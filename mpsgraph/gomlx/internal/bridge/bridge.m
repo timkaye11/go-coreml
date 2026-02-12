@@ -1,0 +1,1074 @@
+// MPSGraph bridge implementation - Objective-C++ wrapping Apple's MPSGraph framework.
+// Generated for go-coreml MPSGraph backend.
+
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+#import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
+#include "bridge.h"
+#include <string.h>
+
+// --- Context object holding MPSGraph + Metal device + command queue ---
+
+@interface MPSGraphContext : NSObject
+@property (nonatomic, strong) MPSGraph* graph;
+@property (nonatomic, strong) id<MTLDevice> device;
+@property (nonatomic, strong) id<MTLCommandQueue> commandQueue;
+// Track placeholders in insertion order for compilation.
+@property (nonatomic, strong) NSMutableArray<MPSGraphTensor*>* placeholders;
+@end
+
+@implementation MPSGraphContext
+@end
+
+// --- Executable wrapper ---
+
+@interface MPSGraphExecWrapper : NSObject
+@property (nonatomic, strong) MPSGraphExecutable* executable;
+@property (nonatomic, strong) id<MTLDevice> device;
+@property (nonatomic, strong) id<MTLCommandQueue> commandQueue;
+@property (nonatomic, strong) NSArray<MPSGraphTensor*>* feedTensors;
+@property (nonatomic, strong) NSArray<MPSGraphTensor*>* targetTensors;
+@end
+
+@implementation MPSGraphExecWrapper
+@end
+
+// --- Helper: set error message ---
+
+static void setError(MPSGraphError* error, int code, NSString* msg) {
+    if (error) {
+        error->code = code;
+        error->message = strdup([msg UTF8String]);
+    }
+}
+
+static void clearError(MPSGraphError* error) {
+    if (error) {
+        error->code = 0;
+        error->message = NULL;
+    }
+}
+
+// --- Helper: convert dtype enum to MPSDataType ---
+
+static MPSDataType toMPSDataType(int dtype) {
+    switch (dtype) {
+        case MPSGRAPH_DTYPE_BOOL:     return MPSDataTypeBool;
+        case MPSGRAPH_DTYPE_INT8:     return MPSDataTypeInt8;
+        case MPSGRAPH_DTYPE_INT16:    return MPSDataTypeInt16;
+        case MPSGRAPH_DTYPE_INT32:    return MPSDataTypeInt32;
+        case MPSGRAPH_DTYPE_INT64:    return MPSDataTypeInt64;
+        case MPSGRAPH_DTYPE_FLOAT16:  return MPSDataTypeFloat16;
+        case MPSGRAPH_DTYPE_BFLOAT16: return MPSDataTypeBFloat16;
+        case MPSGRAPH_DTYPE_FLOAT32:  return MPSDataTypeFloat32;
+        case MPSGRAPH_DTYPE_FLOAT64:  return MPSDataTypeFloat32; // Float64 not supported; fall back to Float32
+        case MPSGRAPH_DTYPE_UINT8:    return MPSDataTypeUInt8;
+        case MPSGRAPH_DTYPE_UINT16:   return MPSDataTypeUInt16;
+        case MPSGRAPH_DTYPE_UINT32:   return MPSDataTypeUInt32;
+        case MPSGRAPH_DTYPE_UINT64:   return MPSDataTypeUInt64;
+        default:                      return MPSDataTypeFloat32;
+    }
+}
+
+// --- Helper: build NSArray<NSNumber*> from int64_t* shape ---
+
+static NSArray<NSNumber*>* shapeArray(int64_t* shape, int rank) {
+    NSMutableArray<NSNumber*>* arr = [NSMutableArray arrayWithCapacity:rank];
+    for (int i = 0; i < rank; i++) {
+        [arr addObject:@(shape[i])];
+    }
+    return arr;
+}
+
+// --- Helper: build NSArray<NSNumber*> from int* array ---
+
+static NSArray<NSNumber*>* intArray(int* values, int count) {
+    NSMutableArray<NSNumber*>* arr = [NSMutableArray arrayWithCapacity:count];
+    for (int i = 0; i < count; i++) {
+        [arr addObject:@(values[i])];
+    }
+    return arr;
+}
+
+// ===========================================================================
+// Context Lifecycle
+// ===========================================================================
+
+MPSGraphContextHandle mpsgraph_create_context(MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            setError(error, 1, @"Failed to create Metal device");
+            return NULL;
+        }
+
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        if (!queue) {
+            setError(error, 2, @"Failed to create Metal command queue");
+            return NULL;
+        }
+
+        MPSGraphContext* ctx = [[MPSGraphContext alloc] init];
+        ctx.device = device;
+        ctx.commandQueue = queue;
+        ctx.graph = [[MPSGraph alloc] init];
+        ctx.placeholders = [NSMutableArray array];
+
+        return (__bridge_retained void*)ctx;
+    }
+}
+
+void mpsgraph_destroy_context(MPSGraphContextHandle handle) {
+    if (handle) {
+        @autoreleasepool {
+            MPSGraphContext* ctx = (__bridge_transfer MPSGraphContext*)handle;
+            (void)ctx; // ARC releases
+        }
+    }
+}
+
+const char* mpsgraph_device_name(MPSGraphContextHandle handle) {
+    @autoreleasepool {
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        return strdup([ctx.device.name UTF8String]);
+    }
+}
+
+// ===========================================================================
+// Tensor Creation
+// ===========================================================================
+
+MPSGraphTensorHandle mpsgraph_placeholder(MPSGraphContextHandle handle, int dtype,
+    int64_t* shape, int rank, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        NSArray<NSNumber*>* shapeArr = shapeArray(shape, rank);
+        MPSDataType mpsType = toMPSDataType(dtype);
+
+        MPSGraphTensor* tensor = [ctx.graph placeholderWithShape:shapeArr
+                                                        dataType:mpsType
+                                                            name:nil];
+        if (!tensor) {
+            setError(error, 10, @"Failed to create placeholder tensor");
+            return NULL;
+        }
+        [ctx.placeholders addObject:tensor];
+        return (__bridge void*)tensor;
+    }
+}
+
+MPSGraphTensorHandle mpsgraph_constant(MPSGraphContextHandle handle, void* data,
+    int64_t nbytes, int dtype, int64_t* shape, int rank, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        NSArray<NSNumber*>* shapeArr = shapeArray(shape, rank);
+        MPSDataType mpsType = toMPSDataType(dtype);
+        NSData* nsData = [NSData dataWithBytes:data length:nbytes];
+
+        MPSGraphTensor* tensor = [ctx.graph constantWithData:nsData
+                                                       shape:shapeArr
+                                                    dataType:mpsType];
+        if (!tensor) {
+            setError(error, 11, @"Failed to create constant tensor");
+            return NULL;
+        }
+        return (__bridge void*)tensor;
+    }
+}
+
+MPSGraphTensorHandle mpsgraph_iota(MPSGraphContextHandle handle, int dtype,
+    int64_t* shape, int rank, int axis, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        NSArray<NSNumber*>* shapeArr = shapeArray(shape, rank);
+        MPSDataType mpsType = toMPSDataType(dtype);
+
+        // Create coordinate tensor along the specified axis.
+        MPSGraphTensor* tensor = [ctx.graph coordinateAlongAxis:axis
+                                                      withShape:shapeArr
+                                                           name:nil];
+        // coordinateAlongAxis returns Int32; cast if needed.
+        if (mpsType != MPSDataTypeInt32) {
+            tensor = [ctx.graph castTensor:tensor toType:mpsType name:nil];
+        }
+        if (!tensor) {
+            setError(error, 12, @"Failed to create iota tensor");
+            return NULL;
+        }
+        return (__bridge void*)tensor;
+    }
+}
+
+// ===========================================================================
+// Unary Operations - using macros for conciseness
+// ===========================================================================
+
+#define IMPL_UNARY_OP(cname, method) \
+MPSGraphTensorHandle cname(MPSGraphContextHandle handle, MPSGraphTensorHandle x, MPSGraphError* error) { \
+    @autoreleasepool { \
+        clearError(error); \
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle; \
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x; \
+        MPSGraphTensor* result = [ctx.graph method##WithTensor:input name:nil]; \
+        if (!result) { \
+            setError(error, 20, @"Unary op " #method " failed"); \
+            return NULL; \
+        } \
+        return (__bridge void*)result; \
+    } \
+}
+
+IMPL_UNARY_OP(mpsgraph_abs,         absolute)
+IMPL_UNARY_OP(mpsgraph_neg,         negative)
+IMPL_UNARY_OP(mpsgraph_sqrt,        squareRoot)
+IMPL_UNARY_OP(mpsgraph_rsqrt,       reciprocalSquareRoot)
+IMPL_UNARY_OP(mpsgraph_exp,         exponent)
+IMPL_UNARY_OP(mpsgraph_log,         logarithm)
+IMPL_UNARY_OP(mpsgraph_sin,         sin)
+IMPL_UNARY_OP(mpsgraph_cos,         cos)
+IMPL_UNARY_OP(mpsgraph_tanh,        tanh)
+IMPL_UNARY_OP(mpsgraph_sigmoid,     sigmoid)
+IMPL_UNARY_OP(mpsgraph_erf,         erf)
+IMPL_UNARY_OP(mpsgraph_floor,       floor)
+IMPL_UNARY_OP(mpsgraph_ceil,        ceil)
+IMPL_UNARY_OP(mpsgraph_round,       rint)
+IMPL_UNARY_OP(mpsgraph_sign,        sign)
+// logicalNOT: MPSGraph uses notWithTensor:name:
+MPSGraphTensorHandle mpsgraph_logical_not(MPSGraphContextHandle handle, MPSGraphTensorHandle x, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        MPSGraphTensor* result = [ctx.graph notWithTensor:input name:nil];
+        if (!result) {
+            setError(error, 20, @"logicalNOT failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+IMPL_UNARY_OP(mpsgraph_bitwise_not, bitwiseNOT)
+IMPL_UNARY_OP(mpsgraph_is_finite,   isFinite)
+IMPL_UNARY_OP(mpsgraph_is_nan,      isNaN)
+IMPL_UNARY_OP(mpsgraph_identity,    identity)
+
+// expm1 = exp(x) - 1: MPSGraph has exponentMinusOne (macOS 15+), but we use a safe decomposition.
+MPSGraphTensorHandle mpsgraph_expm1(MPSGraphContextHandle handle, MPSGraphTensorHandle x, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        MPSGraphTensor* expX = [ctx.graph exponentWithTensor:input name:nil];
+        MPSGraphTensor* one = [ctx.graph constantWithScalar:1.0
+                                                      shape:@[@1]
+                                                   dataType:input.dataType];
+        MPSGraphTensor* result = [ctx.graph subtractionWithPrimaryTensor:expX
+                                                        secondaryTensor:one
+                                                                   name:nil];
+        if (!result) {
+            setError(error, 20, @"expm1 failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+// log1p = log(1 + x)
+MPSGraphTensorHandle mpsgraph_log1p(MPSGraphContextHandle handle, MPSGraphTensorHandle x, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        MPSGraphTensor* one = [ctx.graph constantWithScalar:1.0
+                                                      shape:@[@1]
+                                                   dataType:input.dataType];
+        MPSGraphTensor* onePlusX = [ctx.graph additionWithPrimaryTensor:one
+                                                       secondaryTensor:input
+                                                                  name:nil];
+        MPSGraphTensor* result = [ctx.graph logarithmWithTensor:onePlusX name:nil];
+        if (!result) {
+            setError(error, 20, @"log1p failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+// ===========================================================================
+// Binary Operations
+// ===========================================================================
+
+#define IMPL_BINARY_OP(cname, method) \
+MPSGraphTensorHandle cname(MPSGraphContextHandle handle, MPSGraphTensorHandle lhs, MPSGraphTensorHandle rhs, MPSGraphError* error) { \
+    @autoreleasepool { \
+        clearError(error); \
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle; \
+        MPSGraphTensor* l = (__bridge MPSGraphTensor*)lhs; \
+        MPSGraphTensor* r = (__bridge MPSGraphTensor*)rhs; \
+        MPSGraphTensor* result = [ctx.graph method##WithPrimaryTensor:l secondaryTensor:r name:nil]; \
+        if (!result) { \
+            setError(error, 21, @"Binary op " #method " failed"); \
+            return NULL; \
+        } \
+        return (__bridge void*)result; \
+    } \
+}
+
+IMPL_BINARY_OP(mpsgraph_add,             addition)
+IMPL_BINARY_OP(mpsgraph_sub,             subtraction)
+IMPL_BINARY_OP(mpsgraph_mul,             multiplication)
+IMPL_BINARY_OP(mpsgraph_div,             division)
+IMPL_BINARY_OP(mpsgraph_rem,             modulo)
+IMPL_BINARY_OP(mpsgraph_pow,             power)
+IMPL_BINARY_OP(mpsgraph_max,             maximum)
+IMPL_BINARY_OP(mpsgraph_min,             minimum)
+IMPL_BINARY_OP(mpsgraph_atan2,           atan2)
+IMPL_BINARY_OP(mpsgraph_logical_and,     logicalAND)
+IMPL_BINARY_OP(mpsgraph_logical_or,      logicalOR)
+IMPL_BINARY_OP(mpsgraph_logical_xor,     logicalXOR)
+IMPL_BINARY_OP(mpsgraph_bitwise_and,     bitwiseAND)
+IMPL_BINARY_OP(mpsgraph_bitwise_or,      bitwiseOR)
+IMPL_BINARY_OP(mpsgraph_bitwise_xor,     bitwiseXOR)
+IMPL_BINARY_OP(mpsgraph_shift_left,      bitwiseLeftShift)
+IMPL_BINARY_OP(mpsgraph_shift_right,     bitwiseRightShift)
+
+// --- Comparison Operations ---
+
+IMPL_BINARY_OP(mpsgraph_equal,            equal)
+IMPL_BINARY_OP(mpsgraph_not_equal,        notEqual)
+IMPL_BINARY_OP(mpsgraph_less_than,        lessThan)
+IMPL_BINARY_OP(mpsgraph_less_or_equal,    lessThanOrEqualTo)
+IMPL_BINARY_OP(mpsgraph_greater_than,     greaterThan)
+IMPL_BINARY_OP(mpsgraph_greater_or_equal, greaterThanOrEqualTo)
+
+// ===========================================================================
+// Shape Operations
+// ===========================================================================
+
+MPSGraphTensorHandle mpsgraph_reshape(MPSGraphContextHandle handle, MPSGraphTensorHandle x,
+    int64_t* shape, int rank, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        NSArray<NSNumber*>* shapeArr = shapeArray(shape, rank);
+        MPSGraphTensor* result = [ctx.graph reshapeTensor:input
+                                                withShape:shapeArr
+                                                     name:nil];
+        if (!result) {
+            setError(error, 30, @"reshape failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+MPSGraphTensorHandle mpsgraph_transpose(MPSGraphContextHandle handle, MPSGraphTensorHandle x,
+    int* permutation, int rank, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+
+        // Apply transposition by chaining pairwise swaps to achieve the target permutation.
+        // We build the permutation incrementally: for each position i, find where the target
+        // axis currently is and swap it into place.
+        int current[rank];
+        for (int i = 0; i < rank; i++) current[i] = i;
+
+        MPSGraphTensor* result = input;
+        for (int i = 0; i < rank; i++) {
+            int target = permutation[i];
+            if (current[i] == target) continue;
+
+            // Find where target currently is.
+            int j = -1;
+            for (int k = i; k < rank; k++) {
+                if (current[k] == target) { j = k; break; }
+            }
+            if (j < 0) {
+                setError(error, 31, @"invalid permutation in transpose");
+                return NULL;
+            }
+
+            result = [ctx.graph transposeTensor:result
+                                      dimension:(NSUInteger)i
+                                  withDimension:(NSUInteger)j
+                                           name:nil];
+            // Update tracking.
+            int tmp = current[i];
+            current[i] = current[j];
+            current[j] = tmp;
+        }
+
+        return (__bridge void*)result;
+    }
+}
+
+MPSGraphTensorHandle mpsgraph_cast(MPSGraphContextHandle handle, MPSGraphTensorHandle x,
+    int dtype, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        MPSDataType mpsType = toMPSDataType(dtype);
+        MPSGraphTensor* result = [ctx.graph castTensor:input toType:mpsType name:nil];
+        if (!result) {
+            setError(error, 32, @"cast failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+MPSGraphTensorHandle mpsgraph_broadcast_to(MPSGraphContextHandle handle, MPSGraphTensorHandle x,
+    int64_t* shape, int rank, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        NSArray<NSNumber*>* shapeArr = shapeArray(shape, rank);
+        MPSGraphTensor* result = [ctx.graph broadcastTensor:input
+                                                    toShape:shapeArr
+                                                       name:nil];
+        if (!result) {
+            setError(error, 33, @"broadcast_to failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+MPSGraphTensorHandle mpsgraph_slice(MPSGraphContextHandle handle, MPSGraphTensorHandle x,
+    int64_t* starts, int64_t* ends, int64_t* strides, int rank, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+
+        NSMutableArray<NSNumber*>* startsArr = [NSMutableArray arrayWithCapacity:rank];
+        NSMutableArray<NSNumber*>* endsArr   = [NSMutableArray arrayWithCapacity:rank];
+        NSMutableArray<NSNumber*>* stridesArr = [NSMutableArray arrayWithCapacity:rank];
+        for (int i = 0; i < rank; i++) {
+            [startsArr addObject:@(starts[i])];
+            [endsArr addObject:@(ends[i])];
+            [stridesArr addObject:@(strides[i])];
+        }
+
+        MPSGraphTensor* result = [ctx.graph sliceTensor:input
+                                                 starts:startsArr
+                                                   ends:endsArr
+                                                strides:stridesArr
+                                                   name:nil];
+        if (!result) {
+            setError(error, 34, @"slice failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+MPSGraphTensorHandle mpsgraph_concatenate(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle* tensors, int numTensors, int axis, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        NSMutableArray<MPSGraphTensor*>* arr = [NSMutableArray arrayWithCapacity:numTensors];
+        for (int i = 0; i < numTensors; i++) {
+            [arr addObject:(__bridge MPSGraphTensor*)tensors[i]];
+        }
+        MPSGraphTensor* result = [ctx.graph concatTensors:arr
+                                                dimension:axis
+                                                     name:nil];
+        if (!result) {
+            setError(error, 35, @"concatenate failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+MPSGraphTensorHandle mpsgraph_reverse(MPSGraphContextHandle handle, MPSGraphTensorHandle x,
+    int* axes, int numAxes, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        NSArray<NSNumber*>* axesArr = intArray(axes, numAxes);
+        MPSGraphTensor* result = [ctx.graph reverseTensor:input
+                                                     axes:axesArr
+                                                     name:nil];
+        if (!result) {
+            setError(error, 36, @"reverse failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+MPSGraphTensorHandle mpsgraph_pad(MPSGraphContextHandle handle, MPSGraphTensorHandle x,
+    MPSGraphTensorHandle padValue, int64_t* padBefore, int64_t* padAfter, int rank,
+    MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        MPSGraphTensor* fillTensor = (__bridge MPSGraphTensor*)padValue;
+
+        // Use padTensor with constant padding mode.
+        MPSGraphPaddingMode mode = MPSGraphPaddingModeConstant;
+        NSMutableArray<NSNumber*>* leftPad = [NSMutableArray arrayWithCapacity:rank];
+        NSMutableArray<NSNumber*>* rightPad = [NSMutableArray arrayWithCapacity:rank];
+        for (int i = 0; i < rank; i++) {
+            [leftPad addObject:@(padBefore[i])];
+            [rightPad addObject:@(padAfter[i])];
+        }
+
+        MPSGraphTensor* result = [ctx.graph padTensor:input
+                                      withPaddingMode:mode
+                                          leftPadding:leftPad
+                                         rightPadding:rightPad
+                                        constantValue:0.0
+                                                 name:nil];
+        // Note: MPSGraph padTensor with constant mode uses the constantValue parameter.
+        // For non-zero pad values, we would need a different approach, but this covers
+        // the common case. TODO: handle non-zero pad values if needed.
+        if (!result) {
+            setError(error, 37, @"pad failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+// ===========================================================================
+// Ternary / Selection
+// ===========================================================================
+
+MPSGraphTensorHandle mpsgraph_where(MPSGraphContextHandle handle, MPSGraphTensorHandle cond,
+    MPSGraphTensorHandle onTrue, MPSGraphTensorHandle onFalse, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* c = (__bridge MPSGraphTensor*)cond;
+        MPSGraphTensor* t = (__bridge MPSGraphTensor*)onTrue;
+        MPSGraphTensor* f = (__bridge MPSGraphTensor*)onFalse;
+        MPSGraphTensor* result = [ctx.graph selectWithPredicateTensor:c
+                                                 truePredicateTensor:t
+                                                falsePredicateTensor:f
+                                                                name:nil];
+        if (!result) {
+            setError(error, 40, @"where failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+MPSGraphTensorHandle mpsgraph_clamp(MPSGraphContextHandle handle, MPSGraphTensorHandle minVal,
+    MPSGraphTensorHandle x, MPSGraphTensorHandle maxVal, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* mn = (__bridge MPSGraphTensor*)minVal;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        MPSGraphTensor* mx = (__bridge MPSGraphTensor*)maxVal;
+        MPSGraphTensor* result = [ctx.graph clampWithTensor:input
+                                             minValueTensor:mn
+                                             maxValueTensor:mx
+                                                       name:nil];
+        if (!result) {
+            setError(error, 41, @"clamp failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+// ===========================================================================
+// Matrix Operations
+// ===========================================================================
+
+MPSGraphTensorHandle mpsgraph_matmul(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle lhs, MPSGraphTensorHandle rhs, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* l = (__bridge MPSGraphTensor*)lhs;
+        MPSGraphTensor* r = (__bridge MPSGraphTensor*)rhs;
+        MPSGraphTensor* result = [ctx.graph matrixMultiplicationWithPrimaryTensor:l
+                                                                 secondaryTensor:r
+                                                                            name:nil];
+        if (!result) {
+            setError(error, 50, @"matmul failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+// ===========================================================================
+// Reduction Operations
+// ===========================================================================
+
+MPSGraphTensorHandle mpsgraph_reduce(MPSGraphContextHandle handle, MPSGraphTensorHandle x,
+    int reduceType, int* axes, int numAxes, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        NSArray<NSNumber*>* axesArr = intArray(axes, numAxes);
+
+        MPSGraphTensor* result = nil;
+        switch (reduceType) {
+            case MPSGRAPH_REDUCE_SUM:
+                result = [ctx.graph reductionSumWithTensor:input axes:axesArr name:nil];
+                break;
+            case MPSGRAPH_REDUCE_PRODUCT:
+                result = [ctx.graph reductionProductWithTensor:input axes:axesArr name:nil];
+                break;
+            case MPSGRAPH_REDUCE_MAX:
+                result = [ctx.graph reductionMaximumWithTensor:input axes:axesArr name:nil];
+                break;
+            case MPSGRAPH_REDUCE_MIN:
+                result = [ctx.graph reductionMinimumWithTensor:input axes:axesArr name:nil];
+                break;
+            default:
+                setError(error, 60, @"unknown reduction type");
+                return NULL;
+        }
+        if (!result) {
+            setError(error, 61, @"reduction failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+// ===========================================================================
+// Gather / Scatter
+// ===========================================================================
+
+MPSGraphTensorHandle mpsgraph_gather_nd(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle params, MPSGraphTensorHandle indices,
+    int batchDims, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* p = (__bridge MPSGraphTensor*)params;
+        MPSGraphTensor* idx = (__bridge MPSGraphTensor*)indices;
+        MPSGraphTensor* result = [ctx.graph gatherNDWithUpdatesTensor:p
+                                                        indicesTensor:idx
+                                                       batchDimensions:batchDims
+                                                                 name:nil];
+        if (!result) {
+            setError(error, 70, @"gather_nd failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+MPSGraphTensorHandle mpsgraph_gather_along_axis(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle x, MPSGraphTensorHandle indices, int axis,
+    MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        MPSGraphTensor* idx = (__bridge MPSGraphTensor*)indices;
+        MPSGraphTensor* result = [ctx.graph gatherAlongAxis:axis
+                                          withUpdatesTensor:input
+                                              indicesTensor:idx
+                                                       name:nil];
+        if (!result) {
+            setError(error, 71, @"gather_along_axis failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+MPSGraphTensorHandle mpsgraph_scatter_nd(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle data, MPSGraphTensorHandle indices, MPSGraphTensorHandle updates,
+    int64_t* shape, int rank, int mode, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* d = (__bridge MPSGraphTensor*)data;
+        MPSGraphTensor* idx = (__bridge MPSGraphTensor*)indices;
+        MPSGraphTensor* upd = (__bridge MPSGraphTensor*)updates;
+        NSArray<NSNumber*>* shapeArr = shapeArray(shape, rank);
+
+        MPSGraphScatterMode scatterMode;
+        switch (mode) {
+            case 0: scatterMode = MPSGraphScatterModeSet; break;
+            case 1: scatterMode = MPSGraphScatterModeAdd; break;
+            case 2: scatterMode = MPSGraphScatterModeMin; break;
+            case 3: scatterMode = MPSGraphScatterModeMax; break;
+            default: scatterMode = MPSGraphScatterModeSet; break;
+        }
+
+        MPSGraphTensor* result = [ctx.graph scatterNDWithUpdatesTensor:upd
+                                                        indicesTensor:idx
+                                                                shape:shapeArr
+                                                       batchDimensions:0
+                                                                  mode:scatterMode
+                                                                  name:nil];
+        if (!result) {
+            setError(error, 72, @"scatter_nd failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+// ===========================================================================
+// ArgMin / ArgMax
+// ===========================================================================
+
+MPSGraphTensorHandle mpsgraph_argmin(MPSGraphContextHandle handle, MPSGraphTensorHandle x,
+    int axis, int outputDtype, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        MPSGraphTensor* result = [ctx.graph reductionArgMinimumWithTensor:input
+                                                                     axis:axis
+                                                                     name:nil];
+        MPSDataType mpsOutType = toMPSDataType(outputDtype);
+        if (result.dataType != mpsOutType) {
+            result = [ctx.graph castTensor:result toType:mpsOutType name:nil];
+        }
+        if (!result) {
+            setError(error, 73, @"argmin failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+MPSGraphTensorHandle mpsgraph_argmax(MPSGraphContextHandle handle, MPSGraphTensorHandle x,
+    int axis, int outputDtype, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        MPSGraphTensor* result = [ctx.graph reductionArgMaximumWithTensor:input
+                                                                     axis:axis
+                                                                     name:nil];
+        MPSDataType mpsOutType = toMPSDataType(outputDtype);
+        if (result.dataType != mpsOutType) {
+            result = [ctx.graph castTensor:result toType:mpsOutType name:nil];
+        }
+        if (!result) {
+            setError(error, 74, @"argmax failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+// ===========================================================================
+// Batch Normalization
+// ===========================================================================
+
+MPSGraphTensorHandle mpsgraph_batch_norm_inference(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle input, MPSGraphTensorHandle mean, MPSGraphTensorHandle variance,
+    MPSGraphTensorHandle gamma, MPSGraphTensorHandle beta,
+    float epsilon, int featureAxis, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* x = (__bridge MPSGraphTensor*)input;
+        MPSGraphTensor* m = (__bridge MPSGraphTensor*)mean;
+        MPSGraphTensor* v = (__bridge MPSGraphTensor*)variance;
+        MPSGraphTensor* g = gamma ? (__bridge MPSGraphTensor*)gamma : nil;
+        MPSGraphTensor* b = beta ? (__bridge MPSGraphTensor*)beta : nil;
+
+        // (x - mean) / sqrt(variance + epsilon) * gamma + beta
+        MPSGraphTensor* epsTensor = [ctx.graph constantWithScalar:epsilon
+                                                            shape:@[@1]
+                                                         dataType:v.dataType];
+        MPSGraphTensor* varEps = [ctx.graph additionWithPrimaryTensor:v
+                                                     secondaryTensor:epsTensor
+                                                                name:nil];
+        MPSGraphTensor* stddev = [ctx.graph squareRootWithTensor:varEps name:nil];
+        MPSGraphTensor* xCentered = [ctx.graph subtractionWithPrimaryTensor:x
+                                                            secondaryTensor:m
+                                                                       name:nil];
+        MPSGraphTensor* result = [ctx.graph divisionWithPrimaryTensor:xCentered
+                                                     secondaryTensor:stddev
+                                                                name:nil];
+        if (g) {
+            result = [ctx.graph multiplicationWithPrimaryTensor:result
+                                               secondaryTensor:g
+                                                          name:nil];
+        }
+        if (b) {
+            result = [ctx.graph additionWithPrimaryTensor:result
+                                         secondaryTensor:b
+                                                    name:nil];
+        }
+        if (!result) {
+            setError(error, 80, @"batch_norm_inference failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+// ===========================================================================
+// Convolution
+// ===========================================================================
+
+MPSGraphTensorHandle mpsgraph_conv2d(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle input, MPSGraphTensorHandle weights,
+    int64_t* strides, int64_t* dilations, int64_t* padBefore, int64_t* padAfter,
+    int groups, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* x = (__bridge MPSGraphTensor*)input;
+        MPSGraphTensor* w = (__bridge MPSGraphTensor*)weights;
+
+        // Create convolution descriptor (NCHW layout assumed).
+        MPSGraphConvolution2DOpDescriptor* desc = [MPSGraphConvolution2DOpDescriptor
+            descriptorWithStrideInX:strides[1] strideInY:strides[0]
+                  dilationRateInX:dilations[1] dilationRateInY:dilations[0]
+                            groups:groups
+                     paddingLeft:padBefore[1] paddingRight:padAfter[1]
+                       paddingTop:padBefore[0] paddingBottom:padAfter[0]
+                      paddingStyle:MPSGraphPaddingStyleExplicit
+                        dataLayout:MPSGraphTensorNamedDataLayoutNCHW
+                     weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
+
+        MPSGraphTensor* result = [ctx.graph convolution2DWithSourceTensor:x
+                                                           weightsTensor:w
+                                                              descriptor:desc
+                                                                    name:nil];
+        if (!result) {
+            setError(error, 90, @"conv2d failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+// ===========================================================================
+// Dynamic Slice / Update
+// ===========================================================================
+
+MPSGraphTensorHandle mpsgraph_dynamic_slice(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle x, MPSGraphTensorHandle* startIndices, int numIndices,
+    int64_t* sliceSizes, int rank, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+
+        // Build slice starts and sizes arrays.
+        // Dynamic slice uses runtime start indices. We use stridedSlice with dynamic starts.
+        // MPSGraph doesn't have a direct dynamicSlice, so we decompose.
+        NSMutableArray<NSNumber*>* sizes = [NSMutableArray arrayWithCapacity:rank];
+        for (int i = 0; i < rank; i++) {
+            [sizes addObject:@(sliceSizes[i])];
+        }
+
+        // Stack the start indices into a single tensor, then use gatherND-like slicing.
+        // For simplicity, decompose: for each axis, do a dynamic gather/slice.
+        // Actually, MPSGraph has sliceTensor:starts:ends:strides: with dynamic tensors.
+        // But for truly dynamic starts, we need a workaround.
+        // TODO: Implement proper dynamic slice. For now, return error.
+        setError(error, 100, @"dynamic_slice not yet implemented");
+        return NULL;
+    }
+}
+
+MPSGraphTensorHandle mpsgraph_dynamic_update_slice(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle x, MPSGraphTensorHandle update,
+    MPSGraphTensorHandle* startIndices, int numIndices, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        // TODO: Implement dynamic update slice.
+        setError(error, 101, @"dynamic_update_slice not yet implemented");
+        return NULL;
+    }
+}
+
+// ===========================================================================
+// Compilation & Execution
+// ===========================================================================
+
+MPSGraphExecHandle mpsgraph_compile(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle* feeds, int* feedDtypes, int64_t** feedShapes, int* feedRanks, int numFeeds,
+    MPSGraphTensorHandle* targets, int numTargets,
+    MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+
+        // Build feeds dictionary: MPSGraphTensor* -> MPSGraphShapedType*
+        NSMutableDictionary<MPSGraphTensor*, MPSGraphShapedType*>* feedsDict =
+            [NSMutableDictionary dictionaryWithCapacity:numFeeds];
+        NSMutableArray<MPSGraphTensor*>* feedTensors = [NSMutableArray arrayWithCapacity:numFeeds];
+
+        for (int i = 0; i < numFeeds; i++) {
+            MPSGraphTensor* tensor = (__bridge MPSGraphTensor*)feeds[i];
+            MPSDataType mpsType = toMPSDataType(feedDtypes[i]);
+            NSArray<NSNumber*>* shape = shapeArray(feedShapes[i], feedRanks[i]);
+            MPSGraphShapedType* shapedType = [[MPSGraphShapedType alloc] initWithShape:shape
+                                                                              dataType:mpsType];
+            feedsDict[tensor] = shapedType;
+            [feedTensors addObject:tensor];
+        }
+
+        // Build targets array.
+        NSMutableArray<MPSGraphTensor*>* targetTensors = [NSMutableArray arrayWithCapacity:numTargets];
+        for (int i = 0; i < numTargets; i++) {
+            [targetTensors addObject:(__bridge MPSGraphTensor*)targets[i]];
+        }
+
+        // Compile.
+        MPSGraphCompilationDescriptor* compDesc = [[MPSGraphCompilationDescriptor alloc] init];
+        MPSGraphExecutable* exec = [ctx.graph compileWithDevice:[MPSGraphDevice deviceWithMTLDevice:ctx.device]
+                                                          feeds:feedsDict
+                                                  targetTensors:targetTensors
+                                               targetOperations:nil
+                                          compilationDescriptor:compDesc];
+        if (!exec) {
+            setError(error, 110, @"MPSGraph compilation failed");
+            return NULL;
+        }
+
+        // Wrap in our context object.
+        MPSGraphExecWrapper* wrapper = [[MPSGraphExecWrapper alloc] init];
+        wrapper.executable = exec;
+        wrapper.device = ctx.device;
+        wrapper.commandQueue = ctx.commandQueue;
+        wrapper.feedTensors = [feedTensors copy];
+        wrapper.targetTensors = [targetTensors copy];
+
+        return (__bridge_retained void*)wrapper;
+    }
+}
+
+void mpsgraph_destroy_exec(MPSGraphExecHandle handle) {
+    if (handle) {
+        @autoreleasepool {
+            MPSGraphExecWrapper* wrapper = (__bridge_transfer MPSGraphExecWrapper*)handle;
+            (void)wrapper; // ARC releases
+        }
+    }
+}
+
+bool mpsgraph_execute(MPSGraphExecHandle handle,
+    void** inputData, int64_t* inputSizes, int* inputDtypes,
+    int64_t** inputShapes, int* inputRanks, int numInputs,
+    void** outputData, int64_t* outputSizes, int* outputDtypes,
+    int64_t** outputShapes, int* outputRanks, int numOutputs,
+    MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphExecWrapper* wrapper = (__bridge MPSGraphExecWrapper*)handle;
+
+        // Build input tensor data array.
+        NSMutableArray<MPSGraphTensorData*>* inputsArray = [NSMutableArray arrayWithCapacity:numInputs];
+        for (int i = 0; i < numInputs; i++) {
+            MPSDataType mpsType = toMPSDataType(inputDtypes[i]);
+            NSArray<NSNumber*>* shape = shapeArray(inputShapes[i], inputRanks[i]);
+
+            // Create MPSNDArray descriptor.
+            MPSNDArrayDescriptor* desc = [MPSNDArrayDescriptor descriptorWithDataType:mpsType
+                                                                                shape:shape];
+
+            // Create MPSNDArray and copy input data.
+            MPSNDArray* ndarray = [[MPSNDArray alloc] initWithDevice:wrapper.device descriptor:desc];
+            [ndarray writeBytes:inputData[i] strideBytes:nil];
+
+            MPSGraphTensorData* tensorData = [[MPSGraphTensorData alloc] initWithMPSNDArray:ndarray];
+            [inputsArray addObject:tensorData];
+        }
+
+        // Build output tensor data array (pre-allocated).
+        NSMutableArray<MPSGraphTensorData*>* resultsArray = [NSMutableArray arrayWithCapacity:numOutputs];
+        NSMutableArray<MPSNDArray*>* outputNDArrays = [NSMutableArray arrayWithCapacity:numOutputs];
+        for (int i = 0; i < numOutputs; i++) {
+            MPSDataType mpsType = toMPSDataType(outputDtypes[i]);
+            NSArray<NSNumber*>* shape = shapeArray(outputShapes[i], outputRanks[i]);
+
+            MPSNDArrayDescriptor* desc = [MPSNDArrayDescriptor descriptorWithDataType:mpsType
+                                                                                shape:shape];
+            MPSNDArray* ndarray = [[MPSNDArray alloc] initWithDevice:wrapper.device descriptor:desc];
+            MPSGraphTensorData* tensorData = [[MPSGraphTensorData alloc] initWithMPSNDArray:ndarray];
+            [resultsArray addObject:tensorData];
+            [outputNDArrays addObject:ndarray];
+        }
+
+        // Execute.
+        NSArray<MPSGraphTensorData*>* results = [wrapper.executable
+            runWithMTLCommandQueue:wrapper.commandQueue
+                       inputsArray:inputsArray
+                      resultsArray:resultsArray
+                 executionDescriptor:nil];
+
+        if (!results || results.count != (NSUInteger)numOutputs) {
+            setError(error, 111, @"MPSGraph execution failed or returned wrong number of outputs");
+            return false;
+        }
+
+        // Copy output data back.
+        for (int i = 0; i < numOutputs; i++) {
+            MPSGraphTensorData* result = results[i];
+            MPSNDArray* ndarray = result.mpsndarray;
+            [ndarray readBytes:outputData[i] strideBytes:nil];
+        }
+
+        return true;
+    }
+}
+
+// ===========================================================================
+// Buffer Management
+// ===========================================================================
+
+MTLBufferHandle mpsgraph_buffer_create(MPSGraphContextHandle handle, int64_t nbytes, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        id<MTLBuffer> buffer = [ctx.device newBufferWithLength:nbytes
+                                                       options:MTLResourceStorageModeShared];
+        if (!buffer) {
+            setError(error, 120, @"Failed to create MTLBuffer");
+            return NULL;
+        }
+        return (__bridge_retained void*)buffer;
+    }
+}
+
+void* mpsgraph_buffer_contents(MTLBufferHandle handle) {
+    if (!handle) return NULL;
+    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)handle;
+    return buffer.contents;
+}
+
+int64_t mpsgraph_buffer_length(MTLBufferHandle handle) {
+    if (!handle) return 0;
+    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)handle;
+    return (int64_t)buffer.length;
+}
+
+void mpsgraph_buffer_destroy(MTLBufferHandle handle) {
+    if (handle) {
+        @autoreleasepool {
+            id<MTLBuffer> buffer = (__bridge_transfer id<MTLBuffer>)handle;
+            (void)buffer; // ARC releases
+        }
+    }
+}
