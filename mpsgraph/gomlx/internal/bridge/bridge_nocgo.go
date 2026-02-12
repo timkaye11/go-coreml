@@ -127,6 +127,26 @@ func (c *Context) ScatterND(data, indices, updates Tensor, shape []int64, mode i
 }
 func (c *Context) ArgMin(x Tensor, axis int, outputDtype DType) (Tensor, error) { return nil, errNoCGo }
 func (c *Context) ArgMax(x Tensor, axis int, outputDtype DType) (Tensor, error) { return nil, errNoCGo }
+func (c *Context) Pool2D(x Tensor, mode int, windowDims, strides, padBefore, padAfter []int64) (Tensor, error) {
+	return nil, errNoCGo
+}
+func (c *Context) MaxPool2DGradient(gradient, source Tensor, windowDims, strides, padBefore, padAfter []int64) (Tensor, error) {
+	return nil, errNoCGo
+}
+func (c *Context) DynamicSlice(x Tensor, starts []Tensor, sizes []int64) (Tensor, error) {
+	return nil, errNoCGo
+}
+func (c *Context) DynamicUpdateSlice(x, update Tensor, starts []Tensor) (Tensor, error) {
+	return nil, errNoCGo
+}
+func (c *Context) RandomUniform(dtype DType, shape []int64) (Tensor, error) { return nil, errNoCGo }
+func (c *Context) Softmax(x Tensor, axis int) (Tensor, error)              { return nil, errNoCGo }
+func (c *Context) ConvGeneral(input, kernel Tensor, numSpatialDims int, strides, dilations, padBefore, padAfter []int64, groups int) (Tensor, error) {
+	return nil, errNoCGo
+}
+func (c *Context) ScatterAlongAxis(data, indices, updates Tensor, axis, mode int) (Tensor, error) {
+	return nil, errNoCGo
+}
 func (c *Context) BatchNormInference(input, mean, variance, gamma, beta Tensor, epsilon float32, featureAxis int) (Tensor, error) {
 	return nil, errNoCGo
 }

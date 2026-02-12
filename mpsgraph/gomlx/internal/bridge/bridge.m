@@ -1325,6 +1325,44 @@ MPSGraphTensorHandle mpsgraph_pool2d(MPSGraphContextHandle handle, MPSGraphTenso
 }
 
 // ===========================================================================
+// Max Pool 2D Gradient (SelectAndScatter)
+// ===========================================================================
+
+MPSGraphTensorHandle mpsgraph_max_pool2d_gradient(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle gradientH, MPSGraphTensorHandle sourceH,
+    int64_t* windowDims, int64_t* strides, int64_t* padBefore, int64_t* padAfter,
+    MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* gradient = (__bridge MPSGraphTensor*)gradientH;
+        MPSGraphTensor* source = (__bridge MPSGraphTensor*)sourceH;
+
+        MPSGraphPooling2DOpDescriptor* desc = [MPSGraphPooling2DOpDescriptor
+            descriptorWithKernelWidth:(NSUInteger)windowDims[1]
+                        kernelHeight:(NSUInteger)windowDims[0]
+                           strideInX:(NSUInteger)strides[1]
+                           strideInY:(NSUInteger)strides[0]
+                        paddingStyle:MPSGraphPaddingStyleExplicit
+                          dataLayout:MPSGraphTensorNamedDataLayoutNCHW];
+        desc.paddingLeft = (NSUInteger)padBefore[1];
+        desc.paddingRight = (NSUInteger)padAfter[1];
+        desc.paddingTop = (NSUInteger)padBefore[0];
+        desc.paddingBottom = (NSUInteger)padAfter[0];
+
+        MPSGraphTensor* result = [ctx.graph maxPooling2DGradientWithGradientTensor:gradient
+                                                                     sourceTensor:source
+                                                                       descriptor:desc
+                                                                             name:nil];
+        if (!result) {
+            setError(error, 230, @"max_pool2d_gradient failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+// ===========================================================================
 // General Convolution
 // ===========================================================================
 

@@ -13,6 +13,14 @@ import (
 	"github.com/gomlx/gomlx/pkg/core/graph"
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/gomlx/gomlx/pkg/core/tensors"
+	"github.com/gomlx/gomlx/pkg/core/tensors/images"
+	"github.com/gomlx/gomlx/pkg/ml/context"
+	"github.com/gomlx/gomlx/pkg/ml/layers"
+	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
+	"github.com/gomlx/gomlx/pkg/ml/nn"
+	"github.com/gomlx/gomlx/pkg/ml/train"
+	"github.com/gomlx/gomlx/pkg/ml/train/losses"
+	"github.com/gomlx/gomlx/pkg/ml/train/optimizers"
 )
 
 // TestBackendCreation tests that the backend can be created.
@@ -2044,4 +2052,965 @@ func TestGoMLXWhereAndCompare(t *testing.T) {
 
 	got := result.Value().([]float32)
 	assertClose(t, got, []float32{0, 0, 0, 1, 2}, 1e-5)
+}
+
+// =============================================================================
+// Training Integration Tests
+// =============================================================================
+
+// TestContextExecDense tests a forward pass through a Dense layer using context.Exec.
+func TestContextExecDense(t *testing.T) {
+	backend := newTestBackend(t)
+	ctx := context.New()
+
+	// Model: Dense(input, useBias=true, outputDim=1)
+	modelFn := func(ctx *context.Context, input *graph.Node) *graph.Node {
+		return layers.Dense(ctx, input, true, 1)
+	}
+
+	exec, err := context.NewExec(backend, ctx, modelFn)
+	if err != nil {
+		t.Fatalf("NewExec failed: %+v", err)
+	}
+
+	// Input: 3 examples, 2 features
+	input := tensors.FromFlatDataAndDimensions([]float32{1, 2, 3, 4, 5, 6}, 3, 2)
+	results := exec.MustExec(input)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 output, got %d", len(results))
+	}
+
+	// Just verify the output shape is [3, 1] (values depend on random init).
+	outShape := results[0].Shape()
+	if outShape.Rank() != 2 || outShape.Dimensions[0] != 3 || outShape.Dimensions[1] != 1 {
+		t.Fatalf("expected output shape [3,1], got %s", outShape)
+	}
+	t.Logf("Dense forward output shape: %s", outShape)
+
+	// Verify variables were created.
+	weightsVar := ctx.GetVariableByScopeAndName("/dense", "weights")
+	biasesVar := ctx.GetVariableByScopeAndName("/dense", "biases")
+	if weightsVar == nil {
+		t.Fatal("weights variable not found")
+	}
+	if biasesVar == nil {
+		t.Fatal("biases variable not found")
+	}
+	t.Logf("Weights shape: %s, Biases shape: %s",
+		weightsVar.Shape(), biasesVar.Shape())
+}
+
+// simpleTrainDataset implements train.Dataset for a simple regression problem.
+// It yields the same batch indefinitely (infinite dataset).
+type simpleTrainDataset struct {
+	inputs []*tensors.Tensor
+	labels []*tensors.Tensor
+}
+
+func (d *simpleTrainDataset) Name() string                  { return "simple" }
+func (d *simpleTrainDataset) Reset()                        {}
+func (d *simpleTrainDataset) IsOwnershipTransferred() bool  { return false }
+func (d *simpleTrainDataset) Yield() (spec any, inputs []*tensors.Tensor, labels []*tensors.Tensor, err error) {
+	return d, d.inputs, d.labels, nil
+}
+
+// TestTrainingLinearRegression tests a full training loop: forward, backward (autodiff), SGD update.
+func TestTrainingLinearRegression(t *testing.T) {
+	backend := newTestBackend(t)
+
+	// Simple linear regression: y = 2*x1 + 3*x2 + 1
+	// 4 examples, 2 features
+	inputData := []float32{
+		1, 0,
+		0, 1,
+		1, 1,
+		2, 1,
+	}
+	// Labels: 2*x1 + 3*x2 + 1
+	labelData := []float32{3, 4, 6, 8}
+
+	inputs := tensors.FromFlatDataAndDimensions(inputData, 4, 2)
+	labels := tensors.FromFlatDataAndDimensions(labelData, 4, 1)
+
+	dataset := &simpleTrainDataset{
+		inputs: []*tensors.Tensor{inputs},
+		labels: []*tensors.Tensor{labels},
+	}
+
+	ctx := context.New()
+	ctx.SetParam(optimizers.ParamLearningRate, 0.1)
+
+	modelFn := func(ctx *context.Context, spec any, inputs []*graph.Node) []*graph.Node {
+		logits := layers.Dense(ctx, inputs[0], true, 1)
+		return []*graph.Node{logits}
+	}
+
+	trainer := train.NewTrainer(backend, ctx, modelFn,
+		losses.MeanSquaredError,
+		optimizers.StochasticGradientDescent().Done(),
+		nil, nil)
+
+	loop := train.NewLoop(trainer)
+
+	// Run 500 training steps.
+	numSteps := 500
+	metrics, err := loop.RunSteps(dataset, numSteps)
+	if err != nil {
+		t.Fatalf("Training failed: %+v", err)
+	}
+
+	// The last metric should be the loss.
+	if len(metrics) < 2 {
+		t.Fatalf("expected at least 2 metrics (step + loss), got %d", len(metrics))
+	}
+
+	// Loss metric can be float32 or float64 depending on backend.
+	var finalLoss float64
+	switch v := metrics[1].Value().(type) {
+	case float64:
+		finalLoss = v
+	case float32:
+		finalLoss = float64(v)
+	default:
+		t.Fatalf("unexpected loss type: %T", metrics[1].Value())
+	}
+	t.Logf("Final loss after %d steps: %f", numSteps, finalLoss)
+
+	// After 100 steps of SGD on this simple problem, loss should be small.
+	if finalLoss > 5.0 {
+		t.Errorf("Loss too high after training: %f (expected < 5.0)", finalLoss)
+	}
+
+	// Check learned weights approximate [2, 3] and bias ≈ 1.
+	weightsVar := ctx.GetVariableByScopeAndName("/dense", "weights")
+	biasVar := ctx.GetVariableByScopeAndName("/dense", "biases")
+	if weightsVar == nil || biasVar == nil {
+		t.Fatal("variables not found after training")
+	}
+
+	wTensor := weightsVar.MustValue()
+	bTensor := biasVar.MustValue()
+	t.Logf("Learned weights: %v", wTensor.Value())
+	t.Logf("Learned bias: %v", bTensor.Value())
+}
+
+// TestTrainingWithAdam tests training with the Adam optimizer on a 2-layer network.
+func TestTrainingWithAdam(t *testing.T) {
+	backend := newTestBackend(t)
+
+	// XOR-like problem: need nonlinearity to solve.
+	// y = 1 if exactly one of x1, x2 is > 0.5, else 0.
+	inputData := []float32{
+		0, 0,
+		0, 1,
+		1, 0,
+		1, 1,
+	}
+	labelData := []float32{0, 1, 1, 0}
+
+	inputs := tensors.FromFlatDataAndDimensions(inputData, 4, 2)
+	labels := tensors.FromFlatDataAndDimensions(labelData, 4, 1)
+
+	dataset := &simpleTrainDataset{
+		inputs: []*tensors.Tensor{inputs},
+		labels: []*tensors.Tensor{labels},
+	}
+
+	ctx := context.New()
+	ctx.SetParam(optimizers.ParamLearningRate, 0.01)
+
+	// 2-layer MLP: Dense(4, tanh) → Dense(1)
+	modelFn := func(ctx *context.Context, spec any, inputs []*graph.Node) []*graph.Node {
+		x := inputs[0]
+		x = layers.Dense(ctx.In("hidden"), x, true, 4)
+		x = graph.Tanh(x)
+		x = layers.Dense(ctx.In("output"), x, true, 1)
+		return []*graph.Node{x}
+	}
+
+	trainer := train.NewTrainer(backend, ctx, modelFn,
+		losses.MeanSquaredError,
+		optimizers.Adam().Done(),
+		nil, nil)
+
+	loop := train.NewLoop(trainer)
+	numSteps := 500
+	metrics, err := loop.RunSteps(dataset, numSteps)
+	if err != nil {
+		t.Fatalf("Training with Adam failed: %+v", err)
+	}
+
+	var finalLoss float64
+	switch v := metrics[1].Value().(type) {
+	case float64:
+		finalLoss = v
+	case float32:
+		finalLoss = float64(v)
+	}
+	t.Logf("Final loss after %d Adam steps: %f", numSteps, finalLoss)
+
+	// XOR is harder, but after 500 Adam steps loss should be decreasing.
+	if finalLoss > 1.0 {
+		t.Errorf("Loss too high with Adam: %f", finalLoss)
+	}
+}
+
+// =============================================================================
+// Autodiff (Gradient) Tests
+// =============================================================================
+
+// TestGradientSimple verifies that automatic differentiation produces correct gradients.
+func TestGradientSimple(t *testing.T) {
+	backend := newTestBackend(t)
+
+	t.Run("linear_grad", func(t *testing.T) {
+		// f(x) = sum(3*x + 2) → df/dx = 3 for each element
+		result := graph.MustExecOnce(backend, func(x *graph.Node) *graph.Node {
+			three := graph.Const(x.Graph(), float32(3.0))
+			y := graph.Add(graph.Mul(three, x), graph.Const(x.Graph(), float32(2.0)))
+			loss := graph.ReduceAllSum(y)
+			grads := graph.Gradient(loss, x)
+			return grads[0]
+		}, []float32{5.0, 10.0})
+		got := result.Value().([]float32)
+		assertClose(t, got, []float32{3.0, 3.0}, 1e-5)
+	})
+
+	t.Run("quadratic_grad", func(t *testing.T) {
+		// f(x) = sum(x^2) → df/dx = 2*x
+		result := graph.MustExecOnce(backend, func(x *graph.Node) *graph.Node {
+			y := graph.Mul(x, x)
+			loss := graph.ReduceAllSum(y)
+			grads := graph.Gradient(loss, x)
+			return grads[0]
+		}, []float32{3.0, -2.0})
+		got := result.Value().([]float32)
+		assertClose(t, got, []float32{6.0, -4.0}, 1e-5)
+	})
+
+	t.Run("matmul_grad", func(t *testing.T) {
+		// f(W) = sum(x @ W) where x=[1,2], W=[2,1] → df/dW = x^T
+		x := tensors.FromFlatDataAndDimensions([]float32{1, 2}, 1, 2)
+		result := graph.MustExecOnce(backend, func(xNode, wNode *graph.Node) *graph.Node {
+			y := graph.Dot(xNode, wNode)
+			loss := graph.ReduceAllSum(y)
+			grads := graph.Gradient(loss, wNode)
+			return grads[0]
+		}, x, tensors.FromFlatDataAndDimensions([]float32{0.5, 0.3}, 2, 1))
+		got, err := tensors.CopyFlatData[float32](result)
+		if err != nil {
+			t.Fatalf("CopyFlatData failed: %+v", err)
+		}
+		// df/dW = x^T = [[1], [2]]
+		assertClose(t, got, []float32{1, 2}, 1e-5)
+	})
+
+	t.Run("relu_grad", func(t *testing.T) {
+		// f(x) = relu(x) → grad is 1 where x > 0, 0 otherwise
+		result := graph.MustExecOnce(backend, func(x *graph.Node) *graph.Node {
+			y := graph.Where(
+				graph.GreaterThan(x, graph.ZerosLike(x)),
+				x,
+				graph.ZerosLike(x),
+			)
+			loss := graph.ReduceAllSum(y)
+			grads := graph.Gradient(loss, x)
+			return grads[0]
+		}, []float32{-2, -1, 0.5, 1, 3})
+		got := result.Value().([]float32)
+		assertClose(t, got, []float32{0, 0, 1, 1, 1}, 1e-5)
+	})
+
+	t.Run("reduce_mean_grad", func(t *testing.T) {
+		// f(x) = mean(x) → df/dx = 1/n for each element
+		result := graph.MustExecOnce(backend, func(x *graph.Node) *graph.Node {
+			y := graph.ReduceAllMean(x)
+			grads := graph.Gradient(y, x)
+			return grads[0]
+		}, []float32{1, 2, 3, 4})
+		got := result.Value().([]float32)
+		// mean of 4 elements → gradient = 1/4 = 0.25
+		assertClose(t, got, []float32{0.25, 0.25, 0.25, 0.25}, 1e-5)
+	})
+}
+
+// TestGradientDenseLayer tests gradients through a Dense layer with MSE loss.
+func TestGradientDenseLayer(t *testing.T) {
+	backend := newTestBackend(t)
+	ctx := context.New()
+
+	// Build a graph with Dense layer and compute loss + gradients.
+	modelFn := func(ctx *context.Context, input, target *graph.Node) *graph.Node {
+		pred := layers.Dense(ctx, input, true, 1)
+		diff := graph.Sub(target, pred)
+		loss := graph.ReduceAllMean(graph.Mul(diff, diff))
+		return loss
+	}
+
+	exec, err := context.NewExec(backend, ctx, modelFn)
+	if err != nil {
+		t.Fatalf("NewExec failed: %+v", err)
+	}
+
+	input := tensors.FromFlatDataAndDimensions([]float32{1, 2}, 1, 2)
+	target := tensors.FromFlatDataAndDimensions([]float32{5}, 1, 1)
+
+	// First execution initializes variables and computes loss.
+	results := exec.MustExec(input, target)
+	loss1, err := tensors.CopyFlatData[float32](results[0])
+	if err != nil {
+		t.Fatalf("CopyFlatData failed: %+v", err)
+	}
+	t.Logf("Initial loss: %f", loss1[0])
+
+	// Verify loss is a scalar and finite.
+	if math.IsNaN(float64(loss1[0])) || math.IsInf(float64(loss1[0]), 0) {
+		t.Fatalf("Loss is not finite: %f", loss1[0])
+	}
+}
+
+// =============================================================================
+// MNIST-like Model Test (Linear — no pooling)
+// =============================================================================
+
+// TestMNISTLinear tests training a simple linear model on synthetic MNIST-like data.
+func TestMNISTLinear(t *testing.T) {
+	backend := newTestBackend(t)
+
+	// Synthetic "MNIST": 50 examples, 784 features (28x28 flattened), 10 classes.
+	numExamples := 50
+	numFeatures := 784
+	numClasses := 10
+
+	// Generate random input data using the backend.
+	inputData := make([]float32, numExamples*numFeatures)
+	for i := range inputData {
+		inputData[i] = float32(i%7) * 0.01 // Simple deterministic pattern
+	}
+	// Generate labels: class = example_idx % numClasses
+	labelData := make([]int32, numExamples)
+	for i := range labelData {
+		labelData[i] = int32(i % numClasses)
+	}
+
+	inputs := tensors.FromFlatDataAndDimensions(inputData, numExamples, numFeatures)
+	labels := tensors.FromFlatDataAndDimensions(labelData, numExamples, 1)
+
+	dataset := &simpleTrainDataset{
+		inputs: []*tensors.Tensor{inputs},
+		labels: []*tensors.Tensor{labels},
+	}
+
+	ctx := context.New()
+	ctx.SetParam(optimizers.ParamLearningRate, 0.01)
+
+	modelFn := func(ctx *context.Context, spec any, inputs []*graph.Node) []*graph.Node {
+		x := inputs[0]
+		logits := layers.Dense(ctx, x, true, numClasses)
+		return []*graph.Node{logits}
+	}
+
+	trainer := train.NewTrainer(backend, ctx, modelFn,
+		losses.SparseCategoricalCrossEntropyLogits,
+		optimizers.Adam().Done(),
+		nil, nil)
+
+	loop := train.NewLoop(trainer)
+	numSteps := 50
+	metrics, err := loop.RunSteps(dataset, numSteps)
+	if err != nil {
+		t.Fatalf("MNIST linear training failed: %+v", err)
+	}
+
+	var finalLoss float64
+	switch v := metrics[1].Value().(type) {
+	case float64:
+		finalLoss = v
+	case float32:
+		finalLoss = float64(v)
+	}
+	t.Logf("MNIST linear final loss after %d steps: %f", numSteps, finalLoss)
+
+	// Cross-entropy loss should be significantly less than initial ~ln(10) ≈ 2.3.
+	if finalLoss > 3.0 {
+		t.Errorf("MNIST linear loss too high: %f (expected < 3.0)", finalLoss)
+	}
+}
+
+// TestMaxPoolGradient tests MaxPool forward + backward (SelectAndScatter) through GoMLX's autodiff.
+func TestMaxPoolGradient(t *testing.T) {
+	backend := newTestBackend(t)
+
+	t.Run("forward_NCHW", func(t *testing.T) {
+		// Test MaxPool forward using GoMLX graph API with ChannelsFirst (NCHW).
+		result := graph.MustExecOnce(backend, func(x *graph.Node) *graph.Node {
+			return graph.MaxPool(x).ChannelsAxis(images.ChannelsFirst).Window(2).Done()
+		}, tensors.FromFlatDataAndDimensions(
+			[]float32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+			1, 1, 4, 4))
+		got, _ := tensors.CopyFlatData[float32](result)
+		assertClose(t, got, []float32{6, 8, 14, 16}, 1e-5)
+	})
+
+	t.Run("forward_NHWC", func(t *testing.T) {
+		// Test MaxPool forward with ChannelsLast (NHWC) — the default.
+		result := graph.MustExecOnce(backend, func(x *graph.Node) *graph.Node {
+			return graph.MaxPool(x).Window(2).Done()
+		}, tensors.FromFlatDataAndDimensions(
+			[]float32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+			1, 4, 4, 1))
+		got, _ := tensors.CopyFlatData[float32](result)
+		assertClose(t, got, []float32{6, 8, 14, 16}, 1e-5)
+	})
+
+	t.Run("gradient_NCHW", func(t *testing.T) {
+		// Test MaxPool gradient (SelectAndScatter) with ChannelsFirst.
+		result := graph.MustExecOnce(backend, func(x *graph.Node) *graph.Node {
+			pooled := graph.MaxPool(x).ChannelsAxis(images.ChannelsFirst).Window(2).Done()
+			loss := graph.ReduceAllSum(pooled)
+			grads := graph.Gradient(loss, x)
+			return grads[0]
+		}, tensors.FromFlatDataAndDimensions(
+			[]float32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+			1, 1, 4, 4))
+		got, _ := tensors.CopyFlatData[float32](result)
+		// Gradient flows to the max elements: 6(pos 5), 8(pos 7), 14(pos 13), 16(pos 15)
+		expected := []float32{0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1}
+		assertClose(t, got, expected, 1e-5)
+	})
+
+	t.Run("gradient_NHWC", func(t *testing.T) {
+		// Test MaxPool gradient (SelectAndScatter) with ChannelsLast — the default.
+		result := graph.MustExecOnce(backend, func(x *graph.Node) *graph.Node {
+			pooled := graph.MaxPool(x).Window(2).Done()
+			loss := graph.ReduceAllSum(pooled)
+			grads := graph.Gradient(loss, x)
+			return grads[0]
+		}, tensors.FromFlatDataAndDimensions(
+			[]float32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+			1, 4, 4, 1))
+		got, _ := tensors.CopyFlatData[float32](result)
+		expected := []float32{0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1}
+		assertClose(t, got, expected, 1e-5)
+	})
+}
+
+// TestCNNTraining tests a simple CNN model (Conv + ReLU + MaxPool + Dense) with training.
+// Uses synthetic 8x8 images with 2 classes: class 0 has high values in the left half,
+// class 1 has high values in the right half.
+func TestCNNTraining(t *testing.T) {
+	backend := newTestBackend(t)
+
+	const (
+		batchSize  = 20
+		imgH       = 8
+		imgW       = 8
+		numClasses = 2
+	)
+
+	// Generate synthetic dataset: class 0 = brighter left, class 1 = brighter right.
+	imgData := make([]float32, batchSize*imgH*imgW)
+	labelData := make([]int32, batchSize)
+	for i := range batchSize {
+		cls := int32(i % numClasses)
+		labelData[i] = cls
+		for h := range imgH {
+			for w := range imgW {
+				idx := i*imgH*imgW + h*imgW + w
+				if cls == 0 {
+					// Class 0: left half bright
+					if w < imgW/2 {
+						imgData[idx] = 0.8 + float32(i%5)*0.02
+					} else {
+						imgData[idx] = 0.1 + float32(i%5)*0.02
+					}
+				} else {
+					// Class 1: right half bright
+					if w >= imgW/2 {
+						imgData[idx] = 0.8 + float32(i%5)*0.02
+					} else {
+						imgData[idx] = 0.1 + float32(i%5)*0.02
+					}
+				}
+			}
+		}
+	}
+
+	// Create tensors: images [batch, H, W, 1] (NHWC), labels [batch, 1].
+	imgTensor := tensors.FromFlatDataAndDimensions(imgData, batchSize, imgH, imgW, 1)
+	labelTensor := tensors.FromFlatDataAndDimensions(labelData, batchSize, 1)
+
+	dataset := &simpleTrainDataset{
+		inputs: []*tensors.Tensor{imgTensor},
+		labels: []*tensors.Tensor{labelTensor},
+	}
+
+	ctx := context.New()
+	ctx.SetParam(optimizers.ParamLearningRate, 0.01)
+
+	// CNN model: Conv(3x3, 4 filters) → ReLU → MaxPool(2x2) → Flatten → Dense(numClasses)
+	modelFn := func(ctx *context.Context, spec any, inputs []*graph.Node) []*graph.Node {
+		x := inputs[0] // [batch, 8, 8, 1]
+
+		// Conv layer
+		x = layers.Convolution(ctx.In("conv1"), x).Filters(4).KernelSize(3).PadSame().Done()
+		x = activations.Relu(x)
+		x = graph.MaxPool(x).Window(2).Done() // [batch, 4, 4, 4]
+
+		// Flatten and classify
+		batchDim := x.Shape().Dimensions[0]
+		x = graph.Reshape(x, batchDim, -1) // [batch, 64]
+		logits := layers.Dense(ctx.In("dense"), x, true, numClasses)
+		return []*graph.Node{logits}
+	}
+
+	trainer := train.NewTrainer(backend, ctx, modelFn,
+		losses.SparseCategoricalCrossEntropyLogits,
+		optimizers.Adam().Done(),
+		nil, nil)
+
+	loop := train.NewLoop(trainer)
+	numSteps := 200
+	metrics, err := loop.RunSteps(dataset, numSteps)
+	if err != nil {
+		t.Fatalf("CNN training failed: %+v", err)
+	}
+
+	var finalLoss float64
+	switch v := metrics[1].Value().(type) {
+	case float64:
+		finalLoss = v
+	case float32:
+		finalLoss = float64(v)
+	}
+	t.Logf("CNN final loss after %d steps: %f", numSteps, finalLoss)
+
+	// Loss should decrease from initial ~ln(2) ≈ 0.69 to something much smaller.
+	if finalLoss > 0.5 {
+		t.Errorf("CNN loss too high: %f (expected < 0.5)", finalLoss)
+	}
+}
+
+// TestFusedLayerNorm tests the FusedLayerNorm operation using nn.LayerNorm directly (no context variables).
+func TestFusedLayerNorm(t *testing.T) {
+	backend := newTestBackend(t)
+
+	t.Run("basic", func(t *testing.T) {
+		// Layer normalize a [2, 4] tensor over axis 1 (features), no gamma/beta.
+		result := graph.MustExecOnce(backend, func(x *graph.Node) *graph.Node {
+			return nn.LayerNorm(x, []int{-1}, 1e-5, nil, nil, nil)
+		}, tensors.FromFlatDataAndDimensions([]float32{1, 2, 3, 4, 5, 6, 7, 8}, 2, 4))
+		got, _ := tensors.CopyFlatData[float32](result)
+		// Row 1: [1,2,3,4] → mean=2.5, var=1.25, std≈1.118 → [-1.342, -0.447, 0.447, 1.342]
+		assertClose(t, got[:4], []float32{-1.3416, -0.4472, 0.4472, 1.3416}, 1e-3)
+		assertClose(t, got[4:], []float32{-1.3416, -0.4472, 0.4472, 1.3416}, 1e-3)
+	})
+
+	t.Run("with_gamma_beta", func(t *testing.T) {
+		// Layer normalize with gamma=2 and beta=1.
+		// gamma/beta must be broadcast-shaped to match x's rank: [1, 4] for x [2, 4].
+		result := graph.MustExecOnce(backend, func(x, gamma, beta *graph.Node) *graph.Node {
+			return nn.LayerNorm(x, []int{-1}, 1e-5, gamma, beta, nil)
+		},
+			tensors.FromFlatDataAndDimensions([]float32{1, 2, 3, 4, 5, 6, 7, 8}, 2, 4),
+			tensors.FromFlatDataAndDimensions([]float32{2, 2, 2, 2}, 1, 4),
+			tensors.FromFlatDataAndDimensions([]float32{1, 1, 1, 1}, 1, 4),
+		)
+		got, _ := tensors.CopyFlatData[float32](result)
+		// normalized * 2 + 1: [-1.342*2+1, -0.447*2+1, 0.447*2+1, 1.342*2+1]
+		//                   = [-1.683, 0.106, 1.894, 3.683]
+		assertClose(t, got[:4], []float32{-1.6833, 0.1056, 1.8944, 3.6833}, 1e-3)
+	})
+
+	t.Run("gradient", func(t *testing.T) {
+		// Test that gradient flows through LayerNorm (no gamma/beta).
+		result := graph.MustExecOnce(backend, func(x *graph.Node) *graph.Node {
+			normed := nn.LayerNorm(x, []int{-1}, 1e-5, nil, nil, nil)
+			loss := graph.ReduceAllSum(normed)
+			grads := graph.Gradient(loss, x)
+			return grads[0]
+		}, tensors.FromFlatDataAndDimensions([]float32{1, 2, 3, 4}, 1, 4))
+		got, _ := tensors.CopyFlatData[float32](result)
+		// LayerNorm gradient for uniform loss sum should be close to 0
+		// (since normalizing then summing → the gradient direction
+		// is perpendicular to the constant vector).
+		for i, v := range got {
+			if math.Abs(float64(v)) > 1e-4 {
+				t.Errorf("LayerNorm gradient[%d] = %f, expected ~0", i, v)
+			}
+		}
+	})
+}
+
+// TestFusedGelu tests the FusedGelu operation.
+func TestFusedGelu(t *testing.T) {
+	backend := newTestBackend(t)
+
+	// GELU(0) = 0, GELU(large) ≈ large, GELU(negative) ≈ 0
+	result := graph.MustExecOnce(backend, func(x *graph.Node) *graph.Node {
+		return activations.Gelu(x)
+	}, []float32{0.0, 1.0, -1.0, 3.0})
+	got, _ := tensors.CopyFlatData[float32](result)
+	// Expected: GELU(0)=0, GELU(1)≈0.8413, GELU(-1)≈-0.1587, GELU(3)≈2.9960
+	assertClose(t, got, []float32{0.0, 0.8413, -0.1587, 2.9960}, 1e-3)
+}
+
+// TestTransformerTraining tests a small transformer-like model: Embedding + LayerNorm + Dense.
+func TestTransformerTraining(t *testing.T) {
+	backend := newTestBackend(t)
+
+	const (
+		batchSize  = 10
+		seqLen     = 8
+		dModel     = 16
+		numClasses = 3
+	)
+
+	// Synthetic data: each class has different feature patterns that survive LayerNorm.
+	inputData := make([]float32, batchSize*seqLen*dModel)
+	labelData := make([]int32, batchSize)
+	for i := range batchSize {
+		cls := int32(i % numClasses)
+		labelData[i] = cls
+		for s := range seqLen {
+			for d := range dModel {
+				idx := i*seqLen*dModel + s*dModel + d
+				// Create class-dependent variance patterns: different features are active per class.
+				if d%numClasses == int(cls) {
+					inputData[idx] = 1.0 + float32(d)*0.1
+				} else {
+					inputData[idx] = -0.5
+				}
+			}
+		}
+	}
+
+	inputTensor := tensors.FromFlatDataAndDimensions(inputData, batchSize, seqLen, dModel)
+	labelTensor := tensors.FromFlatDataAndDimensions(labelData, batchSize, 1)
+
+	dataset := &simpleTrainDataset{
+		inputs: []*tensors.Tensor{inputTensor},
+		labels: []*tensors.Tensor{labelTensor},
+	}
+
+	ctx := context.New()
+	ctx.SetParam(optimizers.ParamLearningRate, 0.01)
+
+	// Transformer-like model: LayerNorm → Dense → GELU → reduce → Dense → logits
+	modelFn := func(ctx *context.Context, spec any, inputs []*graph.Node) []*graph.Node {
+		x := inputs[0] // [batch, seq, dModel]
+
+		// LayerNorm over feature dim
+		x = layers.LayerNormalization(ctx.In("ln1"), x, -1).Done()
+
+		// Feed-forward: Dense → GELU → Dense
+		x = layers.Dense(ctx.In("ff1"), x, true, dModel)
+		x = activations.Gelu(x)
+
+		// Mean pool over sequence
+		x = graph.ReduceMean(x, 1) // [batch, dModel]
+
+		// Output
+		logits := layers.Dense(ctx.In("out"), x, true, numClasses)
+		return []*graph.Node{logits}
+	}
+
+	trainer := train.NewTrainer(backend, ctx, modelFn,
+		losses.SparseCategoricalCrossEntropyLogits,
+		optimizers.Adam().Done(),
+		nil, nil)
+
+	loop := train.NewLoop(trainer)
+	numSteps := 500
+	metrics, err := loop.RunSteps(dataset, numSteps)
+	if err != nil {
+		t.Fatalf("Transformer training failed: %+v", err)
+	}
+
+	var finalLoss float64
+	switch v := metrics[1].Value().(type) {
+	case float64:
+		finalLoss = v
+	case float32:
+		finalLoss = float64(v)
+	}
+	t.Logf("Transformer final loss after %d steps: %f", numSteps, finalLoss)
+
+	// ln(3) ≈ 1.099 is the random baseline for 3 classes; loss should drop well below.
+	if finalLoss > 0.5 {
+		t.Errorf("Transformer loss too high: %f (expected < 0.5)", finalLoss)
+	}
+}
+
+// TestInt64Operations tests Int64 dtype support.
+func TestInt64Operations(t *testing.T) {
+	backend := newTestBackend(t)
+
+	t.Run("add", func(t *testing.T) {
+		result := graph.MustExecOnce(backend, func(a, b *graph.Node) *graph.Node {
+			return graph.Add(a, b)
+		}, []int64{1, 2, 3}, []int64{10, 20, 30})
+		got, _ := tensors.CopyFlatData[int64](result)
+		expected := []int64{11, 22, 33}
+		for i, v := range got {
+			if v != expected[i] {
+				t.Errorf("Int64 Add[%d]: got %d, want %d", i, v, expected[i])
+			}
+		}
+	})
+
+	t.Run("cast_float_to_int64", func(t *testing.T) {
+		result := graph.MustExecOnce(backend, func(x *graph.Node) *graph.Node {
+			return graph.ConvertDType(x, dtypes.Int64)
+		}, []float32{1.5, 2.9, -3.1})
+		got, _ := tensors.CopyFlatData[int64](result)
+		// Truncation: 1.5→1, 2.9→2, -3.1→-3
+		expected := []int64{1, 2, -3}
+		for i, v := range got {
+			if v != expected[i] {
+				t.Errorf("Cast Float32→Int64[%d]: got %d, want %d", i, v, expected[i])
+			}
+		}
+	})
+
+	t.Run("gather_with_int32_indices", func(t *testing.T) {
+		// Common pattern: gather with int32 index tensor (used for embeddings).
+		result := graph.MustExecOnce(backend, func(x *graph.Node) *graph.Node {
+			indices := graph.Const(x.Graph(), tensors.FromFlatDataAndDimensions([]int32{2, 0, 1}, 3, 1))
+			return graph.Gather(x, indices)
+		}, tensors.FromFlatDataAndDimensions([]float32{10, 20, 30}, 3, 1))
+		got, _ := tensors.CopyFlatData[float32](result)
+		expected := []float32{30, 10, 20}
+		for i, v := range got {
+			if v != expected[i] {
+				t.Errorf("Gather[%d]: got %f, want %f", i, v, expected[i])
+			}
+		}
+	})
+
+	t.Run("uint8_arithmetic", func(t *testing.T) {
+		result := graph.MustExecOnce(backend, func(a, b *graph.Node) *graph.Node {
+			return graph.Add(a, b)
+		}, []uint8{100, 200}, []uint8{10, 20})
+		got, _ := tensors.CopyFlatData[uint8](result)
+		expected := []uint8{110, 220}
+		for i, v := range got {
+			if v != expected[i] {
+				t.Errorf("Uint8 Add[%d]: got %d, want %d", i, v, expected[i])
+			}
+		}
+	})
+}
+
+// BenchmarkTransformerStep measures per-step time for a transformer-like training iteration.
+// Run with: go test -bench BenchmarkTransformerStep -benchtime 10s -count 1
+func BenchmarkTransformerStep(b *testing.B) {
+	backend, err := New("")
+	if err != nil {
+		b.Fatalf("New() failed: %+v", err)
+	}
+	defer backend.Finalize()
+
+	const (
+		batchSize  = 8
+		seqLen     = 128
+		dModel     = 64
+		numClasses = 10
+	)
+
+	// Synthetic data.
+	inputData := make([]float32, batchSize*seqLen*dModel)
+	labelData := make([]int32, batchSize)
+	for i := range batchSize {
+		cls := int32(i % numClasses)
+		labelData[i] = cls
+		for j := range seqLen * dModel {
+			inputData[i*seqLen*dModel+j] = float32(cls)*0.1 + float32(j%dModel)*0.01
+		}
+	}
+
+	inputTensor := tensors.FromFlatDataAndDimensions(inputData, batchSize, seqLen, dModel)
+	labelTensor := tensors.FromFlatDataAndDimensions(labelData, batchSize, 1)
+
+	dataset := &simpleTrainDataset{
+		inputs: []*tensors.Tensor{inputTensor},
+		labels: []*tensors.Tensor{labelTensor},
+	}
+
+	ctx := context.New()
+	ctx.SetParam(optimizers.ParamLearningRate, 0.001)
+
+	// Transformer-like model: LayerNorm → Dense → GELU → reduce → Dense → logits
+	modelFn := func(ctx *context.Context, spec any, inputs []*graph.Node) []*graph.Node {
+		x := inputs[0] // [batch, seq, dModel]
+
+		// LayerNorm over feature dim
+		x = layers.LayerNormalization(ctx.In("ln1"), x, -1).Done()
+
+		// Feed-forward: Dense → GELU → Dense
+		x = layers.Dense(ctx.In("ff1"), x, true, dModel)
+		x = activations.Gelu(x)
+		x = layers.Dense(ctx.In("ff2"), x, true, dModel)
+
+		// Mean pool over sequence
+		x = graph.ReduceMean(x, 1) // [batch, dModel]
+
+		// Output
+		logits := layers.Dense(ctx.In("out"), x, true, numClasses)
+		return []*graph.Node{logits}
+	}
+
+	trainer := train.NewTrainer(backend, ctx, modelFn,
+		losses.SparseCategoricalCrossEntropyLogits,
+		optimizers.Adam().Done(),
+		nil, nil)
+
+	// Warm up: first step includes compilation.
+	loop := train.NewLoop(trainer)
+	_, err = loop.RunSteps(dataset, 5)
+	if err != nil {
+		b.Fatalf("Warmup failed: %+v", err)
+	}
+
+	b.ResetTimer()
+	for range b.N {
+		_, err = loop.RunSteps(dataset, 1)
+		if err != nil {
+			b.Fatalf("Step failed: %+v", err)
+		}
+	}
+}
+
+// benchmarkMatMul benchmarks matrix multiplication of given dimensions.
+func benchmarkMatMul(b *testing.B, M, K, N int) {
+	backend, err := New("")
+	if err != nil {
+		b.Fatalf("New() failed: %+v", err)
+	}
+	defer backend.Finalize()
+
+	aData := make([]float32, M*K)
+	bData := make([]float32, K*N)
+	for i := range aData {
+		aData[i] = float32(i%100) * 0.01
+	}
+	for i := range bData {
+		bData[i] = float32(i%100) * 0.01
+	}
+	aTensor := tensors.FromFlatDataAndDimensions(aData, M, K)
+	bTensor := tensors.FromFlatDataAndDimensions(bData, K, N)
+
+	exec, err := graph.NewExec(backend, func(a, b *graph.Node) *graph.Node {
+		return graph.Dot(a, b)
+	})
+	if err != nil {
+		b.Fatalf("NewExec failed: %+v", err)
+	}
+	defer exec.Finalize()
+	exec.MustExec(aTensor, bTensor)
+
+	b.ResetTimer()
+	for range b.N {
+		exec.MustExec(aTensor, bTensor)
+	}
+}
+
+func BenchmarkDenseMatMul_512x256x512(b *testing.B)   { benchmarkMatMul(b, 512, 256, 512) }
+func BenchmarkDenseMatMul_1024x768x1024(b *testing.B) { benchmarkMatMul(b, 1024, 768, 1024) }
+func BenchmarkDenseMatMul_2048x768x2048(b *testing.B) { benchmarkMatMul(b, 2048, 768, 2048) }
+
+// Benchmarks matching CoreML benchmark_test.go for direct comparison.
+
+func BenchmarkMatMulExecution_64(b *testing.B)   { benchmarkMatMul(b, 64, 64, 64) }
+func BenchmarkMatMulExecution_128(b *testing.B)  { benchmarkMatMul(b, 128, 128, 128) }
+func BenchmarkMatMulExecution_256(b *testing.B)  { benchmarkMatMul(b, 256, 256, 256) }
+func BenchmarkMatMulExecution_512(b *testing.B)  { benchmarkMatMul(b, 512, 512, 512) }
+func BenchmarkMatMulExecution_1024(b *testing.B) { benchmarkMatMul(b, 1024, 1024, 1024) }
+func BenchmarkMatMulExecution_2048(b *testing.B) { benchmarkMatMul(b, 2048, 2048, 2048) }
+
+// BenchmarkBinaryOps benchmarks (x + y) * (x - y) on [1024] vectors.
+func BenchmarkBinaryOps(b *testing.B) {
+	backend, err := New("")
+	if err != nil {
+		b.Fatalf("New() failed: %+v", err)
+	}
+	defer backend.Finalize()
+
+	xData := make([]float32, 1024)
+	yData := make([]float32, 1024)
+	for i := range xData {
+		xData[i] = float32(i) * 0.01
+		yData[i] = float32(1024-i) * 0.01
+	}
+
+	exec, err := graph.NewExec(backend, func(x, y *graph.Node) *graph.Node {
+		return graph.Mul(graph.Add(x, y), graph.Sub(x, y))
+	})
+	if err != nil {
+		b.Fatalf("NewExec failed: %+v", err)
+	}
+	defer exec.Finalize()
+	exec.MustExec(xData, yData)
+
+	b.ResetTimer()
+	for range b.N {
+		exec.MustExec(xData, yData)
+	}
+}
+
+// BenchmarkReduceOps benchmarks ReduceSum on [1024, 1024] along axis 1.
+func BenchmarkReduceOps(b *testing.B) {
+	backend, err := New("")
+	if err != nil {
+		b.Fatalf("New() failed: %+v", err)
+	}
+	defer backend.Finalize()
+
+	data := make([]float32, 1024*1024)
+	for i := range data {
+		data[i] = float32(i) * 0.0001
+	}
+	tensor := tensors.FromFlatDataAndDimensions(data, 1024, 1024)
+
+	exec, err := graph.NewExec(backend, func(x *graph.Node) *graph.Node {
+		return graph.ReduceSum(x, 1)
+	})
+	if err != nil {
+		b.Fatalf("NewExec failed: %+v", err)
+	}
+	defer exec.Finalize()
+	exec.MustExec(tensor)
+
+	b.ResetTimer()
+	for range b.N {
+		exec.MustExec(tensor)
+	}
+}
+
+// BenchmarkUnaryOps benchmarks exp(log(abs(x))) on [1024] vectors.
+func BenchmarkUnaryOps(b *testing.B) {
+	backend, err := New("")
+	if err != nil {
+		b.Fatalf("New() failed: %+v", err)
+	}
+	defer backend.Finalize()
+
+	data := make([]float32, 1024)
+	for i := range data {
+		data[i] = float32(i+1) * 0.01
+	}
+
+	exec, err := graph.NewExec(backend, func(x *graph.Node) *graph.Node {
+		return graph.Exp(graph.Log(graph.Abs(x)))
+	})
+	if err != nil {
+		b.Fatalf("NewExec failed: %+v", err)
+	}
+	defer exec.Finalize()
+	exec.MustExec(data)
+
+	b.ResetTimer()
+	for range b.N {
+		exec.MustExec(data)
+	}
 }

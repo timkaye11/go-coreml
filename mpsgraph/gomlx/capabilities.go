@@ -117,7 +117,8 @@ var backendCapabilities = backends.Capabilities{
 		backends.OpTypeConvGeneral: true,
 
 		// Phase 2: Pooling
-		backends.OpTypeReduceWindow: true,
+		backends.OpTypeReduceWindow:        true,
+		backends.OpTypeSelectAndScatterMax: true,
 
 		// Phase 2: TotalOrder comparisons
 		backends.OpTypeEqualTotalOrder:          true,
@@ -130,6 +131,11 @@ var backendCapabilities = backends.Capabilities{
 		// Phase 2: Logical reductions
 		backends.OpTypeReduceLogicalAnd: true,
 		backends.OpTypeReduceLogicalOr:  true,
+
+		// Fused operations
+		backends.OpTypeFusedSoftmax:   true,
+		backends.OpTypeFusedLayerNorm: true,
+		backends.OpTypeFusedGelu:      true,
 	},
 
 	DTypes: map[dtypes.DType]bool{
@@ -139,5 +145,9 @@ var backendCapabilities = backends.Capabilities{
 		dtypes.Int8:    true,
 		dtypes.Int16:   true,
 		dtypes.Int32:   true,
+		dtypes.Int64:   true,
+		dtypes.Uint8:   true,
+		dtypes.Uint16:  true,
+		dtypes.Uint32:  true,
 	},
 }

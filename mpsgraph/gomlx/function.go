@@ -292,7 +292,15 @@ func (f *Function) IsNaN(x backends.Value) (backends.Value, error) {
 }
 
 func (f *Function) Identity(x backends.Value) (backends.Value, error) {
-	return f.unaryOp("Identity", backends.OpTypeIdentity, f.ctx().Identity, x)
+	node, err := castNode(x)
+	if err != nil {
+		return nil, errors.Wrap(err, "Identity")
+	}
+	tensor, err := f.ctx().Identity(node.tensor)
+	if err != nil {
+		return nil, errors.Wrap(err, "Identity")
+	}
+	return &graphNode{tensor: tensor, shape: node.shape}, nil
 }
 
 // ===========================================================================
@@ -665,6 +673,13 @@ func (f *Function) reduceOp(opName string, opType backends.OpType, reduceType in
 	if err != nil {
 		return nil, errors.Wrap(err, opName)
 	}
+	// Empty axes means reduce all dimensions.
+	if len(axes) == 0 {
+		axes = make([]int, node.shape.Rank())
+		for i := range axes {
+			axes[i] = i
+		}
+	}
 	outShape, err := shapeinference.ReduceOp(node.shape, axes)
 	if err != nil {
 		return nil, errors.Wrap(err, opName)
@@ -889,26 +904,45 @@ func (f *Function) RNGBitGenerator(state backends.Value, shape shapes.Shape) (ne
 			expectedStateShape, stateNode.shape)
 	}
 
-	// Generate random values using MPSGraph's random uniform.
-	// MPSGraph manages its own RNG state, so we pass the GoMLX state through unchanged.
 	dims := make([]int64, shape.Rank())
 	for i, d := range shape.Dimensions {
 		dims[i] = int64(d)
 	}
-	bridgeDType := dtypeToBridgeDType(shape.DType)
 
-	valuesTensor, err := f.ctx().RandomUniform(bridgeDType, dims)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "RNGBitGenerator")
+	// GoMLX's RandomUniform calls RNGBitGenerator with Uint32 dtype to get random bits,
+	// then converts to float: ConvertDType(bits, Float32) * (1/2^32).
+	// MPSGraph only supports float types for random generation (float16, bfloat16, float32).
+	// Strategy: generate Float32 uniform [0, 1), scale to [0, 2^32) so the subsequent
+	// ConvertDType(Uint32→Float32) is a no-op cast and MulScalar(1/2^32) produces [0, 1).
+	var valuesTensor bridge.Tensor
+	if shape.DType.IsFloat() {
+		// Direct generation for float types.
+		bridgeDType := dtypeToBridgeDType(shape.DType)
+		valuesTensor, err = f.ctx().RandomUniform(bridgeDType, dims)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "RNGBitGenerator")
+		}
+	} else {
+		// Integer type (typically Uint32): generate Float32 uniform and scale.
+		valuesTensor, err = f.ctx().RandomUniform(dtypeToBridgeDType(dtypes.Float32), dims)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "RNGBitGenerator: RandomUniform(Float32)")
+		}
+		// Scale [0, 1) → [0, 2^32) so the calling code's pipeline
+		// (ConvertDType + MulScalar(1/2^32)) produces correct [0, 1) uniform.
+		scaleVal := float32(4294967296.0) // 2^32
+		scaleTensor, err := f.ctx().Constant(
+			unsafe.Pointer(&scaleVal), 4, dtypeToBridgeDType(dtypes.Float32), []int64{1})
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "RNGBitGenerator: scale constant")
+		}
+		valuesTensor, err = f.ctx().Mul(valuesTensor, scaleTensor)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "RNGBitGenerator: scale")
+		}
 	}
 
-	// For integer types, we need random bits, not uniform [0,1).
-	// MPSGraph only generates uniform floats, so for integer types we generate
-	// Float32 uniform, scale to the range, and cast.
-	// However, the common GoMLX pattern is to generate uint32 bits and then convert.
-	// For now, we pass the state through and return the random tensor.
-	// The state is unchanged since MPSGraph manages its own state.
-
+	// Pass the GoMLX RNG state through unchanged (MPSGraph manages its own state).
 	newStateNode := &graphNode{tensor: stateNode.tensor, shape: stateNode.shape}
 	valuesNode := &graphNode{tensor: valuesTensor, shape: shape}
 	return newStateNode, valuesNode, nil
@@ -934,6 +968,38 @@ func (f *Function) ConvGeneral(
 		return nil, errors.Wrap(err, "ConvGeneral: kernel")
 	}
 
+	numSpatialDims := len(axes.InputSpatial)
+
+	// Default nil strides to 1.
+	if strides == nil {
+		strides = make([]int, numSpatialDims)
+		for i := range strides {
+			strides[i] = 1
+		}
+	}
+
+	// Default nil dilations to 1.
+	if inputDilations == nil {
+		inputDilations = make([]int, numSpatialDims)
+		for i := range inputDilations {
+			inputDilations[i] = 1
+		}
+	}
+	if kernelDilations == nil {
+		kernelDilations = make([]int, numSpatialDims)
+		for i := range kernelDilations {
+			kernelDilations[i] = 1
+		}
+	}
+
+	// Default group counts.
+	if channelGroupCount < 1 {
+		channelGroupCount = 1
+	}
+	if batchGroupCount < 1 {
+		batchGroupCount = 1
+	}
+
 	outputShape, err := shapeinference.ConvGeneralOp(
 		inputNode.shape, kernelNode.shape, axes, strides, paddings,
 		inputDilations, kernelDilations, channelGroupCount, batchGroupCount)
@@ -941,9 +1007,17 @@ func (f *Function) ConvGeneral(
 		return nil, errors.Wrap(err, "ConvGeneral")
 	}
 
-	numSpatialDims := len(axes.InputSpatial)
 	if numSpatialDims != 2 {
 		return nil, errors.Errorf("ConvGeneral: only 2D convolution supported, got %d spatial dims", numSpatialDims)
+	}
+
+	// Check if input dilation is needed (values > 1).
+	hasInputDilation := false
+	for _, d := range inputDilations {
+		if d > 1 {
+			hasInputDilation = true
+			break
+		}
 	}
 
 	// Transpose input and kernel to NCHW / OIHW layout expected by MPSGraph.
@@ -951,6 +1025,17 @@ func (f *Function) ConvGeneral(
 	if err != nil {
 		return nil, errors.Wrap(err, "ConvGeneral: transpose input")
 	}
+
+	// Handle input dilation by inserting zeros between input elements.
+	// Input dilation of D for an axis means: between each pair of values, insert (D-1) zeros.
+	// This expands a dimension of size N to (N-1)*D + 1.
+	if hasInputDilation {
+		inputTensor, err = f.dilateInput(inputTensor, inputNode.shape, axes.InputBatch, axes.InputChannels, axes.InputSpatial, inputDilations)
+		if err != nil {
+			return nil, errors.Wrap(err, "ConvGeneral: input dilation")
+		}
+	}
+
 	kernelTensor, err := f.transposeToOIHW(kernelNode, axes.KernelOutputChannels, axes.KernelInputChannels, axes.KernelSpatial)
 	if err != nil {
 		return nil, errors.Wrap(err, "ConvGeneral: transpose kernel")
@@ -962,21 +1047,15 @@ func (f *Function) ConvGeneral(
 	padBeforeArr := make([]int64, numSpatialDims)
 	padAfterArr := make([]int64, numSpatialDims)
 	for i := range numSpatialDims {
-		strideArr[i] = 1
-		dilationArr[i] = 1
-		if strides != nil && i < len(strides) {
-			strideArr[i] = int64(strides[i])
-		}
-		if kernelDilations != nil && i < len(kernelDilations) {
-			dilationArr[i] = int64(kernelDilations[i])
-		}
+		strideArr[i] = int64(strides[i])
+		dilationArr[i] = int64(kernelDilations[i])
 		if paddings != nil && i < len(paddings) {
 			padBeforeArr[i] = int64(paddings[i][0])
 			padAfterArr[i] = int64(paddings[i][1])
 		}
 	}
 
-	groups := max(channelGroupCount, 1) * max(batchGroupCount, 1)
+	groups := channelGroupCount * batchGroupCount
 	result, err := f.ctx().ConvGeneral(inputTensor, kernelTensor, numSpatialDims,
 		strideArr, dilationArr, padBeforeArr, padAfterArr, groups)
 	if err != nil {
@@ -990,6 +1069,181 @@ func (f *Function) ConvGeneral(
 	}
 
 	return &graphNode{tensor: result, shape: outputShape}, nil
+}
+
+// dilateInput inserts zeros between input elements for input dilation.
+// Input is already in NCHW layout. dilations are per spatial axis.
+func (f *Function) dilateInput(tensor bridge.Tensor, origShape shapes.Shape, batchAxis, channelAxis int, spatialAxes []int, dilations []int) (bridge.Tensor, error) {
+	// After transpose to NCHW, spatial dims are at indices 2 and 3.
+	// Dilation of D on an axis with size N → new size = (N-1)*D + 1.
+	// We use Pad with interior padding to achieve this.
+	origDims := origShape.Dimensions
+	// Get spatial dims in original order.
+	spatialSizes := make([]int64, len(spatialAxes))
+	for i, ax := range spatialAxes {
+		spatialSizes[i] = int64(origDims[ax])
+	}
+
+	// Compute dilated sizes and pad amounts.
+	// In NCHW layout: [batch, channels, H, W], spatial at indices 2, 3.
+	// Build padBefore/padAfter arrays with interior padding.
+	// MPSGraph pad doesn't support interior padding, so we build with Iota + scatter approach.
+	// Actually, a simpler approach: create a zero tensor of the dilated size and scatter original values.
+
+	batchSize := int64(origDims[batchAxis])
+	channelSize := int64(origDims[channelAxis])
+	dilatedH := (spatialSizes[0]-1)*int64(dilations[0]) + 1
+	dilatedW := (spatialSizes[1]-1)*int64(dilations[1]) + 1
+
+	// Create a zero tensor of the dilated size [batch, channels, dilatedH, dilatedW].
+	zeroVal := float32(0)
+	zeroTensor, err := f.ctx().Constant(
+		unsafe.Pointer(&zeroVal), 4, dtypeToBridgeDType(origShape.DType), []int64{1})
+	if err != nil {
+		return nil, errors.Wrap(err, "dilateInput: zero constant")
+	}
+	dilatedShape := []int64{batchSize, channelSize, dilatedH, dilatedW}
+	zeroTensor, err = f.ctx().BroadcastTo(zeroTensor, dilatedShape)
+	if err != nil {
+		return nil, errors.Wrap(err, "dilateInput: broadcast zeros")
+	}
+
+	// Use slice + dynamic_update_slice to place original values at strided positions.
+	// Actually, the simplest approach: use Pad with 0 before, 0 after, and (dilation-1) interior.
+	// But our bridge doesn't support interior padding.
+
+	// Alternative: create with strides using Slice in reverse.
+	// Actually the simplest correct approach for input dilation:
+	// Build indices for scattered positions and use gather/scatter.
+	// But that's complex. Let me use a different approach:
+	// Reshape + interleave with zeros using Concatenate along spatial axes.
+
+	// Simplest approach: iterate and build with concat.
+	// For moderate dilation factors, this is reasonable.
+
+	// Actually, let me just implement this with a strided assignment pattern using
+	// DynamicUpdateSlice. For each row/col, update the appropriate position.
+
+	// The most efficient approach: use pad with interior padding.
+	// We can implement interior padding as: create dilated zero tensor, then
+	// for each (h, w) in original, place at (h*dilH, w*dilW) in dilated.
+	// This is a gather operation: create stride indices.
+
+	// Actually, the cleanest approach: use Slice with negative strides (not supported),
+	// or simply use a workaround.
+
+	// Let me try: create the dilated tensor directly using the stridedSlice approach:
+	// tensor is [B, C, H, W], we want [B, C, (H-1)*d+1, (W-1)*d+1]
+	// with original values at positions [0, d, 2d, ...] in each spatial axis.
+
+	// The simplest correct approach uses Iota to generate scatter indices:
+	// For now, just create a Pad operation that inserts zeros.
+	// Our Pad bridge doesn't support interior padding, so let's implement it
+	// by reshaping + concat.
+
+	// For dilation D on axis of size N:
+	//   1. Reshape: [..., N, 1, ...]
+	//   2. Pad with D-1 zeros on the last new dim: [..., N, D, ...]
+	//   3. Reshape to flatten: [..., N*D, ...]
+	//   4. Slice to remove trailing D-1 zeros: [..., (N-1)*D+1, ...]
+
+	result := tensor
+
+	// Dilate height (axis 2 in NCHW).
+	if dilations[0] > 1 {
+		result, err = f.dilateAxis(result, 2, spatialSizes[0], int64(dilations[0]),
+			[]int64{batchSize, channelSize, spatialSizes[0], spatialSizes[1]}, origShape.DType)
+		if err != nil {
+			return nil, errors.Wrap(err, "dilateInput: dilate H")
+		}
+		spatialSizes[0] = dilatedH
+	}
+
+	// Dilate width (axis 3 in NCHW).
+	if dilations[1] > 1 {
+		result, err = f.dilateAxis(result, 3, spatialSizes[1], int64(dilations[1]),
+			[]int64{batchSize, channelSize, dilatedH, spatialSizes[1]}, origShape.DType)
+		if err != nil {
+			return nil, errors.Wrap(err, "dilateInput: dilate W")
+		}
+	}
+
+	return result, nil
+}
+
+// dilateAxis dilates a single axis by inserting (dilation-1) zeros between elements.
+// Approach: reshape to insert a new dim, pad that dim, reshape to flatten, then slice.
+func (f *Function) dilateAxis(tensor bridge.Tensor, axis int, axisSize, dilation int64, currentShape []int64, dtype dtypes.DType) (bridge.Tensor, error) {
+	rank := len(currentShape)
+
+	// Step 1: Reshape to split the target axis into [axisSize, 1].
+	reshapeDims := make([]int64, rank+1)
+	for i := 0; i < axis; i++ {
+		reshapeDims[i] = currentShape[i]
+	}
+	reshapeDims[axis] = axisSize
+	reshapeDims[axis+1] = 1
+	for i := axis + 1; i < rank; i++ {
+		reshapeDims[i+1] = currentShape[i]
+	}
+	result, err := f.ctx().Reshape(tensor, reshapeDims)
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 2: Pad the new axis (axis+1) with (dilation-1) zeros after.
+	padBefore := make([]int64, rank+1)
+	padAfter := make([]int64, rank+1)
+	padAfter[axis+1] = dilation - 1
+
+	zeroVal := float32(0)
+	zeroTensor, err := f.ctx().Constant(
+		unsafe.Pointer(&zeroVal), 4, dtypeToBridgeDType(dtype), []int64{1})
+	if err != nil {
+		return nil, err
+	}
+	// Reshape zero to scalar for pad.
+	zeroTensor, err = f.ctx().Reshape(zeroTensor, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	result, err = f.ctx().Pad(result, zeroTensor, padBefore, padAfter)
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 3: Reshape to flatten the axis back: [axisSize * dilation].
+	flatDims := make([]int64, rank)
+	for i := 0; i < axis; i++ {
+		flatDims[i] = currentShape[i]
+	}
+	flatDims[axis] = axisSize * dilation
+	for i := axis + 1; i < rank; i++ {
+		flatDims[i] = currentShape[i]
+	}
+	result, err = f.ctx().Reshape(result, flatDims)
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 4: Slice to remove trailing (dilation-1) zeros.
+	// New size = (axisSize-1)*dilation + 1.
+	dilatedSize := (axisSize-1)*dilation + 1
+	starts := make([]int64, rank)
+	ends := make([]int64, rank)
+	strides := make([]int64, rank)
+	for i := range rank {
+		ends[i] = flatDims[i]
+		strides[i] = 1
+	}
+	ends[axis] = dilatedSize
+	result, err = f.ctx().Slice(result, starts, ends, strides)
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
 }
 
 // transposeToNCHW transposes a tensor from arbitrary axis layout to NCHW.
@@ -1047,6 +1301,79 @@ func (f *Function) transposeFromNCHW(tensor bridge.Tensor, targetShape shapes.Sh
 // ReduceWindow (Pooling)
 // ===========================================================================
 
+// poolAxesInfo holds axis mapping for pool operations.
+// MPSGraph pool2d expects NCHW layout; this detects the actual layout
+// and provides permutations for transposing to/from NCHW.
+type poolAxesInfo struct {
+	spatialAxes    [2]int   // Indices of spatial axes in original layout.
+	nonSpatialAxes [2]int   // Indices of batch/channel axes in original layout.
+	toNCHW         []int    // Permutation from original layout to NCHW.
+	fromNCHW       []int    // Permutation from NCHW back to original layout.
+	needsTranspose bool     // Whether transposition is needed.
+	spatialWindow  [2]int64 // Window sizes for spatial dims.
+	spatialStrides [2]int64 // Strides for spatial dims.
+	padBefore      [2]int64 // Padding before for spatial dims.
+	padAfter       [2]int64 // Padding after for spatial dims.
+}
+
+// detectPoolAxes detects spatial axes from windowDimensions and builds
+// transposition info. Spatial axes are those with window > 1 or stride > 1
+// or non-zero padding.
+func detectPoolAxes(windowDimensions, windowStrides []int, paddings [][2]int) (poolAxesInfo, error) {
+	var info poolAxesInfo
+
+	// Detect spatial axes: those with window > 1 or stride > 1 or padding.
+	var spatialAxes, nonSpatialAxes []int
+	for i := range 4 {
+		isSpatial := false
+		if windowDimensions[i] > 1 {
+			isSpatial = true
+		}
+		if windowStrides != nil && i < len(windowStrides) && windowStrides[i] > 1 {
+			isSpatial = true
+		}
+		if paddings != nil && i < len(paddings) && (paddings[i][0] != 0 || paddings[i][1] != 0) {
+			isSpatial = true
+		}
+		if isSpatial {
+			spatialAxes = append(spatialAxes, i)
+		} else {
+			nonSpatialAxes = append(nonSpatialAxes, i)
+		}
+	}
+
+	if len(spatialAxes) != 2 || len(nonSpatialAxes) != 2 {
+		return info, errors.Errorf("expected exactly 2 spatial axes (window > 1), got %d spatial %v, %d non-spatial %v",
+			len(spatialAxes), spatialAxes, len(nonSpatialAxes), nonSpatialAxes)
+	}
+
+	info.spatialAxes = [2]int{spatialAxes[0], spatialAxes[1]}
+	info.nonSpatialAxes = [2]int{nonSpatialAxes[0], nonSpatialAxes[1]}
+
+	// Build permutation to NCHW: [nonSpatial0, nonSpatial1, spatial0, spatial1].
+	info.toNCHW = []int{nonSpatialAxes[0], nonSpatialAxes[1], spatialAxes[0], spatialAxes[1]}
+	info.needsTranspose = info.toNCHW[0] != 0 || info.toNCHW[1] != 1 || info.toNCHW[2] != 2 || info.toNCHW[3] != 3
+
+	// Inverse permutation.
+	info.fromNCHW = make([]int, 4)
+	for i, v := range info.toNCHW {
+		info.fromNCHW[v] = i
+	}
+
+	// Extract spatial parameters.
+	info.spatialWindow = [2]int64{int64(windowDimensions[spatialAxes[0]]), int64(windowDimensions[spatialAxes[1]])}
+	info.spatialStrides = [2]int64{1, 1}
+	if windowStrides != nil {
+		info.spatialStrides = [2]int64{int64(windowStrides[spatialAxes[0]]), int64(windowStrides[spatialAxes[1]])}
+	}
+	if paddings != nil {
+		info.padBefore = [2]int64{int64(paddings[spatialAxes[0]][0]), int64(paddings[spatialAxes[1]][0])}
+		info.padAfter = [2]int64{int64(paddings[spatialAxes[0]][1]), int64(paddings[spatialAxes[1]][1])}
+	}
+
+	return info, nil
+}
+
 func (f *Function) ReduceWindow(
 	x backends.Value,
 	reductionType backends.ReduceOpType,
@@ -1064,16 +1391,9 @@ func (f *Function) ReduceWindow(
 		return nil, errors.Wrap(err, "ReduceWindow")
 	}
 
-	// For now, only support the common 2D pooling case with window on spatial dims.
-	// Full general ReduceWindow decomposition is complex.
 	rank := node.shape.Rank()
 	if rank != 4 {
-		return nil, errors.Errorf("ReduceWindow: only 4D tensors (NCHW) supported, got rank %d", rank)
-	}
-
-	// Check that batch and channel dims have window size 1.
-	if windowDimensions[0] != 1 || windowDimensions[1] != 1 {
-		return nil, errors.Errorf("ReduceWindow: batch/channel window must be 1, got %v", windowDimensions[:2])
+		return nil, errors.Errorf("ReduceWindow: only 4D tensors supported, got rank %d", rank)
 	}
 
 	var mode int
@@ -1086,21 +1406,36 @@ func (f *Function) ReduceWindow(
 		return nil, errors.Errorf("ReduceWindow: reduction type %v not supported in MPSGraph pooling", reductionType)
 	}
 
-	spatialWindow := []int64{int64(windowDimensions[2]), int64(windowDimensions[3])}
-	spatialStrides := []int64{1, 1}
-	if strides != nil && len(strides) >= 4 {
-		spatialStrides = []int64{int64(strides[2]), int64(strides[3])}
-	}
-	padBefore := []int64{0, 0}
-	padAfter := []int64{0, 0}
-	if paddings != nil && len(paddings) >= 4 {
-		padBefore = []int64{int64(paddings[2][0]), int64(paddings[3][0])}
-		padAfter = []int64{int64(paddings[2][1]), int64(paddings[3][1])}
-	}
-
-	tensor, err := f.ctx().Pool2D(node.tensor, mode, spatialWindow, spatialStrides, padBefore, padAfter)
+	axesInfo, err := detectPoolAxes(windowDimensions, strides, paddings)
 	if err != nil {
 		return nil, errors.Wrap(err, "ReduceWindow")
+	}
+
+	// Transpose to NCHW if needed.
+	tensor := node.tensor
+	if axesInfo.needsTranspose {
+		tensor, err = f.ctx().Transpose(tensor, axesInfo.toNCHW)
+		if err != nil {
+			return nil, errors.Wrap(err, "ReduceWindow: transpose to NCHW")
+		}
+	}
+
+	spatialWindow := axesInfo.spatialWindow[:]
+	spatialStrides := axesInfo.spatialStrides[:]
+	padBefore := axesInfo.padBefore[:]
+	padAfter := axesInfo.padAfter[:]
+
+	tensor, err = f.ctx().Pool2D(tensor, mode, spatialWindow, spatialStrides, padBefore, padAfter)
+	if err != nil {
+		return nil, errors.Wrap(err, "ReduceWindow")
+	}
+
+	// Transpose back from NCHW if needed.
+	if axesInfo.needsTranspose {
+		tensor, err = f.ctx().Transpose(tensor, axesInfo.fromNCHW)
+		if err != nil {
+			return nil, errors.Wrap(err, "ReduceWindow: transpose from NCHW")
+		}
 	}
 
 	// Reshape to match expected output shape if needed.
@@ -1114,6 +1449,77 @@ func (f *Function) ReduceWindow(
 	}
 
 	return &graphNode{tensor: tensor, shape: outShape}, nil
+}
+
+// ===========================================================================
+// SelectAndScatter (MaxPool gradient)
+// ===========================================================================
+
+func (f *Function) SelectAndScatterMax(operand, source backends.Value, windowDimensions, windowStrides []int, paddings [][2]int) (backends.Value, error) {
+	return f.selectAndScatterImpl("SelectAndScatterMax", operand, source, windowDimensions, windowStrides, paddings)
+}
+
+func (f *Function) SelectAndScatterMin(operand, source backends.Value, windowDimensions, windowStrides []int, paddings [][2]int) (backends.Value, error) {
+	return nil, errors.Errorf("SelectAndScatterMin not yet supported in MPSGraph backend")
+}
+
+func (f *Function) selectAndScatterImpl(opName string, operand, source backends.Value, windowDimensions, windowStrides []int, paddings [][2]int) (backends.Value, error) {
+	opNode, err := castNode(operand)
+	if err != nil {
+		return nil, errors.Wrapf(err, "%s: operand", opName)
+	}
+	srcNode, err := castNode(source)
+	if err != nil {
+		return nil, errors.Wrapf(err, "%s: source", opName)
+	}
+
+	rank := opNode.shape.Rank()
+	if rank != 4 {
+		return nil, errors.Errorf("%s: only 4D tensors supported, got rank %d", opName, rank)
+	}
+
+	axesInfo, err := detectPoolAxes(windowDimensions, windowStrides, paddings)
+	if err != nil {
+		return nil, errors.Wrapf(err, "%s", opName)
+	}
+
+	// Transpose operand and source to NCHW if needed.
+	opTensor := opNode.tensor
+	srcTensor := srcNode.tensor
+	if axesInfo.needsTranspose {
+		opTensor, err = f.ctx().Transpose(opTensor, axesInfo.toNCHW)
+		if err != nil {
+			return nil, errors.Wrapf(err, "%s: transpose operand to NCHW", opName)
+		}
+		srcTensor, err = f.ctx().Transpose(srcTensor, axesInfo.toNCHW)
+		if err != nil {
+			return nil, errors.Wrapf(err, "%s: transpose source to NCHW", opName)
+		}
+	}
+
+	spatialWindow := axesInfo.spatialWindow[:]
+	spatialStrides := axesInfo.spatialStrides[:]
+	padBefore := axesInfo.padBefore[:]
+	padAfter := axesInfo.padAfter[:]
+
+	// MPSGraph's maxPooling2DGradient takes:
+	// - gradient: the incoming gradient (same shape as pool output = source)
+	// - sourceTensor: the original input to pooling (= operand)
+	tensor, err := f.ctx().MaxPool2DGradient(srcTensor, opTensor, spatialWindow, spatialStrides, padBefore, padAfter)
+	if err != nil {
+		return nil, errors.Wrap(err, opName)
+	}
+
+	// Transpose back from NCHW if needed.
+	if axesInfo.needsTranspose {
+		tensor, err = f.ctx().Transpose(tensor, axesInfo.fromNCHW)
+		if err != nil {
+			return nil, errors.Wrapf(err, "%s: transpose from NCHW", opName)
+		}
+	}
+
+	// Output shape is same as operand.
+	return &graphNode{tensor: tensor, shape: opNode.shape}, nil
 }
 
 // ===========================================================================
@@ -1178,11 +1584,255 @@ func (f *Function) FusedSoftmax(x backends.Value, axis int) (backends.Value, err
 }
 
 func (f *Function) FusedGelu(x backends.Value, exact bool) (backends.Value, error) {
-	return nil, errors.Wrap(backends.ErrNotImplemented, "FusedGelu")
+	// GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+	node, err := castNode(x)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedGelu")
+	}
+	dt := node.shape.DType
+
+	makeConst := func(val float32) (bridge.Tensor, error) {
+		t, err := f.ctx().Constant(unsafe.Pointer(&val), 4, dtypeToBridgeDType(dt), []int64{1})
+		if err != nil {
+			return nil, err
+		}
+		return f.ctx().Reshape(t, nil) // scalar
+	}
+
+	half, err := makeConst(0.5)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedGelu")
+	}
+	one, err := makeConst(1.0)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedGelu")
+	}
+	coeff, err := makeConst(0.044715)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedGelu")
+	}
+	sqrtTwoPi, err := makeConst(0.7978845608) // sqrt(2/pi)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedGelu")
+	}
+
+	t := node.tensor
+	// x^3
+	x2, err := f.ctx().Mul(t, t)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedGelu")
+	}
+	x3, err := f.ctx().Mul(x2, t)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedGelu")
+	}
+	// 0.044715 * x^3
+	cx3, err := f.ctx().Mul(coeff, x3)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedGelu")
+	}
+	// x + 0.044715 * x^3
+	inner, err := f.ctx().Add(t, cx3)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedGelu")
+	}
+	// sqrt(2/pi) * (x + 0.044715 * x^3)
+	scaled, err := f.ctx().Mul(sqrtTwoPi, inner)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedGelu")
+	}
+	// tanh(...)
+	tanhVal, err := f.ctx().Tanh(scaled)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedGelu")
+	}
+	// 1 + tanh(...)
+	onePlusTanh, err := f.ctx().Add(one, tanhVal)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedGelu")
+	}
+	// 0.5 * x
+	halfX, err := f.ctx().Mul(half, t)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedGelu")
+	}
+	// 0.5 * x * (1 + tanh(...))
+	result, err := f.ctx().Mul(halfX, onePlusTanh)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedGelu")
+	}
+
+	return &graphNode{tensor: result, shape: node.shape}, nil
 }
 
 func (f *Function) FusedLayerNorm(x backends.Value, axes []int, epsilon float64, gamma, beta backends.Value) (backends.Value, error) {
-	return nil, errors.Wrap(backends.ErrNotImplemented, "FusedLayerNorm")
+	node, err := castNode(x)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedLayerNorm")
+	}
+
+	// Normalize negative axes.
+	rank := node.shape.Rank()
+	normalizedAxes := make([]int, len(axes))
+	for i, ax := range axes {
+		if ax < 0 {
+			ax += rank
+		}
+		if ax < 0 || ax >= rank {
+			return nil, errors.Errorf("FusedLayerNorm: axis %d out of range for rank %d", axes[i], rank)
+		}
+		normalizedAxes[i] = ax
+	}
+
+	// Compute mean over the specified axes.
+	meanTensor, err := f.ctx().Reduce(node.tensor, bridge.ReduceSum, normalizedAxes)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedLayerNorm: reduce for mean")
+	}
+
+	// Count elements being reduced.
+	numElements := int64(1)
+	for _, ax := range normalizedAxes {
+		numElements *= int64(node.shape.Dimensions[ax])
+	}
+	dt := node.shape.DType
+	countVal := float32(numElements)
+	countTensor, err := f.ctx().Constant(unsafe.Pointer(&countVal), 4, dtypeToBridgeDType(dt), []int64{1})
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedLayerNorm: count constant")
+	}
+	countTensor, err = f.ctx().Reshape(countTensor, nil) // scalar
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedLayerNorm: count reshape")
+	}
+
+	// mean = sum / count
+	meanTensor, err = f.ctx().Div(meanTensor, countTensor)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedLayerNorm: mean div")
+	}
+
+	// x - mean (broadcast automatically)
+	diff, err := f.ctx().Sub(node.tensor, meanTensor)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedLayerNorm: subtract mean")
+	}
+
+	// variance = mean((x - mean)^2)
+	diffSq, err := f.ctx().Mul(diff, diff)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedLayerNorm: diff squared")
+	}
+	varTensor, err := f.ctx().Reduce(diffSq, bridge.ReduceSum, normalizedAxes)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedLayerNorm: reduce for variance")
+	}
+	varTensor, err = f.ctx().Div(varTensor, countTensor)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedLayerNorm: variance div")
+	}
+
+	// variance + epsilon
+	epsVal := float32(epsilon)
+	epsTensor, err := f.ctx().Constant(unsafe.Pointer(&epsVal), 4, dtypeToBridgeDType(dt), []int64{1})
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedLayerNorm: epsilon constant")
+	}
+	epsTensor, err = f.ctx().Reshape(epsTensor, nil) // scalar
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedLayerNorm: epsilon reshape")
+	}
+	varPlusEps, err := f.ctx().Add(varTensor, epsTensor)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedLayerNorm: var + eps")
+	}
+
+	// 1 / sqrt(variance + epsilon)
+	invStd, err := f.ctx().Rsqrt(varPlusEps)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedLayerNorm: rsqrt")
+	}
+
+	// normalized = (x - mean) * invStd
+	normalized, err := f.ctx().Mul(diff, invStd)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedLayerNorm: normalize")
+	}
+
+	// Build int64 shape for broadcasting.
+	targetShape := make([]int64, rank)
+	for i, d := range node.shape.Dimensions {
+		targetShape[i] = int64(d)
+	}
+
+	// broadcastToTarget reshapes a lower-rank tensor (e.g. gamma [4]) to the
+	// target shape by inserting size-1 dims for non-normalized axes, then broadcasting.
+	broadcastToTarget := func(t bridge.Tensor, tShape shapes.Shape) (bridge.Tensor, error) {
+		if tShape.Rank() >= rank {
+			return t, nil
+		}
+		// Build reshape: insert 1s for non-normalized axes.
+		reshapeDims := make([]int64, rank)
+		normIdx := 0
+		for i := range rank {
+			isNormAxis := false
+			for _, ax := range normalizedAxes {
+				if ax == i {
+					isNormAxis = true
+					break
+				}
+			}
+			if isNormAxis && normIdx < tShape.Rank() {
+				reshapeDims[i] = int64(tShape.Dimensions[normIdx])
+				normIdx++
+			} else {
+				reshapeDims[i] = 1
+			}
+		}
+		reshaped, err := f.ctx().Reshape(t, reshapeDims)
+		if err != nil {
+			return nil, err
+		}
+		broadcasted, err := f.ctx().BroadcastTo(reshaped, targetShape)
+		if err != nil {
+			return nil, err
+		}
+		return broadcasted, nil
+	}
+
+	// Apply gamma (scale) if provided.
+	if gamma != nil {
+		gammaNode, err := castNode(gamma)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedLayerNorm: gamma")
+		}
+		gammaTensor, err := broadcastToTarget(gammaNode.tensor, gammaNode.shape)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedLayerNorm: broadcast gamma")
+		}
+		normalized, err = f.ctx().Mul(normalized, gammaTensor)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedLayerNorm: apply gamma")
+		}
+	}
+
+	// Apply beta (offset) if provided.
+	if beta != nil {
+		betaNode, err := castNode(beta)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedLayerNorm: beta")
+		}
+		betaTensor, err := broadcastToTarget(betaNode.tensor, betaNode.shape)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedLayerNorm: broadcast beta")
+		}
+		normalized, err = f.ctx().Add(normalized, betaTensor)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedLayerNorm: apply beta")
+		}
+	}
+
+	return &graphNode{tensor: normalized, shape: node.shape}, nil
 }
 
 func (f *Function) FusedDense(x, weight, bias backends.Value, activation backends.ActivationType) (backends.Value, error) {

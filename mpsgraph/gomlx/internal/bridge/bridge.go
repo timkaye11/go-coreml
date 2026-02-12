@@ -617,6 +617,25 @@ func (c *Context) Pool2D(x Tensor, mode int, windowDims, strides, padBefore, pad
 	return Tensor(t), nil
 }
 
+// MaxPool2DGradient computes the gradient of max pooling 2D (SelectAndScatter for MaxPool backprop).
+// gradient: incoming gradient (same shape as maxpool output, NCHW)
+// source: original input to maxpool (NCHW)
+// Returns: gradient with respect to source (same shape as source).
+func (c *Context) MaxPool2DGradient(gradient, source Tensor, windowDims, strides, padBefore, padAfter []int64) (Tensor, error) {
+	var cErr C.MPSGraphError
+	t := C.mpsgraph_max_pool2d_gradient(c.handle,
+		C.MPSGraphTensorHandle(gradient), C.MPSGraphTensorHandle(source),
+		(*C.int64_t)(unsafe.Pointer(&windowDims[0])),
+		(*C.int64_t)(unsafe.Pointer(&strides[0])),
+		(*C.int64_t)(unsafe.Pointer(&padBefore[0])),
+		(*C.int64_t)(unsafe.Pointer(&padAfter[0])),
+		&cErr)
+	if err := extractError(cErr); err != nil {
+		return nil, err
+	}
+	return Tensor(t), nil
+}
+
 // ===========================================================================
 // Random Number Generation
 // ===========================================================================

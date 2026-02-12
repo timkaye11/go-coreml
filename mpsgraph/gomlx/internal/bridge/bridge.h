@@ -220,6 +220,14 @@ MPSGraphTensorHandle mpsgraph_pool2d(MPSGraphContextHandle ctx,
     int64_t* windowDims, int64_t* strides, int64_t* padBefore, int64_t* padAfter,
     MPSGraphError* error);
 
+// --- Max Pool 2D Gradient (SelectAndScatter for MaxPool backprop) ---
+// gradient: incoming gradient (same shape as maxpool output)
+// source: original input to maxpool (operand in XLA terms)
+MPSGraphTensorHandle mpsgraph_max_pool2d_gradient(MPSGraphContextHandle ctx,
+    MPSGraphTensorHandle gradient, MPSGraphTensorHandle source,
+    int64_t* windowDims, int64_t* strides, int64_t* padBefore, int64_t* padAfter,
+    MPSGraphError* error);
+
 // --- General Convolution with axis transposition ---
 MPSGraphTensorHandle mpsgraph_conv_general(MPSGraphContextHandle ctx,
     MPSGraphTensorHandle input, MPSGraphTensorHandle kernel,
