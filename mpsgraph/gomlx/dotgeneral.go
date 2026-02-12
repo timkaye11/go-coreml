@@ -66,11 +66,11 @@ func (f *Function) DotGeneral(
 	lhs backends.Value, lhsContractingAxes []int, lhsBatchAxes []int,
 	rhs backends.Value, rhsContractingAxes []int, rhsBatchAxes []int,
 ) (backends.Value, error) {
-	lhsNode, err := castNode(lhs)
+	lhsNode, err := f.resolveNode(lhs)
 	if err != nil {
 		return nil, errors.Wrap(err, "DotGeneral: lhs")
 	}
-	rhsNode, err := castNode(rhs)
+	rhsNode, err := f.resolveNode(rhs)
 	if err != nil {
 		return nil, errors.Wrap(err, "DotGeneral: rhs")
 	}
@@ -90,7 +90,7 @@ func (f *Function) DotGeneral(
 		if err != nil {
 			return nil, errors.Wrap(err, "DotGeneral: fast matmul")
 		}
-		return &graphNode{tensor: tensor, shape: outShape}, nil
+		return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 	}
 
 	// General path: normalize → rank-3 matmul → reshape
@@ -159,7 +159,7 @@ func (f *Function) DotGeneral(
 		return nil, errors.Wrap(err, "DotGeneral: output reshape")
 	}
 
-	return &graphNode{tensor: result, shape: outShape}, nil
+	return &graphNode{tensor: result, shape: outShape, owner: f}, nil
 }
 
 // isSimpleMatMul detects the common case: [M,K] x [K,N] with axis 1 contracting on lhs, axis 0 on rhs.

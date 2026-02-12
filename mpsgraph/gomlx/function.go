@@ -5,6 +5,7 @@
 package mpsgraph
 
 import (
+	"math"
 	"reflect"
 	"unsafe"
 
@@ -21,7 +22,8 @@ import (
 type graphNode struct {
 	tensor bridge.Tensor // MPSGraphTensor handle
 	shape  shapes.Shape
-	name   string // Optional name (for parameters)
+	name   string    // Optional name (for parameters)
+	owner  *Function // Which function created this node
 }
 
 // Function implements backends.Function for the MPSGraph backend.
@@ -34,6 +36,51 @@ type Function struct {
 	returned bool
 	params   []*graphNode // Input placeholders
 	outputs  []*graphNode // Return values
+
+	// ownCtx is a separate bridge.Context for closures. Nil for the main function.
+	ownCtx *bridge.Context
+
+	// Closure capture tracking: capturedParentNodes[i] in the parent maps to
+	// capturedLocalNodes[i] (a placeholder) in this closure's context.
+	capturedParentNodes []*graphNode
+	capturedLocalNodes  []*graphNode
+
+	// controlFlowStep records a control flow operation (While/If/Sort/Call).
+	// Currently only one CF op per function is supported; it must be the
+	// last operation before Return().
+	controlFlowStep *controlFlowStep
+}
+
+// controlFlowStep records a pending control flow operation.
+type controlFlowStep struct {
+	opType       backends.OpType
+	inputs       []*graphNode   // Inputs to the CF op (from the current graph)
+	outputShapes []shapes.Shape // Output shapes of the CF op
+	outputNodes  []*graphNode   // Virtual output nodes (no tensor)
+	whileData    *whileStepData
+	ifData       *ifStepData
+	sortData     *sortStepData
+	callData     *callStepData
+}
+
+type whileStepData struct {
+	condFn *Function
+	bodyFn *Function
+}
+
+type ifStepData struct {
+	trueFn  *Function
+	falseFn *Function
+}
+
+type sortStepData struct {
+	comparatorFn *Function
+	axis         int
+	isStable     bool
+}
+
+type callStepData struct {
+	targetFn *Function
 }
 
 // Verify interface compliance.
@@ -59,15 +106,176 @@ func (f *Function) Parent() backends.Function {
 	return f.parent
 }
 
-// Closure creates a closure function.
+// Closure creates a closure function with its own MPSGraph context.
 func (f *Function) Closure() (backends.Function, error) {
-	return newFunction(f.builder, "", f), nil
+	ctx, err := bridge.NewContext()
+	if err != nil {
+		return nil, errors.Wrap(err, "Closure: creating context")
+	}
+	closure := newFunction(f.builder, "", f)
+	closure.ownCtx = ctx
+	return closure, nil
 }
 
-// ctx returns the bridge context for this function's builder.
-func (f *Function) ctx() *bridge.Context { return f.builder.ctx }
+// ctx returns the bridge context for this function.
+// Closures use their own context; the main function uses the builder's.
+func (f *Function) ctx() *bridge.Context {
+	if f.ownCtx != nil {
+		return f.ownCtx
+	}
+	return f.builder.ctx
+}
 
-// castNode converts a backends.Value to a graphNode.
+// getOrCreateCaptureNode returns a local placeholder for a parent scope's node.
+// If the node was already captured, returns the existing placeholder.
+// For nested closures (grandparent captures), propagates through intermediates.
+func (f *Function) getOrCreateCaptureNode(parentNode *graphNode) (*graphNode, error) {
+	// Check if already captured.
+	for i, pn := range f.capturedParentNodes {
+		if pn == parentNode {
+			return f.capturedLocalNodes[i], nil
+		}
+	}
+
+	// If parentNode's owner is not our direct parent, propagate through intermediates.
+	nodeToCapture := parentNode
+	if parentNode.owner != f.parent {
+		intermediate, err := f.parent.getOrCreateCaptureNode(parentNode)
+		if err != nil {
+			return nil, err
+		}
+		nodeToCapture = intermediate
+	}
+
+	// Create a placeholder in our own context for the captured value.
+	dims := make([]int64, nodeToCapture.shape.Rank())
+	for i, d := range nodeToCapture.shape.Dimensions {
+		dims[i] = int64(d)
+	}
+	dtype := dtypeToBridgeDType(nodeToCapture.shape.DType)
+	tensor, err := f.ctx().Placeholder(dtype, dims)
+	if err != nil {
+		return nil, errors.Wrap(err, "capture: creating placeholder")
+	}
+	node := &graphNode{tensor: tensor, shape: nodeToCapture.shape, owner: f}
+
+	f.capturedParentNodes = append(f.capturedParentNodes, nodeToCapture)
+	f.capturedLocalNodes = append(f.capturedLocalNodes, node)
+
+	return node, nil
+}
+
+// resolveNode converts a backends.Value to a graphNode, capturing parent values for closures.
+func (f *Function) resolveNode(v backends.Value) (*graphNode, error) {
+	node, ok := v.(*graphNode)
+	if !ok {
+		return nil, errors.Errorf("expected *graphNode, got %T", v)
+	}
+	// Fast path: no closure context or same owner — no capture needed.
+	if f.ownCtx == nil || node.owner == nil || node.owner == f {
+		return node, nil
+	}
+	// Check if from an ancestor function.
+	for p := f.parent; p != nil; p = p.parent {
+		if node.owner == p {
+			return f.getOrCreateCaptureNode(node)
+		}
+	}
+	return nil, errors.Errorf("node from unrelated function scope")
+}
+
+// resolveNodes converts multiple backends.Value to graphNodes, handling closure captures.
+func (f *Function) resolveNodes(name string, values ...backends.Value) ([]*graphNode, error) {
+	nodes := make([]*graphNode, len(values))
+	for i, v := range values {
+		n, err := f.resolveNode(v)
+		if err != nil {
+			return nil, errors.Wrapf(err, "%s: input #%d", name, i)
+		}
+		nodes[i] = n
+	}
+	return nodes, nil
+}
+
+// validateClosure validates that a backends.Function is a compiled closure of the current function.
+func (f *Function) validateClosure(opName, closureName string, closure backends.Function) (*Function, error) {
+	fn, ok := closure.(*Function)
+	if !ok {
+		return nil, errors.Errorf("%s: %s must be a *mpsgraph.Function, got %T", opName, closureName, closure)
+	}
+	if fn.parent != f {
+		return nil, errors.Errorf("%s: %s must be a closure of the current function", opName, closureName)
+	}
+	if !fn.returned {
+		return nil, errors.Errorf("%s: %s must have Return() called", opName, closureName)
+	}
+	return fn, nil
+}
+
+// compileClosure compiles a closure Function into an Executable.
+// The closure's feeds are: parameters first, then captured local nodes.
+func (f *Function) compileClosure() (*Executable, error) {
+	// Determine which context to compile from.
+	// Closures have their own context; named functions (for Call) use the builder's context.
+	ctx := f.ownCtx
+	if ctx == nil {
+		ctx = f.builder.ctx
+	}
+	if ctx == nil {
+		return nil, errors.New("compileClosure: no context available")
+	}
+
+	allFeeds := make([]*graphNode, 0, len(f.params)+len(f.capturedLocalNodes))
+	allFeeds = append(allFeeds, f.params...)
+	allFeeds = append(allFeeds, f.capturedLocalNodes...)
+
+	info := bridge.CompileInfo{
+		Feeds:      make([]bridge.Tensor, len(allFeeds)),
+		FeedDtypes: make([]int, len(allFeeds)),
+		FeedShapes: make([][]int64, len(allFeeds)),
+		Targets:    make([]bridge.Tensor, len(f.outputs)),
+	}
+
+	for i, p := range allFeeds {
+		info.Feeds[i] = p.tensor
+		info.FeedDtypes[i] = dtypeToBridgeDType(p.shape.DType)
+		dims := p.shape.Dimensions
+		info.FeedShapes[i] = make([]int64, len(dims))
+		for j, d := range dims {
+			info.FeedShapes[i][j] = int64(d)
+		}
+	}
+
+	for i, out := range f.outputs {
+		info.Targets[i] = out.tensor
+	}
+
+	exec, err := ctx.Compile(info)
+	if err != nil {
+		return nil, errors.Wrap(err, "compileClosure")
+	}
+
+	inputNames := make([]string, len(allFeeds))
+	inputShapes := make([]shapes.Shape, len(allFeeds))
+	for i, p := range allFeeds {
+		inputShapes[i] = p.shape
+	}
+
+	outputShapes := make([]shapes.Shape, len(f.outputs))
+	for i, out := range f.outputs {
+		outputShapes[i] = out.shape
+	}
+
+	return &Executable{
+		backend:      f.builder.backend,
+		exec:         exec,
+		inputNames:   inputNames,
+		inputShapes:  inputShapes,
+		outputShapes: outputShapes,
+	}, nil
+}
+
+// castNode converts a backends.Value to a graphNode (simple type assertion, no capture).
 func castNode(v backends.Value) (*graphNode, error) {
 	n, ok := v.(*graphNode)
 	if !ok {
@@ -76,7 +284,7 @@ func castNode(v backends.Value) (*graphNode, error) {
 	return n, nil
 }
 
-// castNodes converts multiple backends.Value to graphNodes.
+// castNodes converts multiple backends.Value to graphNodes (simple, no capture).
 func castNodes(name string, values ...backends.Value) ([]*graphNode, error) {
 	nodes := make([]*graphNode, len(values))
 	for i, v := range values {
@@ -104,7 +312,7 @@ func (f *Function) Parameter(name string, shape shapes.Shape, sharding *backends
 	if err != nil {
 		return nil, errors.Wrapf(err, "Parameter(%s)", name)
 	}
-	node := &graphNode{tensor: tensor, shape: shape, name: name}
+	node := &graphNode{tensor: tensor, shape: shape, name: name, owner: f}
 	f.params = append(f.params, node)
 	return node, nil
 }
@@ -150,12 +358,12 @@ func (f *Function) Constant(flat any, dims ...int) (backends.Value, error) {
 		}
 	}
 
-	return &graphNode{tensor: tensor, shape: shape}, nil
+	return &graphNode{tensor: tensor, shape: shape, owner: f}, nil
 }
 
 // Return marks the function outputs.
 func (f *Function) Return(outputs []backends.Value, shardings []*backends.ShardingSpec) error {
-	nodes, err := castNodes("Return", outputs...)
+	nodes, err := f.resolveNodes("Return", outputs...)
 	if err != nil {
 		return err
 	}
@@ -166,7 +374,303 @@ func (f *Function) Return(outputs []backends.Value, shardings []*backends.Shardi
 
 // Call calls another function with the given inputs.
 func (f *Function) Call(fn backends.Function, inputs ...backends.Value) ([]backends.Value, error) {
-	return nil, errors.Wrapf(notimplemented.NotImplementedError, "Call")
+	inputNodes, err := f.resolveNodes("Call", inputs...)
+	if err != nil {
+		return nil, err
+	}
+
+	targetFn, ok := fn.(*Function)
+	if !ok {
+		return nil, errors.Errorf("Call: target must be *mpsgraph.Function, got %T", fn)
+	}
+	if targetFn.builder != f.builder {
+		return nil, errors.New("Call: target function must be from the same builder")
+	}
+	if !targetFn.returned {
+		return nil, errors.Errorf("Call: target function %q must have Return() called", targetFn.name)
+	}
+
+	// Validate inputs match target parameters.
+	if len(inputNodes) != len(targetFn.params) {
+		return nil, errors.Errorf("Call: function %q expects %d parameters, got %d inputs",
+			targetFn.name, len(targetFn.params), len(inputNodes))
+	}
+	for i, param := range targetFn.params {
+		if !param.shape.Equal(inputNodes[i].shape) {
+			return nil, errors.Errorf("Call: parameter %d shape mismatch: expected %s, got %s",
+				i, param.shape, inputNodes[i].shape)
+		}
+	}
+
+	outputShapes := make([]shapes.Shape, len(targetFn.outputs))
+	for i, out := range targetFn.outputs {
+		outputShapes[i] = out.shape.Clone()
+	}
+
+	outputNodes := make([]*graphNode, len(outputShapes))
+	results := make([]backends.Value, len(outputShapes))
+	for i, s := range outputShapes {
+		n := &graphNode{shape: s, owner: f}
+		outputNodes[i] = n
+		results[i] = n
+	}
+
+	f.controlFlowStep = &controlFlowStep{
+		opType:       backends.OpTypeCall,
+		inputs:       inputNodes,
+		outputShapes: outputShapes,
+		outputNodes:  outputNodes,
+		callData:     &callStepData{targetFn: targetFn},
+	}
+
+	return results, nil
+}
+
+// While executes a loop while a condition is true.
+func (f *Function) While(cond, body backends.Function, initialState ...backends.Value) ([]backends.Value, error) {
+	if f.controlFlowStep != nil {
+		return nil, errors.New("While: only one control flow operation per function is supported")
+	}
+	if len(initialState) == 0 {
+		return nil, errors.New("While: requires at least one initial state value")
+	}
+
+	stateNodes, err := f.resolveNodes("While", initialState...)
+	if err != nil {
+		return nil, err
+	}
+
+	condFn, err := f.validateClosure("While", "cond", cond)
+	if err != nil {
+		return nil, err
+	}
+	bodyFn, err := f.validateClosure("While", "body", body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate cond: params match state shapes, returns scalar bool.
+	if len(condFn.params) != len(stateNodes) {
+		return nil, errors.Errorf("While: cond must have %d parameters, got %d",
+			len(stateNodes), len(condFn.params))
+	}
+	for i, param := range condFn.params {
+		if !param.shape.Equal(stateNodes[i].shape) {
+			return nil, errors.Errorf("While: cond parameter %d shape %s doesn't match state shape %s",
+				i, param.shape, stateNodes[i].shape)
+		}
+	}
+	if len(condFn.outputs) != 1 {
+		return nil, errors.Errorf("While: cond must return exactly one value, got %d", len(condFn.outputs))
+	}
+	if condFn.outputs[0].shape.Rank() != 0 || condFn.outputs[0].shape.DType != dtypes.Bool {
+		return nil, errors.Errorf("While: cond must return scalar bool, got %s", condFn.outputs[0].shape)
+	}
+
+	// Validate body: params match state shapes, returns same shapes.
+	if len(bodyFn.params) != len(stateNodes) {
+		return nil, errors.Errorf("While: body must have %d parameters, got %d",
+			len(stateNodes), len(bodyFn.params))
+	}
+	for i, param := range bodyFn.params {
+		if !param.shape.Equal(stateNodes[i].shape) {
+			return nil, errors.Errorf("While: body parameter %d shape %s doesn't match state shape %s",
+				i, param.shape, stateNodes[i].shape)
+		}
+	}
+	if len(bodyFn.outputs) != len(stateNodes) {
+		return nil, errors.Errorf("While: body must return %d values, got %d",
+			len(stateNodes), len(bodyFn.outputs))
+	}
+	for i, out := range bodyFn.outputs {
+		if !out.shape.Equal(stateNodes[i].shape) {
+			return nil, errors.Errorf("While: body output %d shape %s must match state shape %s",
+				i, out.shape, stateNodes[i].shape)
+		}
+	}
+
+	outputShapes := make([]shapes.Shape, len(stateNodes))
+	for i, n := range stateNodes {
+		outputShapes[i] = n.shape.Clone()
+	}
+
+	outputNodes := make([]*graphNode, len(outputShapes))
+	results := make([]backends.Value, len(outputShapes))
+	for i, s := range outputShapes {
+		n := &graphNode{shape: s, owner: f}
+		outputNodes[i] = n
+		results[i] = n
+	}
+
+	f.controlFlowStep = &controlFlowStep{
+		opType:       backends.OpTypeWhile,
+		inputs:       stateNodes,
+		outputShapes: outputShapes,
+		outputNodes:  outputNodes,
+		whileData:    &whileStepData{condFn: condFn, bodyFn: bodyFn},
+	}
+
+	return results, nil
+}
+
+// If executes one of two branches based on a boolean predicate.
+func (f *Function) If(pred backends.Value, trueBranch, falseBranch backends.Function) ([]backends.Value, error) {
+	if f.controlFlowStep != nil {
+		return nil, errors.New("If: only one control flow operation per function is supported")
+	}
+
+	predNode, err := f.resolveNode(pred)
+	if err != nil {
+		return nil, errors.Wrap(err, "If: pred")
+	}
+	if predNode.shape.Rank() != 0 || predNode.shape.DType != dtypes.Bool {
+		return nil, errors.Errorf("If: pred must be scalar bool, got %s", predNode.shape)
+	}
+
+	trueFn, err := f.validateClosure("If", "trueBranch", trueBranch)
+	if err != nil {
+		return nil, err
+	}
+	falseFn, err := f.validateClosure("If", "falseBranch", falseBranch)
+	if err != nil {
+		return nil, err
+	}
+
+	// If branches take no parameters (they capture values from parent scope).
+	if len(trueFn.params) != 0 {
+		return nil, errors.Errorf("If: trueBranch must have no parameters, got %d", len(trueFn.params))
+	}
+	if len(falseFn.params) != 0 {
+		return nil, errors.Errorf("If: falseBranch must have no parameters, got %d", len(falseFn.params))
+	}
+
+	// Both branches must return same number of outputs with matching shapes.
+	if len(trueFn.outputs) != len(falseFn.outputs) {
+		return nil, errors.Errorf("If: branches must return same number of outputs (true=%d, false=%d)",
+			len(trueFn.outputs), len(falseFn.outputs))
+	}
+	for i := range trueFn.outputs {
+		if !trueFn.outputs[i].shape.Equal(falseFn.outputs[i].shape) {
+			return nil, errors.Errorf("If: output %d shapes must match (true=%s, false=%s)",
+				i, trueFn.outputs[i].shape, falseFn.outputs[i].shape)
+		}
+	}
+
+	outputShapes := make([]shapes.Shape, len(trueFn.outputs))
+	for i, out := range trueFn.outputs {
+		outputShapes[i] = out.shape.Clone()
+	}
+
+	outputNodes := make([]*graphNode, len(outputShapes))
+	results := make([]backends.Value, len(outputShapes))
+	for i, s := range outputShapes {
+		n := &graphNode{shape: s, owner: f}
+		outputNodes[i] = n
+		results[i] = n
+	}
+
+	f.controlFlowStep = &controlFlowStep{
+		opType:       backends.OpTypeIf,
+		inputs:       []*graphNode{predNode},
+		outputShapes: outputShapes,
+		outputNodes:  outputNodes,
+		ifData:       &ifStepData{trueFn: trueFn, falseFn: falseFn},
+	}
+
+	return results, nil
+}
+
+// Sort sorts one or more tensors along an axis using a comparator closure.
+func (f *Function) Sort(comparator backends.Function, axis int, isStable bool, inputs ...backends.Value) ([]backends.Value, error) {
+	if f.controlFlowStep != nil {
+		return nil, errors.New("Sort: only one control flow operation per function is supported")
+	}
+	if len(inputs) == 0 {
+		return nil, errors.New("Sort: requires at least one input tensor")
+	}
+
+	inputNodes, err := f.resolveNodes("Sort", inputs...)
+	if err != nil {
+		return nil, err
+	}
+
+	compFn, err := f.validateClosure("Sort", "comparator", comparator)
+	if err != nil {
+		return nil, err
+	}
+
+	// All inputs must have the same dimensions.
+	firstShape := inputNodes[0].shape
+	for i, n := range inputNodes[1:] {
+		if firstShape.Rank() != n.shape.Rank() {
+			return nil, errors.Errorf("Sort: all inputs must have same rank, input 0 rank=%d, input %d rank=%d",
+				firstShape.Rank(), i+1, n.shape.Rank())
+		}
+		for j := range firstShape.Dimensions {
+			if firstShape.Dimensions[j] != n.shape.Dimensions[j] {
+				return nil, errors.Errorf("Sort: all inputs must have same dimensions")
+			}
+		}
+	}
+
+	// Normalize axis.
+	rank := firstShape.Rank()
+	if axis < 0 {
+		axis = rank + axis
+	}
+	if axis < 0 || axis >= rank {
+		return nil, errors.Errorf("Sort: axis %d out of range for rank %d", axis, rank)
+	}
+
+	// Verify comparator: 2*N scalar parameters, returns scalar bool.
+	expectedParams := 2 * len(inputNodes)
+	if len(compFn.params) != expectedParams {
+		return nil, errors.Errorf("Sort: comparator must have %d parameters, got %d",
+			expectedParams, len(compFn.params))
+	}
+	for i, n := range inputNodes {
+		for j := range 2 {
+			paramIdx := 2*i + j
+			param := compFn.params[paramIdx]
+			if param.shape.Rank() != 0 {
+				return nil, errors.Errorf("Sort: comparator parameter %d must be scalar, got %s",
+					paramIdx, param.shape)
+			}
+			if param.shape.DType != n.shape.DType {
+				return nil, errors.Errorf("Sort: comparator parameter %d dtype %s must match input dtype %s",
+					paramIdx, param.shape.DType, n.shape.DType)
+			}
+		}
+	}
+	if len(compFn.outputs) != 1 {
+		return nil, errors.Errorf("Sort: comparator must return exactly one value, got %d", len(compFn.outputs))
+	}
+	if compFn.outputs[0].shape.Rank() != 0 || compFn.outputs[0].shape.DType != dtypes.Bool {
+		return nil, errors.Errorf("Sort: comparator must return scalar bool, got %s", compFn.outputs[0].shape)
+	}
+
+	outputShapes := make([]shapes.Shape, len(inputNodes))
+	for i, n := range inputNodes {
+		outputShapes[i] = n.shape.Clone()
+	}
+
+	outputNodes := make([]*graphNode, len(outputShapes))
+	results := make([]backends.Value, len(outputShapes))
+	for i, s := range outputShapes {
+		n := &graphNode{shape: s, owner: f}
+		outputNodes[i] = n
+		results[i] = n
+	}
+
+	f.controlFlowStep = &controlFlowStep{
+		opType:       backends.OpTypeSort,
+		inputs:       inputNodes,
+		outputShapes: outputShapes,
+		outputNodes:  outputNodes,
+		sortData:     &sortStepData{comparatorFn: compFn, axis: axis, isStable: isStable},
+	}
+
+	return results, nil
 }
 
 // ===========================================================================
@@ -174,7 +678,7 @@ func (f *Function) Call(fn backends.Function, inputs ...backends.Value) ([]backe
 // ===========================================================================
 
 func (f *Function) unaryOp(opName string, opType backends.OpType, bridgeFn func(bridge.Tensor) (bridge.Tensor, error), x backends.Value) (backends.Value, error) {
-	node, err := castNode(x)
+	node, err := f.resolveNode(x)
 	if err != nil {
 		return nil, errors.Wrap(err, opName)
 	}
@@ -186,7 +690,7 @@ func (f *Function) unaryOp(opName string, opType backends.OpType, bridgeFn func(
 	if err != nil {
 		return nil, errors.Wrap(err, opName)
 	}
-	return &graphNode{tensor: tensor, shape: outShape}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 func (f *Function) Abs(x backends.Value) (backends.Value, error) {
@@ -266,7 +770,7 @@ func (f *Function) BitwiseNot(x backends.Value) (backends.Value, error) {
 }
 
 func (f *Function) IsFinite(x backends.Value) (backends.Value, error) {
-	node, err := castNode(x)
+	node, err := f.resolveNode(x)
 	if err != nil {
 		return nil, errors.Wrap(err, "IsFinite")
 	}
@@ -275,11 +779,11 @@ func (f *Function) IsFinite(x backends.Value) (backends.Value, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "IsFinite")
 	}
-	return &graphNode{tensor: tensor, shape: outShape}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 func (f *Function) IsNaN(x backends.Value) (backends.Value, error) {
-	node, err := castNode(x)
+	node, err := f.resolveNode(x)
 	if err != nil {
 		return nil, errors.Wrap(err, "IsNaN")
 	}
@@ -288,11 +792,11 @@ func (f *Function) IsNaN(x backends.Value) (backends.Value, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "IsNaN")
 	}
-	return &graphNode{tensor: tensor, shape: outShape}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 func (f *Function) Identity(x backends.Value) (backends.Value, error) {
-	node, err := castNode(x)
+	node, err := f.resolveNode(x)
 	if err != nil {
 		return nil, errors.Wrap(err, "Identity")
 	}
@@ -300,7 +804,7 @@ func (f *Function) Identity(x backends.Value) (backends.Value, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "Identity")
 	}
-	return &graphNode{tensor: tensor, shape: node.shape}, nil
+	return &graphNode{tensor: tensor, shape: node.shape, owner: f}, nil
 }
 
 // ===========================================================================
@@ -308,7 +812,7 @@ func (f *Function) Identity(x backends.Value) (backends.Value, error) {
 // ===========================================================================
 
 func (f *Function) binaryOp(opName string, opType backends.OpType, bridgeFn func(bridge.Tensor, bridge.Tensor) (bridge.Tensor, error), lhs, rhs backends.Value) (backends.Value, error) {
-	nodes, err := castNodes(opName, lhs, rhs)
+	nodes, err := f.resolveNodes(opName, lhs, rhs)
 	if err != nil {
 		return nil, err
 	}
@@ -320,7 +824,7 @@ func (f *Function) binaryOp(opName string, opType backends.OpType, bridgeFn func
 	if err != nil {
 		return nil, errors.Wrap(err, opName)
 	}
-	return &graphNode{tensor: tensor, shape: outShape}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 func (f *Function) Add(lhs, rhs backends.Value) (backends.Value, error) {
@@ -393,7 +897,7 @@ func (f *Function) ShiftRightArithmetic(lhs, rhs backends.Value) (backends.Value
 }
 
 func (f *Function) ShiftRightLogical(lhs, rhs backends.Value) (backends.Value, error) {
-	lhsNode, err := castNode(lhs)
+	lhsNode, err := f.resolveNode(lhs)
 	if err != nil {
 		return nil, errors.Wrap(err, "ShiftRightLogical")
 	}
@@ -464,7 +968,7 @@ func (f *Function) LessOrEqual(lhs, rhs backends.Value) (backends.Value, error) 
 }
 
 func (f *Function) comparisonOp(opName string, opType backends.OpType, bridgeFn func(bridge.Tensor, bridge.Tensor) (bridge.Tensor, error), lhs, rhs backends.Value) (backends.Value, error) {
-	nodes, err := castNodes(opName, lhs, rhs)
+	nodes, err := f.resolveNodes(opName, lhs, rhs)
 	if err != nil {
 		return nil, err
 	}
@@ -477,7 +981,7 @@ func (f *Function) comparisonOp(opName string, opType backends.OpType, bridgeFn 
 	if err != nil {
 		return nil, errors.Wrap(err, opName)
 	}
-	return &graphNode{tensor: tensor, shape: outShape}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 // ===========================================================================
@@ -485,7 +989,7 @@ func (f *Function) comparisonOp(opName string, opType backends.OpType, bridgeFn 
 // ===========================================================================
 
 func (f *Function) Reshape(x backends.Value, dimensions ...int) (backends.Value, error) {
-	node, err := castNode(x)
+	node, err := f.resolveNode(x)
 	if err != nil {
 		return nil, errors.Wrap(err, "Reshape")
 	}
@@ -498,11 +1002,11 @@ func (f *Function) Reshape(x backends.Value, dimensions ...int) (backends.Value,
 	if err != nil {
 		return nil, errors.Wrap(err, "Reshape")
 	}
-	return &graphNode{tensor: tensor, shape: outShape}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 func (f *Function) Transpose(x backends.Value, permutation ...int) (backends.Value, error) {
-	node, err := castNode(x)
+	node, err := f.resolveNode(x)
 	if err != nil {
 		return nil, errors.Wrap(err, "Transpose")
 	}
@@ -514,11 +1018,11 @@ func (f *Function) Transpose(x backends.Value, permutation ...int) (backends.Val
 	if err != nil {
 		return nil, errors.Wrap(err, "Transpose")
 	}
-	return &graphNode{tensor: tensor, shape: outShape}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 func (f *Function) ConvertDType(x backends.Value, dtype dtypes.DType) (backends.Value, error) {
-	node, err := castNode(x)
+	node, err := f.resolveNode(x)
 	if err != nil {
 		return nil, errors.Wrap(err, "ConvertDType")
 	}
@@ -528,11 +1032,11 @@ func (f *Function) ConvertDType(x backends.Value, dtype dtypes.DType) (backends.
 	if err != nil {
 		return nil, errors.Wrap(err, "ConvertDType")
 	}
-	return &graphNode{tensor: tensor, shape: outShape}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 func (f *Function) BroadcastInDim(x backends.Value, outputShape shapes.Shape, broadcastAxes []int) (backends.Value, error) {
-	node, err := castNode(x)
+	node, err := f.resolveNode(x)
 	if err != nil {
 		return nil, errors.Wrap(err, "BroadcastInDim")
 	}
@@ -562,11 +1066,11 @@ func (f *Function) BroadcastInDim(x backends.Value, outputShape shapes.Shape, br
 	if err != nil {
 		return nil, errors.Wrap(err, "BroadcastInDim: broadcast")
 	}
-	return &graphNode{tensor: tensor, shape: outputShape}, nil
+	return &graphNode{tensor: tensor, shape: outputShape, owner: f}, nil
 }
 
 func (f *Function) Where(condition, onTrue, onFalse backends.Value) (backends.Value, error) {
-	nodes, err := castNodes("Where", condition, onTrue, onFalse)
+	nodes, err := f.resolveNodes("Where", condition, onTrue, onFalse)
 	if err != nil {
 		return nil, err
 	}
@@ -578,11 +1082,11 @@ func (f *Function) Where(condition, onTrue, onFalse backends.Value) (backends.Va
 	if err != nil {
 		return nil, errors.Wrap(err, "Where")
 	}
-	return &graphNode{tensor: tensor, shape: outShape}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 func (f *Function) Clamp(min, x, max backends.Value) (backends.Value, error) {
-	nodes, err := castNodes("Clamp", min, x, max)
+	nodes, err := f.resolveNodes("Clamp", min, x, max)
 	if err != nil {
 		return nil, err
 	}
@@ -592,11 +1096,11 @@ func (f *Function) Clamp(min, x, max backends.Value) (backends.Value, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "Clamp")
 	}
-	return &graphNode{tensor: tensor, shape: outShape}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 func (f *Function) Slice(operand backends.Value, starts, limits, strides []int) (backends.Value, error) {
-	node, err := castNode(operand)
+	node, err := f.resolveNode(operand)
 	if err != nil {
 		return nil, errors.Wrap(err, "Slice")
 	}
@@ -616,11 +1120,11 @@ func (f *Function) Slice(operand backends.Value, starts, limits, strides []int) 
 	if err != nil {
 		return nil, errors.Wrap(err, "Slice")
 	}
-	return &graphNode{tensor: tensor, shape: outShape}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 func (f *Function) Concatenate(axis int, operands ...backends.Value) (backends.Value, error) {
-	nodes, err := castNodes("Concatenate", operands...)
+	nodes, err := f.resolveNodes("Concatenate", operands...)
 	if err != nil {
 		return nil, err
 	}
@@ -638,11 +1142,11 @@ func (f *Function) Concatenate(axis int, operands ...backends.Value) (backends.V
 	if err != nil {
 		return nil, errors.Wrap(err, "Concatenate")
 	}
-	return &graphNode{tensor: tensor, shape: outShape}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 func (f *Function) Reverse(x backends.Value, axes ...int) (backends.Value, error) {
-	node, err := castNode(x)
+	node, err := f.resolveNode(x)
 	if err != nil {
 		return nil, errors.Wrap(err, "Reverse")
 	}
@@ -650,7 +1154,7 @@ func (f *Function) Reverse(x backends.Value, axes ...int) (backends.Value, error
 	if err != nil {
 		return nil, errors.Wrap(err, "Reverse")
 	}
-	return &graphNode{tensor: tensor, shape: node.shape}, nil
+	return &graphNode{tensor: tensor, shape: node.shape, owner: f}, nil
 }
 
 func (f *Function) Iota(shape shapes.Shape, iotaAxis int) (backends.Value, error) {
@@ -663,7 +1167,7 @@ func (f *Function) Iota(shape shapes.Shape, iotaAxis int) (backends.Value, error
 	if err != nil {
 		return nil, errors.Wrap(err, "Iota")
 	}
-	return &graphNode{tensor: tensor, shape: shape}, nil
+	return &graphNode{tensor: tensor, shape: shape, owner: f}, nil
 }
 
 // ===========================================================================
@@ -671,7 +1175,7 @@ func (f *Function) Iota(shape shapes.Shape, iotaAxis int) (backends.Value, error
 // ===========================================================================
 
 func (f *Function) Dot(lhs, rhs backends.Value) (backends.Value, error) {
-	nodes, err := castNodes("Dot", lhs, rhs)
+	nodes, err := f.resolveNodes("Dot", lhs, rhs)
 	if err != nil {
 		return nil, err
 	}
@@ -699,7 +1203,7 @@ func (f *Function) Dot(lhs, rhs backends.Value) (backends.Value, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "Dot")
 	}
-	return &graphNode{tensor: tensor, shape: outShape}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 // DotGeneral is implemented in dotgeneral.go.
@@ -709,7 +1213,7 @@ func (f *Function) Dot(lhs, rhs backends.Value) (backends.Value, error) {
 // ===========================================================================
 
 func (f *Function) reduceOp(opName string, opType backends.OpType, reduceType int, x backends.Value, axes ...int) (backends.Value, error) {
-	node, err := castNode(x)
+	node, err := f.resolveNode(x)
 	if err != nil {
 		return nil, errors.Wrap(err, opName)
 	}
@@ -745,7 +1249,7 @@ func (f *Function) reduceOp(opName string, opType backends.OpType, reduceType in
 			return nil, errors.Wrap(err, opName+": reshape to scalar")
 		}
 	}
-	return &graphNode{tensor: tensor, shape: outShape}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 func (f *Function) ReduceSum(x backends.Value, axes ...int) (backends.Value, error) {
@@ -769,7 +1273,7 @@ func (f *Function) ReduceProduct(x backends.Value, axes ...int) (backends.Value,
 // ===========================================================================
 
 func (f *Function) ArgMinMax(x backends.Value, axis int, outputDType dtypes.DType, isMin bool) (backends.Value, error) {
-	node, err := castNode(x)
+	node, err := f.resolveNode(x)
 	if err != nil {
 		return nil, errors.Wrap(err, "ArgMinMax")
 	}
@@ -808,7 +1312,7 @@ func (f *Function) ArgMinMax(x backends.Value, axis int, outputDType dtypes.DTyp
 			return nil, errors.Wrap(err, "ArgMinMax: reshape to scalar")
 		}
 	}
-	return &graphNode{tensor: tensor, shape: outShape}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 // ===========================================================================
@@ -816,7 +1320,7 @@ func (f *Function) ArgMinMax(x backends.Value, axis int, outputDType dtypes.DTyp
 // ===========================================================================
 
 func (f *Function) BatchNormForInference(operand, scale, offset, mean, variance backends.Value, epsilon float32, featureAxis int) (backends.Value, error) {
-	nodes, err := castNodes("BatchNormForInference", operand, scale, offset, mean, variance)
+	nodes, err := f.resolveNodes("BatchNormForInference", operand, scale, offset, mean, variance)
 	if err != nil {
 		return nil, err
 	}
@@ -827,7 +1331,298 @@ func (f *Function) BatchNormForInference(operand, scale, offset, mean, variance 
 	if err != nil {
 		return nil, errors.Wrap(err, "BatchNormForInference")
 	}
-	return &graphNode{tensor: tensor, shape: nodes[0].shape}, nil
+	return &graphNode{tensor: tensor, shape: nodes[0].shape, owner: f}, nil
+}
+
+func (f *Function) BatchNormForTraining(
+	operand, scale, offset backends.Value,
+	epsilon float32,
+	featureAxis int,
+) (normalized backends.Value, batchMean backends.Value, batchVariance backends.Value, err error) {
+	opNode, err := f.resolveNode(operand)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: operand")
+	}
+	scaleNode, err := f.resolveNode(scale)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: scale")
+	}
+	offsetNode, err := f.resolveNode(offset)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: offset")
+	}
+
+	rank := opNode.shape.Rank()
+	dt := opNode.shape.DType
+
+	// Batch axes = all axes except featureAxis.
+	var batchAxes []int
+	for i := range rank {
+		if i != featureAxis {
+			batchAxes = append(batchAxes, i)
+		}
+	}
+
+	// Compute batch mean: reduce over batch axes, keep feature axis.
+	meanTensor, err := f.ctx().Reduce(opNode.tensor, bridge.ReduceSum, batchAxes)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: reduce for mean")
+	}
+	batchSize := int64(1)
+	for _, ax := range batchAxes {
+		batchSize *= int64(opNode.shape.Dimensions[ax])
+	}
+	countVal := float32(batchSize)
+	countTensor, err := f.ctx().Constant(unsafe.Pointer(&countVal), 4, dtypeToBridgeDType(dt), []int64{1})
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: count constant")
+	}
+	countTensor, err = f.ctx().Reshape(countTensor, nil) // scalar
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: count reshape")
+	}
+	meanTensor, err = f.ctx().Div(meanTensor, countTensor)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: mean div")
+	}
+
+	// Center: operand - mean (broadcast automatically via MPSGraph).
+	diff, err := f.ctx().Sub(opNode.tensor, meanTensor)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: subtract mean")
+	}
+
+	// Variance: mean((operand - mean)^2) over batch axes.
+	diffSq, err := f.ctx().Mul(diff, diff)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: diff squared")
+	}
+	varTensor, err := f.ctx().Reduce(diffSq, bridge.ReduceSum, batchAxes)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: reduce for variance")
+	}
+	varTensor, err = f.ctx().Div(varTensor, countTensor)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: variance div")
+	}
+
+	// Normalize: (operand - mean) / sqrt(variance + epsilon)
+	epsVal := float32(epsilon)
+	epsTensor, err := f.ctx().Constant(unsafe.Pointer(&epsVal), 4, dtypeToBridgeDType(dt), []int64{1})
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: epsilon constant")
+	}
+	epsTensor, err = f.ctx().Reshape(epsTensor, nil) // scalar
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: epsilon reshape")
+	}
+	varPlusEps, err := f.ctx().Add(varTensor, epsTensor)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: var + eps")
+	}
+	invStd, err := f.ctx().Rsqrt(varPlusEps)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: rsqrt")
+	}
+	normalizedTensor, err := f.ctx().Mul(diff, invStd)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: normalize")
+	}
+
+	// Apply scale and offset: normalized * scale + offset.
+	// Scale and offset have shape [featureDim] — need to broadcast to operand shape.
+	normalizedTensor, err = f.ctx().Mul(normalizedTensor, scaleNode.tensor)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: apply scale")
+	}
+	normalizedTensor, err = f.ctx().Add(normalizedTensor, offsetNode.tensor)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: apply offset")
+	}
+
+	// Squeeze mean and variance to 1D [featureDim] shape.
+	featureDim := opNode.shape.Dimensions[featureAxis]
+	featureShape := shapes.Make(dt, featureDim)
+	meanTensor, err = f.ctx().Reshape(meanTensor, []int64{int64(featureDim)})
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: reshape mean")
+	}
+	varTensor, err = f.ctx().Reshape(varTensor, []int64{int64(featureDim)})
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: reshape variance")
+	}
+
+	normalized = &graphNode{tensor: normalizedTensor, shape: opNode.shape, owner: f}
+	batchMean = &graphNode{tensor: meanTensor, shape: featureShape, owner: f}
+	batchVariance = &graphNode{tensor: varTensor, shape: featureShape, owner: f}
+	return normalized, batchMean, batchVariance, nil
+}
+
+func (f *Function) BatchNormGradient(
+	operand, scale, mean, variance, gradOutput backends.Value,
+	epsilon float32,
+	featureAxis int,
+) (gradOperand backends.Value, gradScale backends.Value, gradOffset backends.Value, err error) {
+	opNode, err := f.resolveNode(operand)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: operand")
+	}
+	scaleNode, err := f.resolveNode(scale)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: scale")
+	}
+	meanNode, err := f.resolveNode(mean)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: mean")
+	}
+	varNode, err := f.resolveNode(variance)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: variance")
+	}
+	gradOutNode, err := f.resolveNode(gradOutput)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: gradOutput")
+	}
+
+	rank := opNode.shape.Rank()
+	dt := opNode.shape.DType
+
+	// Batch axes = all axes except featureAxis.
+	var batchAxes []int
+	for i := range rank {
+		if i != featureAxis {
+			batchAxes = append(batchAxes, i)
+		}
+	}
+
+	batchSize := int64(1)
+	for _, ax := range batchAxes {
+		batchSize *= int64(opNode.shape.Dimensions[ax])
+	}
+
+	// Broadcast mean and variance from [featureDim] to operand shape for element-wise ops.
+	// MPSGraph will broadcast automatically since mean/variance have shape [featureDim]
+	// aligned with the featureAxis.
+
+	// invStd = 1 / sqrt(variance + epsilon)
+	epsVal := float32(epsilon)
+	epsTensor, err := f.ctx().Constant(unsafe.Pointer(&epsVal), 4, dtypeToBridgeDType(dt), []int64{1})
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: epsilon constant")
+	}
+	epsTensor, err = f.ctx().Reshape(epsTensor, nil)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: epsilon reshape")
+	}
+	varPlusEps, err := f.ctx().Add(varNode.tensor, epsTensor)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: var + eps")
+	}
+	invStd, err := f.ctx().Rsqrt(varPlusEps)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: rsqrt")
+	}
+
+	// xhat = (operand - mean) * invStd (normalized input without scale/offset)
+	centered, err := f.ctx().Sub(opNode.tensor, meanNode.tensor)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: center")
+	}
+	xhat, err := f.ctx().Mul(centered, invStd)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: xhat")
+	}
+
+	// gradOffset = sum(gradOutput, batchAxes) — gradient w.r.t. offset/bias
+	gradOffsetTensor, err := f.ctx().Reduce(gradOutNode.tensor, bridge.ReduceSum, batchAxes)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: gradOffset reduce")
+	}
+
+	// gradScale = sum(gradOutput * xhat, batchAxes) — gradient w.r.t. scale
+	gradOutTimesXhat, err := f.ctx().Mul(gradOutNode.tensor, xhat)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: gradOutput * xhat")
+	}
+	gradScaleTensor, err := f.ctx().Reduce(gradOutTimesXhat, bridge.ReduceSum, batchAxes)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: gradScale reduce")
+	}
+
+	// gradOperand = (1/N) * scale * invStd * (N * gradOutput - sum(gradOutput) - xhat * sum(gradOutput * xhat))
+	// This is the standard batch norm gradient formula.
+	nVal := float32(batchSize)
+	nTensor, err := f.ctx().Constant(unsafe.Pointer(&nVal), 4, dtypeToBridgeDType(dt), []int64{1})
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: N constant")
+	}
+	nTensor, err = f.ctx().Reshape(nTensor, nil)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: N reshape")
+	}
+	invNVal := float32(1.0 / float64(batchSize))
+	invNTensor, err := f.ctx().Constant(unsafe.Pointer(&invNVal), 4, dtypeToBridgeDType(dt), []int64{1})
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: 1/N constant")
+	}
+	invNTensor, err = f.ctx().Reshape(invNTensor, nil)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: 1/N reshape")
+	}
+
+	// term1 = N * gradOutput
+	term1, err := f.ctx().Mul(nTensor, gradOutNode.tensor)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: N * gradOutput")
+	}
+
+	// term2 = sum(gradOutput, batchAxes) — this is gradOffset, broadcast back
+	// (MPSGraph broadcasts automatically from reduced shape)
+	term1, err = f.ctx().Sub(term1, gradOffsetTensor)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: term1 - gradOffset")
+	}
+
+	// term3 = xhat * sum(gradOutput * xhat, batchAxes) = xhat * gradScale
+	term3, err := f.ctx().Mul(xhat, gradScaleTensor)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: xhat * gradScale")
+	}
+	term1, err = f.ctx().Sub(term1, term3)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: term1 - term3")
+	}
+
+	// gradOperand = (1/N) * scale * invStd * (N*gradOutput - gradOffset - xhat*gradScale)
+	gradOpTensor, err := f.ctx().Mul(invNTensor, term1)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: 1/N * terms")
+	}
+	gradOpTensor, err = f.ctx().Mul(scaleNode.tensor, gradOpTensor)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: scale * terms")
+	}
+	gradOpTensor, err = f.ctx().Mul(invStd, gradOpTensor)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: invStd * terms")
+	}
+
+	// Squeeze gradScale and gradOffset to 1D [featureDim].
+	featureDim := opNode.shape.Dimensions[featureAxis]
+	featureShape := shapes.Make(dt, featureDim)
+	gradScaleTensor, err = f.ctx().Reshape(gradScaleTensor, []int64{int64(featureDim)})
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: reshape gradScale")
+	}
+	gradOffsetTensor, err = f.ctx().Reshape(gradOffsetTensor, []int64{int64(featureDim)})
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: reshape gradOffset")
+	}
+
+	gradOperand = &graphNode{tensor: gradOpTensor, shape: opNode.shape, owner: f}
+	gradScale = &graphNode{tensor: gradScaleTensor, shape: featureShape, owner: f}
+	gradOffset = &graphNode{tensor: gradOffsetTensor, shape: featureShape, owner: f}
+	return gradOperand, gradScale, gradOffset, nil
 }
 
 // ===========================================================================
@@ -835,11 +1630,11 @@ func (f *Function) BatchNormForInference(operand, scale, offset, mean, variance 
 // ===========================================================================
 
 func (f *Function) Pad(operand, fillValue backends.Value, axesConfig ...backends.PadAxis) (backends.Value, error) {
-	opNode, err := castNode(operand)
+	opNode, err := f.resolveNode(operand)
 	if err != nil {
 		return nil, errors.Wrap(err, "Pad")
 	}
-	fillNode, err := castNode(fillValue)
+	fillNode, err := f.resolveNode(fillValue)
 	if err != nil {
 		return nil, errors.Wrap(err, "Pad: fillValue")
 	}
@@ -865,7 +1660,7 @@ func (f *Function) Pad(operand, fillValue backends.Value, axesConfig ...backends
 		return nil, errors.Wrap(err, "Pad")
 	}
 	outShape := shapes.Make(opNode.shape.DType, outDims...)
-	return &graphNode{tensor: tensor, shape: outShape}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 // ===========================================================================
@@ -873,14 +1668,14 @@ func (f *Function) Pad(operand, fillValue backends.Value, axesConfig ...backends
 // ===========================================================================
 
 func (f *Function) DynamicSlice(operand backends.Value, startIndicesValues []backends.Value, sliceSizes []int) (backends.Value, error) {
-	opNode, err := castNode(operand)
+	opNode, err := f.resolveNode(operand)
 	if err != nil {
 		return nil, errors.Wrap(err, "DynamicSlice: operand")
 	}
 
 	startIndicesTensors := make([]bridge.Tensor, len(startIndicesValues))
 	for i, v := range startIndicesValues {
-		n, err := castNode(v)
+		n, err := f.resolveNode(v)
 		if err != nil {
 			return nil, errors.Wrapf(err, "DynamicSlice: startIndex[%d]", i)
 		}
@@ -897,22 +1692,22 @@ func (f *Function) DynamicSlice(operand backends.Value, startIndicesValues []bac
 	if err != nil {
 		return nil, errors.Wrap(err, "DynamicSlice")
 	}
-	return &graphNode{tensor: tensor, shape: outShape}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 func (f *Function) DynamicUpdateSlice(operand, update backends.Value, startIndicesValues []backends.Value) (backends.Value, error) {
-	opNode, err := castNode(operand)
+	opNode, err := f.resolveNode(operand)
 	if err != nil {
 		return nil, errors.Wrap(err, "DynamicUpdateSlice: operand")
 	}
-	updNode, err := castNode(update)
+	updNode, err := f.resolveNode(update)
 	if err != nil {
 		return nil, errors.Wrap(err, "DynamicUpdateSlice: update")
 	}
 
 	startIndicesTensors := make([]bridge.Tensor, len(startIndicesValues))
 	for i, v := range startIndicesValues {
-		n, err := castNode(v)
+		n, err := f.resolveNode(v)
 		if err != nil {
 			return nil, errors.Wrapf(err, "DynamicUpdateSlice: startIndex[%d]", i)
 		}
@@ -924,7 +1719,7 @@ func (f *Function) DynamicUpdateSlice(operand, update backends.Value, startIndic
 		return nil, errors.Wrap(err, "DynamicUpdateSlice")
 	}
 	// Output shape is same as operand shape.
-	return &graphNode{tensor: tensor, shape: opNode.shape}, nil
+	return &graphNode{tensor: tensor, shape: opNode.shape, owner: f}, nil
 }
 
 // ===========================================================================
@@ -932,7 +1727,7 @@ func (f *Function) DynamicUpdateSlice(operand, update backends.Value, startIndic
 // ===========================================================================
 
 func (f *Function) RNGBitGenerator(state backends.Value, shape shapes.Shape) (newState, values backends.Value, err error) {
-	stateNode, err := castNode(state)
+	stateNode, err := f.resolveNode(state)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "RNGBitGenerator: state")
 	}
@@ -983,8 +1778,8 @@ func (f *Function) RNGBitGenerator(state backends.Value, shape shapes.Shape) (ne
 	}
 
 	// Pass the GoMLX RNG state through unchanged (MPSGraph manages its own state).
-	newStateNode := &graphNode{tensor: stateNode.tensor, shape: stateNode.shape}
-	valuesNode := &graphNode{tensor: valuesTensor, shape: shape}
+	newStateNode := &graphNode{tensor: stateNode.tensor, shape: stateNode.shape, owner: f}
+	valuesNode := &graphNode{tensor: valuesTensor, shape: shape, owner: f}
 	return newStateNode, valuesNode, nil
 }
 
@@ -999,11 +1794,11 @@ func (f *Function) ConvGeneral(
 	inputDilations, kernelDilations []int,
 	channelGroupCount, batchGroupCount int,
 ) (backends.Value, error) {
-	inputNode, err := castNode(input)
+	inputNode, err := f.resolveNode(input)
 	if err != nil {
 		return nil, errors.Wrap(err, "ConvGeneral: input")
 	}
-	kernelNode, err := castNode(kernel)
+	kernelNode, err := f.resolveNode(kernel)
 	if err != nil {
 		return nil, errors.Wrap(err, "ConvGeneral: kernel")
 	}
@@ -1108,7 +1903,7 @@ func (f *Function) ConvGeneral(
 		return nil, errors.Wrap(err, "ConvGeneral: transpose output")
 	}
 
-	return &graphNode{tensor: result, shape: outputShape}, nil
+	return &graphNode{tensor: result, shape: outputShape, owner: f}, nil
 }
 
 // dilateInput inserts zeros between input elements for input dilation.
@@ -1362,7 +2157,7 @@ func (f *Function) ReduceWindow(
 	windowDimensions, strides, baseDilations, windowDilations []int,
 	paddings [][2]int,
 ) (backends.Value, error) {
-	node, err := castNode(x)
+	node, err := f.resolveNode(x)
 	if err != nil {
 		return nil, errors.Wrap(err, "ReduceWindow")
 	}
@@ -1462,7 +2257,7 @@ func (f *Function) ReduceWindow(
 		return nil, errors.Wrap(err, "ReduceWindow: reshape")
 	}
 
-	return &graphNode{tensor: tensor, shape: outShape}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 // ===========================================================================
@@ -1478,11 +2273,11 @@ func (f *Function) SelectAndScatterMin(operand, source backends.Value, windowDim
 }
 
 func (f *Function) selectAndScatterImpl(opName string, operand, source backends.Value, windowDimensions, windowStrides []int, paddings [][2]int) (backends.Value, error) {
-	opNode, err := castNode(operand)
+	opNode, err := f.resolveNode(operand)
 	if err != nil {
 		return nil, errors.Wrapf(err, "%s: operand", opName)
 	}
-	srcNode, err := castNode(source)
+	srcNode, err := f.resolveNode(source)
 	if err != nil {
 		return nil, errors.Wrapf(err, "%s: source", opName)
 	}
@@ -1533,7 +2328,7 @@ func (f *Function) selectAndScatterImpl(opName string, operand, source backends.
 	}
 
 	// Output shape is same as operand.
-	return &graphNode{tensor: tensor, shape: opNode.shape}, nil
+	return &graphNode{tensor: tensor, shape: opNode.shape, owner: f}, nil
 }
 
 // ===========================================================================
@@ -1586,7 +2381,7 @@ func (f *Function) ReduceLogicalOr(x backends.Value, axes ...int) (backends.Valu
 // ===========================================================================
 
 func (f *Function) FusedSoftmax(x backends.Value, axis int) (backends.Value, error) {
-	node, err := castNode(x)
+	node, err := f.resolveNode(x)
 	if err != nil {
 		return nil, errors.Wrap(err, "FusedSoftmax")
 	}
@@ -1594,11 +2389,11 @@ func (f *Function) FusedSoftmax(x backends.Value, axis int) (backends.Value, err
 	if err != nil {
 		return nil, errors.Wrap(err, "FusedSoftmax")
 	}
-	return &graphNode{tensor: tensor, shape: node.shape}, nil
+	return &graphNode{tensor: tensor, shape: node.shape, owner: f}, nil
 }
 
 func (f *Function) FusedGelu(x backends.Value, exact bool) (backends.Value, error) {
-	node, err := castNode(x)
+	node, err := f.resolveNode(x)
 	if err != nil {
 		return nil, errors.Wrap(err, "FusedGelu")
 	}
@@ -1653,7 +2448,7 @@ func (f *Function) FusedGelu(x backends.Value, exact bool) (backends.Value, erro
 		if err != nil {
 			return nil, errors.Wrap(err, "FusedGelu: final mul")
 		}
-		return &graphNode{tensor: result, shape: node.shape}, nil
+		return &graphNode{tensor: result, shape: node.shape, owner: f}, nil
 	}
 
 	// Approximate GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
@@ -1720,11 +2515,11 @@ func (f *Function) FusedGelu(x backends.Value, exact bool) (backends.Value, erro
 		return nil, errors.Wrap(err, "FusedGelu")
 	}
 
-	return &graphNode{tensor: result, shape: node.shape}, nil
+	return &graphNode{tensor: result, shape: node.shape, owner: f}, nil
 }
 
 func (f *Function) FusedLayerNorm(x backends.Value, axes []int, epsilon float64, gamma, beta backends.Value) (backends.Value, error) {
-	node, err := castNode(x)
+	node, err := f.resolveNode(x)
 	if err != nil {
 		return nil, errors.Wrap(err, "FusedLayerNorm")
 	}
@@ -1860,7 +2655,7 @@ func (f *Function) FusedLayerNorm(x backends.Value, axes []int, epsilon float64,
 
 	// Apply gamma (scale) if provided.
 	if gamma != nil {
-		gammaNode, err := castNode(gamma)
+		gammaNode, err := f.resolveNode(gamma)
 		if err != nil {
 			return nil, errors.Wrap(err, "FusedLayerNorm: gamma")
 		}
@@ -1876,7 +2671,7 @@ func (f *Function) FusedLayerNorm(x backends.Value, axes []int, epsilon float64,
 
 	// Apply beta (offset) if provided.
 	if beta != nil {
-		betaNode, err := castNode(beta)
+		betaNode, err := f.resolveNode(beta)
 		if err != nil {
 			return nil, errors.Wrap(err, "FusedLayerNorm: beta")
 		}
@@ -1890,11 +2685,114 @@ func (f *Function) FusedLayerNorm(x backends.Value, axes []int, epsilon float64,
 		}
 	}
 
-	return &graphNode{tensor: normalized, shape: node.shape}, nil
+	return &graphNode{tensor: normalized, shape: node.shape, owner: f}, nil
 }
 
 func (f *Function) FusedDense(x, weight, bias backends.Value, activation backends.ActivationType) (backends.Value, error) {
-	return nil, errors.Wrap(backends.ErrNotImplemented, "FusedDense")
+	xNode, err := f.resolveNode(x)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedDense: x")
+	}
+	wNode, err := f.resolveNode(weight)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedDense: weight")
+	}
+
+	if xNode.shape.Rank() < 1 || wNode.shape.Rank() < 2 {
+		return nil, errors.Errorf("FusedDense: x must have rank >= 1 (got %d), weight must have rank >= 2 (got %d)",
+			xNode.shape.Rank(), wNode.shape.Rank())
+	}
+	inFeatures := xNode.shape.Dimensions[xNode.shape.Rank()-1]
+	if inFeatures != wNode.shape.Dimensions[0] {
+		return nil, errors.Errorf("FusedDense: x's last dim (%d) must match weight's first dim (%d)",
+			inFeatures, wNode.shape.Dimensions[0])
+	}
+
+	// Step 1: Matmul via DotGeneral: contract x's last axis with weight's first axis.
+	result, err := f.DotGeneral(x, []int{xNode.shape.Rank() - 1}, nil, weight, []int{0}, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedDense: DotGeneral")
+	}
+	resultNode, err := f.resolveNode(result)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedDense: cast DotGeneral result")
+	}
+
+	// Step 2: Add bias if provided.
+	if bias != nil {
+		biasNode, err := f.resolveNode(bias)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedDense: bias")
+		}
+		// Broadcast bias to result shape: bias has trailing dims matching weight's output dims.
+		broadcastAxes := make([]int, biasNode.shape.Rank())
+		offset := resultNode.shape.Rank() - biasNode.shape.Rank()
+		for i := range broadcastAxes {
+			broadcastAxes[i] = offset + i
+		}
+		result, err = f.BroadcastInDim(bias, resultNode.shape, broadcastAxes)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedDense: broadcast bias")
+		}
+		result, err = f.Add(resultNode, result)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedDense: add bias")
+		}
+		resultNode, err = f.resolveNode(result)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedDense: cast after bias")
+		}
+	}
+
+	// Step 3: Apply activation.
+	switch activation {
+	case backends.ActivationNone:
+		// No activation.
+	case backends.ActivationGelu:
+		result, err = f.FusedGelu(resultNode, false) // approximate GELU
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedDense: GELU activation")
+		}
+		return result, nil
+	case backends.ActivationRelu:
+		// ReLU: max(0, x)
+		dt := resultNode.shape.DType
+		zeroVal := float32(0)
+		zeroTensor, err := f.ctx().Constant(unsafe.Pointer(&zeroVal), 4, dtypeToBridgeDType(dt), []int64{1})
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedDense: ReLU zero constant")
+		}
+		zeroTensor, err = f.ctx().Reshape(zeroTensor, nil) // scalar
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedDense: ReLU zero reshape")
+		}
+		tensor, err := f.ctx().Max(resultNode.tensor, zeroTensor)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedDense: ReLU max")
+		}
+		return &graphNode{tensor: tensor, shape: resultNode.shape, owner: f}, nil
+	case backends.ActivationSilu:
+		// SiLU/Swish: x * sigmoid(x)
+		sigmoid, err := f.ctx().Sigmoid(resultNode.tensor)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedDense: SiLU sigmoid")
+		}
+		tensor, err := f.ctx().Mul(resultNode.tensor, sigmoid)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedDense: SiLU mul")
+		}
+		return &graphNode{tensor: tensor, shape: resultNode.shape, owner: f}, nil
+	case backends.ActivationTanh:
+		tensor, err := f.ctx().Tanh(resultNode.tensor)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedDense: Tanh")
+		}
+		return &graphNode{tensor: tensor, shape: resultNode.shape, owner: f}, nil
+	default:
+		return nil, errors.Errorf("FusedDense: unsupported activation type %d", activation)
+	}
+
+	return resultNode, nil
 }
 
 func (f *Function) FusedScaledDotProductAttention(
@@ -1904,12 +2802,373 @@ func (f *Function) FusedScaledDotProductAttention(
 	scale float64,
 	causal bool,
 ) (backends.Value, error) {
-	return nil, errors.Wrap(backends.ErrNotImplemented, "FusedScaledDotProductAttention")
+	qNode, err := f.resolveNode(query)
+	if err != nil {
+		return nil, errors.Wrap(err, "SDPA: query")
+	}
+	kNode, err := f.resolveNode(key)
+	if err != nil {
+		return nil, errors.Wrap(err, "SDPA: key")
+	}
+	vNode, err := f.resolveNode(value)
+	if err != nil {
+		return nil, errors.Wrap(err, "SDPA: value")
+	}
+
+	if qNode.shape.Rank() != 4 {
+		return nil, errors.Errorf("SDPA: query must have rank 4, got %d", qNode.shape.Rank())
+	}
+	if numHeads <= 0 || numKVHeads <= 0 || numHeads%numKVHeads != 0 {
+		return nil, errors.Errorf("SDPA: numHeads (%d) must be positive and divisible by numKVHeads (%d)", numHeads, numKVHeads)
+	}
+
+	// For simplicity and correctness, convert BSHD to BHSD, do attention, and convert back.
+	// This avoids complex axis management with DotGeneral's output ordering.
+	isBSHD := axesLayout == backends.AxesLayoutBSHD
+	if isBSHD {
+		// BSHD [B,S,H,D] → BHSD [B,H,S,D]
+		query, err = f.Transpose(query, 0, 2, 1, 3)
+		if err != nil {
+			return nil, errors.Wrap(err, "SDPA: transpose Q to BHSD")
+		}
+		key, err = f.Transpose(key, 0, 2, 1, 3)
+		if err != nil {
+			return nil, errors.Wrap(err, "SDPA: transpose K to BHSD")
+		}
+		value, err = f.Transpose(value, 0, 2, 1, 3)
+		if err != nil {
+			return nil, errors.Wrap(err, "SDPA: transpose V to BHSD")
+		}
+		// Also transpose mask if it's rank 4.
+		if mask != nil {
+			maskNode, _ := f.resolveNode(mask)
+			if maskNode != nil && maskNode.shape.Rank() == 4 {
+				mask, err = f.Transpose(mask, 0, 2, 1, 3)
+				if err != nil {
+					return nil, errors.Wrap(err, "SDPA: transpose mask to BHSD")
+				}
+			}
+		}
+		qNode, _ = f.resolveNode(query)
+		kNode, _ = f.resolveNode(key)
+		vNode, _ = f.resolveNode(value)
+	}
+
+	// Now everything is in BHSD layout: [B, H, Sq, D].
+
+	// For GQA: if numKVHeads < numHeads, repeat K/V heads.
+	kvKey := key
+	kvValue := value
+	if numKVHeads < numHeads {
+		repeats := numHeads / numKVHeads
+		kvKey, err = f.repeatHeads(kNode, 1, repeats) // headsAxis=1 in BHSD
+		if err != nil {
+			return nil, errors.Wrap(err, "SDPA: repeat K heads")
+		}
+		kvValue, err = f.repeatHeads(vNode, 1, repeats)
+		if err != nil {
+			return nil, errors.Wrap(err, "SDPA: repeat V heads")
+		}
+	}
+
+	// Compute attention scores: Q @ K^T.
+	// Q: [B,H,Sq,D], K: [B,H,Sk,D] → scores: [B,H,Sq,Sk]
+	scores, err := f.DotGeneral(
+		query, []int{3}, []int{0, 1}, // contract dim(3), batch [B(0),H(1)]
+		kvKey, []int{3}, []int{0, 1}) // contract dim(3), batch [B(0),H(1)]
+	if err != nil {
+		return nil, errors.Wrap(err, "SDPA: scores matmul")
+	}
+
+	// Scale scores.
+	scoresNode, err := f.resolveNode(scores)
+	if err != nil {
+		return nil, errors.Wrap(err, "SDPA: cast scores")
+	}
+	dt := scoresNode.shape.DType
+	scaleVal := float32(scale)
+	scaleTensor, err := f.ctx().Constant(unsafe.Pointer(&scaleVal), 4, dtypeToBridgeDType(dt), []int64{1})
+	if err != nil {
+		return nil, errors.Wrap(err, "SDPA: scale constant")
+	}
+	scaleTensor, err = f.ctx().Reshape(scaleTensor, nil) // scalar
+	if err != nil {
+		return nil, errors.Wrap(err, "SDPA: scale reshape")
+	}
+	scaledTensor, err := f.ctx().Mul(scoresNode.tensor, scaleTensor)
+	if err != nil {
+		return nil, errors.Wrap(err, "SDPA: scale mul")
+	}
+	scores = &graphNode{tensor: scaledTensor, shape: scoresNode.shape, owner: f}
+
+	// Apply causal mask if needed: lower triangular.
+	if causal {
+		seqLen := qNode.shape.Dimensions[2]   // Sq in BHSD
+		kvSeqLen := kNode.shape.Dimensions[2]  // Sk in BHSD
+		// Create lower triangular mask: mask[i,j] = (i >= j).
+		maskShape := shapes.Make(dtypes.Int32, seqLen, kvSeqLen)
+		rowIota, err := f.Iota(maskShape, 0)
+		if err != nil {
+			return nil, errors.Wrap(err, "SDPA: causal row iota")
+		}
+		colIota, err := f.Iota(maskShape, 1)
+		if err != nil {
+			return nil, errors.Wrap(err, "SDPA: causal col iota")
+		}
+		causalMask, err := f.GreaterOrEqual(rowIota, colIota)
+		if err != nil {
+			return nil, errors.Wrap(err, "SDPA: causal mask comparison")
+		}
+		// Reshape for broadcasting with BHSD scores: [1,1,Sq,Sk]
+		causalMask, err = f.Reshape(causalMask, 1, 1, seqLen, kvSeqLen)
+		if err != nil {
+			return nil, errors.Wrap(err, "SDPA: causal mask reshape")
+		}
+		mask = causalMask
+	}
+
+	// Apply mask to scores.
+	if mask != nil {
+		maskNode, err := f.resolveNode(mask)
+		if err != nil {
+			return nil, errors.Wrap(err, "SDPA: mask cast")
+		}
+
+		if maskNode.shape.DType == dtypes.Bool {
+			// Boolean mask: where mask is false, set score to -inf.
+			negInfVal := float32(math.Inf(-1))
+			negInfTensor, err := f.ctx().Constant(unsafe.Pointer(&negInfVal), 4, dtypeToBridgeDType(dt), []int64{1})
+			if err != nil {
+				return nil, errors.Wrap(err, "SDPA: -inf constant")
+			}
+			negInfTensor, err = f.ctx().Reshape(negInfTensor, nil)
+			if err != nil {
+				return nil, errors.Wrap(err, "SDPA: -inf reshape")
+			}
+			// Broadcast -inf to scores shape.
+			scoresNode, _ = f.resolveNode(scores)
+			outDims := make([]int64, scoresNode.shape.Rank())
+			for i, d := range scoresNode.shape.Dimensions {
+				outDims[i] = int64(d)
+			}
+			negInfBroadcast, err := f.ctx().BroadcastTo(negInfTensor, outDims)
+			if err != nil {
+				return nil, errors.Wrap(err, "SDPA: broadcast -inf")
+			}
+			// Broadcast mask to scores shape.
+			maskBroadcast, err := f.broadcastMaskToScores(mask, scoresNode.shape)
+			if err != nil {
+				return nil, errors.Wrap(err, "SDPA: broadcast bool mask")
+			}
+			maskBNode, _ := f.resolveNode(maskBroadcast)
+			// Where(mask, scores, -inf)
+			tensor, err := f.ctx().Where(maskBNode.tensor, scoresNode.tensor, negInfBroadcast)
+			if err != nil {
+				return nil, errors.Wrap(err, "SDPA: where mask")
+			}
+			scores = &graphNode{tensor: tensor, shape: scoresNode.shape, owner: f}
+		} else {
+			// Additive mask: scores = scores + mask.
+			scores, err = f.Add(scores, mask)
+			if err != nil {
+				return nil, errors.Wrap(err, "SDPA: add mask")
+			}
+		}
+	}
+
+	// Softmax along the last axis (kv_seq dimension).
+	scoresNode, _ = f.resolveNode(scores)
+	scores, err = f.FusedSoftmax(scores, scoresNode.shape.Rank()-1)
+	if err != nil {
+		return nil, errors.Wrap(err, "SDPA: softmax")
+	}
+
+	// Compute output: scores @ V.
+	// scores: [B,H,Sq,Sk], V: [B,H,Sk,D] → output: [B,H,Sq,D]
+	output, err := f.DotGeneral(
+		scores, []int{3}, []int{0, 1}, // contract Sk(3), batch [B(0),H(1)]
+		kvValue, []int{2}, []int{0, 1}) // contract Sk(2), batch [B(0),H(1)]
+	if err != nil {
+		return nil, errors.Wrap(err, "SDPA: output matmul")
+	}
+
+	// Convert back from BHSD to BSHD if needed.
+	if isBSHD {
+		output, err = f.Transpose(output, 0, 2, 1, 3)
+		if err != nil {
+			return nil, errors.Wrap(err, "SDPA: transpose output back to BSHD")
+		}
+	}
+
+	return output, nil
+}
+
+// repeatHeads repeats KV heads along the heads axis for GQA.
+// Expands [B, ..., numKVHeads, ..., D] → [B, ..., numHeads, ..., D] by repeating each head.
+func (f *Function) repeatHeads(node *graphNode, headsAxis, repeats int) (backends.Value, error) {
+	dims := node.shape.Dimensions
+	rank := node.shape.Rank()
+	numKVHeads := dims[headsAxis]
+
+	// Insert a new axis after headsAxis: [B, ..., numKVHeads, 1, ..., D]
+	// Then broadcast to [B, ..., numKVHeads, repeats, ..., D]
+	// Then reshape to [B, ..., numKVHeads*repeats, ..., D]
+	newDims := make([]int, rank+1)
+	for i := 0; i < headsAxis+1; i++ {
+		newDims[i] = dims[i]
+	}
+	newDims[headsAxis+1] = 1
+	for i := headsAxis + 1; i < rank; i++ {
+		newDims[i+1] = dims[i]
+	}
+	reshaped, err := f.Reshape(node, newDims...)
+	if err != nil {
+		return nil, errors.Wrap(err, "repeatHeads: reshape insert")
+	}
+
+	// Broadcast the new axis to 'repeats'.
+	broadcastDims := make([]int, rank+1)
+	copy(broadcastDims, newDims)
+	broadcastDims[headsAxis+1] = repeats
+	broadcastShape := shapes.Make(node.shape.DType, broadcastDims...)
+	axes := make([]int, rank+1)
+	for i := range axes {
+		axes[i] = i
+	}
+	broadcasted, err := f.BroadcastInDim(reshaped, broadcastShape, axes)
+	if err != nil {
+		return nil, errors.Wrap(err, "repeatHeads: broadcast")
+	}
+
+	// Reshape to merge heads axis: [B, ..., numKVHeads*repeats, ..., D]
+	finalDims := make([]int, rank)
+	for i := 0; i < headsAxis; i++ {
+		finalDims[i] = dims[i]
+	}
+	finalDims[headsAxis] = numKVHeads * repeats
+	for i := headsAxis + 1; i < rank; i++ {
+		finalDims[i] = dims[i]
+	}
+	return f.Reshape(broadcasted, finalDims...)
+}
+
+// broadcastMaskToScores broadcasts a mask of arbitrary rank to the scores shape.
+func (f *Function) broadcastMaskToScores(mask backends.Value, scoresShape shapes.Shape) (backends.Value, error) {
+	maskNode, err := f.resolveNode(mask)
+	if err != nil {
+		return nil, err
+	}
+	maskRank := maskNode.shape.Rank()
+	scoresRank := scoresShape.Rank()
+
+	// Build broadcast axes: align trailing dimensions.
+	broadcastAxes := make([]int, maskRank)
+	offset := scoresRank - maskRank
+	for i := range broadcastAxes {
+		broadcastAxes[i] = offset + i
+	}
+	return f.BroadcastInDim(mask, scoresShape, broadcastAxes)
 }
 
 func (f *Function) FusedAttentionQKVProjection(
 	x, wQKV, biasQ, biasK, biasV backends.Value,
 	queryDim, keyValueDim int,
 ) (query, key, value backends.Value, err error) {
-	return nil, nil, nil, errors.Wrap(backends.ErrNotImplemented, "FusedAttentionQKVProjection")
+	xNode, err := f.resolveNode(x)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "FusedAttentionQKVProjection: x")
+	}
+	if xNode.shape.Rank() < 1 {
+		return nil, nil, nil, errors.Errorf("FusedAttentionQKVProjection: x must have rank >= 1, got %d", xNode.shape.Rank())
+	}
+
+	// Step 1: Combined matmul: x @ wQKV → [batch..., queryDim + 2*keyValueDim]
+	combined, err := f.DotGeneral(x, []int{xNode.shape.Rank() - 1}, nil, wQKV, []int{0}, nil)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "FusedAttentionQKVProjection: DotGeneral")
+	}
+
+	// Step 2: Slice into Q, K, V along the last axis.
+	combinedNode, err := f.resolveNode(combined)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "FusedAttentionQKVProjection: cast combined")
+	}
+
+	rank := combinedNode.shape.Rank()
+	batchDims := xNode.shape.Dimensions[:xNode.shape.Rank()-1]
+
+	// Build starts/limits/strides for slicing.
+	makeSlice := func(startLast, limitLast int) (backends.Value, error) {
+		starts := make([]int, rank)
+		limits := make([]int, rank)
+		strides := make([]int, rank)
+		for i := range rank {
+			starts[i] = 0
+			limits[i] = combinedNode.shape.Dimensions[i]
+			strides[i] = 1
+		}
+		starts[rank-1] = startLast
+		limits[rank-1] = limitLast
+		return f.Slice(combined, starts, limits, strides)
+	}
+
+	// Q: [batch..., 0:queryDim]
+	query, err = makeSlice(0, queryDim)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "FusedAttentionQKVProjection: slice Q")
+	}
+
+	// K: [batch..., queryDim:queryDim+keyValueDim]
+	key, err = makeSlice(queryDim, queryDim+keyValueDim)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "FusedAttentionQKVProjection: slice K")
+	}
+
+	// V: [batch..., queryDim+keyValueDim:queryDim+2*keyValueDim]
+	value, err = makeSlice(queryDim+keyValueDim, queryDim+2*keyValueDim)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "FusedAttentionQKVProjection: slice V")
+	}
+
+	// Step 3: Add biases if provided.
+	addBias := func(result backends.Value, bias backends.Value, name string) (backends.Value, error) {
+		if bias == nil {
+			return result, nil
+		}
+		resultNode, err := f.resolveNode(result)
+		if err != nil {
+			return nil, errors.Wrapf(err, "FusedAttentionQKVProjection: cast %s", name)
+		}
+		biasNode, err := f.resolveNode(bias)
+		if err != nil {
+			return nil, errors.Wrapf(err, "FusedAttentionQKVProjection: cast bias%s", name)
+		}
+		// Broadcast bias to result shape.
+		broadcastAxes := make([]int, biasNode.shape.Rank())
+		offset := resultNode.shape.Rank() - biasNode.shape.Rank()
+		for i := range broadcastAxes {
+			broadcastAxes[i] = offset + i
+		}
+		broadcastedBias, err := f.BroadcastInDim(bias, resultNode.shape, broadcastAxes)
+		if err != nil {
+			return nil, errors.Wrapf(err, "FusedAttentionQKVProjection: broadcast bias%s", name)
+		}
+		return f.Add(result, broadcastedBias)
+	}
+
+	query, err = addBias(query, biasQ, "Q")
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	key, err = addBias(key, biasK, "K")
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	value, err = addBias(value, biasV, "V")
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	_ = batchDims // used in documentation comments above
+	return query, key, value, nil
 }

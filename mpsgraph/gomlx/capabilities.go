@@ -12,7 +12,7 @@ import (
 // backendCapabilities declares which ops and dtypes the MPSGraph backend supports.
 // This is progressively expanded as more ops are implemented.
 var backendCapabilities = backends.Capabilities{
-	Functions: false, // Closures/control flow not yet supported.
+	Functions: true, // Closures and control flow (While, If, Sort, Call) supported.
 
 	Operations: map[backends.OpType]bool{
 		// Inputs
@@ -133,9 +133,22 @@ var backendCapabilities = backends.Capabilities{
 		backends.OpTypeReduceLogicalOr:  true,
 
 		// Fused operations
-		backends.OpTypeFusedSoftmax:   true,
-		backends.OpTypeFusedLayerNorm: true,
-		backends.OpTypeFusedGelu:      true,
+		backends.OpTypeFusedSoftmax:                      true,
+		backends.OpTypeFusedLayerNorm:                    true,
+		backends.OpTypeFusedGelu:                         true,
+		backends.OpTypeFusedDense:                        true,
+		backends.OpTypeFusedAttentionQKVProjection:       true,
+		backends.OpTypeFusedScaledDotProductAttention:    true,
+
+		// Batch normalization (training)
+		backends.OpTypeBatchNormForTraining: true,
+		backends.OpTypeBatchNormGradient:    true,
+
+		// Control flow
+		backends.OpTypeWhile: true,
+		backends.OpTypeIf:    true,
+		backends.OpTypeSort:  true,
+		backends.OpTypeCall:  true,
 	},
 
 	DTypes: map[dtypes.DType]bool{
@@ -147,7 +160,8 @@ var backendCapabilities = backends.Capabilities{
 		dtypes.Int32:   true,
 		dtypes.Int64:   true,
 		dtypes.Uint8:   true,
-		dtypes.Uint16:  true,
-		dtypes.Uint32:  true,
+		dtypes.Uint16:   true,
+		dtypes.Uint32:   true,
+		dtypes.BFloat16: true,
 	},
 }

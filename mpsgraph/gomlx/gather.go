@@ -27,11 +27,11 @@ func (f *Function) Gather(
 	offsetOutputAxes, collapsedSliceAxes, startIndexMap, sliceSizes []int,
 	indicesAreSorted bool,
 ) (backends.Value, error) {
-	operandNode, err := castNode(operand)
+	operandNode, err := f.resolveNode(operand)
 	if err != nil {
 		return nil, errors.Wrap(err, "Gather: operand")
 	}
-	indicesNode, err := castNode(startIndices)
+	indicesNode, err := f.resolveNode(startIndices)
 	if err != nil {
 		return nil, errors.Wrap(err, "Gather: startIndices")
 	}
@@ -195,7 +195,7 @@ func (f *Function) gatherEmbeddingLookup(
 		return nil, false
 	}
 
-	return &graphNode{tensor: result, shape: outShape}, true
+	return &graphNode{tensor: result, shape: outShape, owner: f}, true
 }
 
 // gatherGeneral implements the full XLA Gather semantics by decomposing into
@@ -299,7 +299,7 @@ func (f *Function) gatherGeneral(
 		if err != nil {
 			return nil, errors.Wrap(err, "Gather: reshape output")
 		}
-		return &graphNode{tensor: result, shape: outShape}, nil
+		return &graphNode{tensor: result, shape: outShape, owner: f}, nil
 	}
 
 	// Fallback: decompose into per-element gather using gatherND with index remapping.
@@ -365,7 +365,7 @@ func (f *Function) gatherGeneral(
 		return nil, errors.Wrap(err, "Gather: reshape output general")
 	}
 
-	return &graphNode{tensor: result, shape: outShape}, nil
+	return &graphNode{tensor: result, shape: outShape, owner: f}, nil
 }
 
 // ===========================================================================
@@ -381,15 +381,15 @@ func (f *Function) scatterImpl(
 	indicesAreSorted, uniqueIndices bool,
 	scatterMode int,
 ) (backends.Value, error) {
-	operandNode, err := castNode(operandOp)
+	operandNode, err := f.resolveNode(operandOp)
 	if err != nil {
 		return nil, errors.Wrap(err, opName+": operand")
 	}
-	indicesNode, err := castNode(scatterIndicesOp)
+	indicesNode, err := f.resolveNode(scatterIndicesOp)
 	if err != nil {
 		return nil, errors.Wrap(err, opName+": indices")
 	}
-	updatesNode, err := castNode(updatesOp)
+	updatesNode, err := f.resolveNode(updatesOp)
 	if err != nil {
 		return nil, errors.Wrap(err, opName+": updates")
 	}
@@ -464,7 +464,7 @@ func (f *Function) scatterImpl(
 		if err != nil {
 			return nil, errors.Wrap(err, opName+": scatter along axis")
 		}
-		return &graphNode{tensor: result, shape: outShape}, nil
+		return &graphNode{tensor: result, shape: outShape, owner: f}, nil
 	}
 
 	// General case: use scatterND.
@@ -493,7 +493,7 @@ func (f *Function) scatterImpl(
 	if err != nil {
 		return nil, errors.Wrap(err, opName+": scatterND")
 	}
-	return &graphNode{tensor: result, shape: outShape}, nil
+	return &graphNode{tensor: result, shape: outShape, owner: f}, nil
 }
 
 func (f *Function) ScatterSum(

@@ -2802,6 +2802,359 @@ func TestInt64Operations(t *testing.T) {
 	})
 }
 
+// TestFusedDense tests the FusedDense operation (matmul + bias + activation).
+func TestFusedDense(t *testing.T) {
+	backend := newTestBackend(t)
+
+	t.Run("no_activation_no_bias", func(t *testing.T) {
+		// Simple matmul: [2,3] @ [3,4] → [2,4]
+		result := graph.MustExecOnce(backend, func(x, w *graph.Node) *graph.Node {
+			return graph.BackendFusedDense(x, w, nil, backends.ActivationNone)
+		},
+			tensors.FromFlatDataAndDimensions([]float32{1, 2, 3, 4, 5, 6}, 2, 3),
+			tensors.FromFlatDataAndDimensions([]float32{
+				1, 0, 0, 0,
+				0, 1, 0, 0,
+				0, 0, 1, 0,
+			}, 3, 4),
+		)
+		got, _ := tensors.CopyFlatData[float32](result)
+		// With identity-like weight: first 3 dims pass through, 4th is 0.
+		assertClose(t, got, []float32{1, 2, 3, 0, 4, 5, 6, 0}, 1e-4)
+	})
+
+	t.Run("with_bias", func(t *testing.T) {
+		result := graph.MustExecOnce(backend, func(x, w, b *graph.Node) *graph.Node {
+			return graph.BackendFusedDense(x, w, b, backends.ActivationNone)
+		},
+			tensors.FromFlatDataAndDimensions([]float32{1, 0, 0, 1}, 2, 2),
+			tensors.FromFlatDataAndDimensions([]float32{2, 0, 0, 3}, 2, 2),
+			tensors.FromFlatDataAndDimensions([]float32{10, 20}, 2),
+		)
+		got, _ := tensors.CopyFlatData[float32](result)
+		// Row 0: [1,0] @ [[2,0],[0,3]] + [10,20] = [2,0] + [10,20] = [12, 20]
+		// Row 1: [0,1] @ [[2,0],[0,3]] + [10,20] = [0,3] + [10,20] = [10, 23]
+		assertClose(t, got, []float32{12, 20, 10, 23}, 1e-4)
+	})
+
+	t.Run("relu_activation", func(t *testing.T) {
+		result := graph.MustExecOnce(backend, func(x, w *graph.Node) *graph.Node {
+			return graph.BackendFusedDense(x, w, nil, backends.ActivationRelu)
+		},
+			tensors.FromFlatDataAndDimensions([]float32{1, -1, -1, 1}, 2, 2),
+			tensors.FromFlatDataAndDimensions([]float32{1, 0, 0, 1}, 2, 2),
+		)
+		got, _ := tensors.CopyFlatData[float32](result)
+		// Row 0: [1,-1] → relu → [1, 0]
+		// Row 1: [-1,1] → relu → [0, 1]
+		assertClose(t, got, []float32{1, 0, 0, 1}, 1e-4)
+	})
+
+	t.Run("dense_layer_integration", func(t *testing.T) {
+		// Test that layers.Dense (which uses FusedDense internally) works correctly.
+		ctx := context.New()
+		result, err := context.ExecOnce(backend, ctx, func(ctx *context.Context, input *graph.Node) *graph.Node {
+			return layers.Dense(ctx, input, true, 4)
+		}, tensors.FromFlatDataAndDimensions([]float32{1, 2, 3, 4, 5, 6}, 2, 3))
+		if err != nil {
+			t.Fatalf("Dense exec failed: %+v", err)
+		}
+		// Just verify it runs and returns the right shape.
+		if result.Shape().Rank() != 2 || result.Shape().Dimensions[0] != 2 || result.Shape().Dimensions[1] != 4 {
+			t.Errorf("Dense output shape = %v, want [2,4]", result.Shape())
+		}
+	})
+
+	t.Run("gradient_via_dense_layer", func(t *testing.T) {
+		// Verify gradients flow through Dense layer (which uses FusedDense internally
+		// via InternalFusedOpCaller that handles VJP fallback).
+		ctx := context.New()
+		result, err := context.ExecOnce(backend, ctx, func(ctx *context.Context, x *graph.Node) *graph.Node {
+			y := layers.Dense(ctx, x, false, 2)
+			loss := graph.ReduceAllSum(y)
+			grads := graph.Gradient(loss, x)
+			return grads[0]
+		}, tensors.FromFlatDataAndDimensions([]float32{1, 2, 3, 4}, 2, 2))
+		if err != nil {
+			t.Fatalf("Dense gradient exec failed: %+v", err)
+		}
+		got, _ := tensors.CopyFlatData[float32](result)
+		// Gradient should be non-zero for all inputs.
+		allZero := true
+		for _, v := range got {
+			if v != 0 {
+				allZero = false
+				break
+			}
+		}
+		if allZero {
+			t.Error("Gradient is all zeros, expected non-zero values")
+		}
+	})
+}
+
+// TestFusedAttentionQKVProjection tests the QKV projection fused op.
+func TestFusedAttentionQKVProjection(t *testing.T) {
+	backend := newTestBackend(t)
+
+	t.Run("identity_weights", func(t *testing.T) {
+		// x: [2, 6], wQKV: [6, 6] (identity), queryDim=2, kvDim=2
+		// So combined output [2,6] gets split into Q[2,2], K[2,2], V[2,2]
+		xData := []float32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+		wData := make([]float32, 36)
+		for i := range 6 {
+			wData[i*6+i] = 1 // identity matrix
+		}
+		results := graph.MustExecOnceN(backend, func(x, w *graph.Node) []*graph.Node {
+			q, k, v := graph.BackendFusedAttentionQKVProjection(x, w, nil, nil, nil, 2, 2)
+			return []*graph.Node{q, k, v}
+		},
+			tensors.FromFlatDataAndDimensions(xData, 2, 6),
+			tensors.FromFlatDataAndDimensions(wData, 6, 6),
+		)
+
+		qGot, _ := tensors.CopyFlatData[float32](results[0])
+		kGot, _ := tensors.CopyFlatData[float32](results[1])
+		vGot, _ := tensors.CopyFlatData[float32](results[2])
+
+		// Q = first 2 cols: [1,2], [7,8]
+		assertClose(t, qGot, []float32{1, 2, 7, 8}, 1e-4)
+		// K = next 2 cols: [3,4], [9,10]
+		assertClose(t, kGot, []float32{3, 4, 9, 10}, 1e-4)
+		// V = last 2 cols: [5,6], [11,12]
+		assertClose(t, vGot, []float32{5, 6, 11, 12}, 1e-4)
+	})
+
+	t.Run("with_biases", func(t *testing.T) {
+		// x: [1, 4], wQKV: [4, 6] (identity-ish), qDim=2, kvDim=2, with biases
+		xData := []float32{1, 2, 3, 4}
+		wData := make([]float32, 24)
+		for i := range 4 {
+			if i < 6 {
+				wData[i*6+i] = 1
+			}
+		}
+		biasQ := []float32{10, 20}
+		biasK := []float32{100, 200}
+		biasV := []float32{1000, 2000}
+
+		results := graph.MustExecOnceN(backend, func(x, w, bq, bk, bv *graph.Node) []*graph.Node {
+			q, k, v := graph.BackendFusedAttentionQKVProjection(x, w, bq, bk, bv, 2, 2)
+			return []*graph.Node{q, k, v}
+		},
+			tensors.FromFlatDataAndDimensions(xData, 1, 4),
+			tensors.FromFlatDataAndDimensions(wData, 4, 6),
+			tensors.FromFlatDataAndDimensions(biasQ, 2),
+			tensors.FromFlatDataAndDimensions(biasK, 2),
+			tensors.FromFlatDataAndDimensions(biasV, 2),
+		)
+
+		qGot, _ := tensors.CopyFlatData[float32](results[0])
+		kGot, _ := tensors.CopyFlatData[float32](results[1])
+		vGot, _ := tensors.CopyFlatData[float32](results[2])
+
+		// Q = [1,2] + [10,20] = [11, 22]
+		assertClose(t, qGot, []float32{11, 22}, 1e-4)
+		// K = [3,4] + [100,200] = [103, 204]
+		assertClose(t, kGot, []float32{103, 204}, 1e-4)
+		// V = [0,0] + [1000,2000] = [1000, 2000] (cols 4,5 of x@w are zero since w is sparse)
+		assertClose(t, vGot, []float32{1000, 2000}, 1e-4)
+	})
+}
+
+// TestFusedScaledDotProductAttention tests the SDPA fused op.
+func TestFusedScaledDotProductAttention(t *testing.T) {
+	backend := newTestBackend(t)
+
+	t.Run("basic_BHSD", func(t *testing.T) {
+		// Simple attention: B=1, H=1, S=2, D=2 with BHSD layout.
+		// Q=K=V=[[[1,0],[0,1]]] → scores = Q@K^T = [[1,0],[0,1]], softmax → [[0.731,0.269],[0.269,0.731]]
+		data := []float32{1, 0, 0, 1}
+		scale := 1.0 / math.Sqrt(2.0) // 1/sqrt(headDim)
+
+		result := graph.MustExecOnce(backend, func(q, k, v *graph.Node) *graph.Node {
+			return graph.BackendFusedScaledDotProductAttention(
+				q, k, v, nil, 1, 1, backends.AxesLayoutBHSD, scale, false)
+		},
+			tensors.FromFlatDataAndDimensions(data, 1, 1, 2, 2),
+			tensors.FromFlatDataAndDimensions(data, 1, 1, 2, 2),
+			tensors.FromFlatDataAndDimensions(data, 1, 1, 2, 2),
+		)
+		got, _ := tensors.CopyFlatData[float32](result)
+		// Output shape should be [1,1,2,2].
+		if result.Shape().Rank() != 4 {
+			t.Fatalf("Expected rank 4, got %d", result.Shape().Rank())
+		}
+		// Values should be between 0 and 1 (weighted average of V=[identity]).
+		for i, v := range got {
+			if v < -0.1 || v > 1.1 {
+				t.Errorf("Output[%d] = %f, expected in [0,1]", i, v)
+			}
+		}
+	})
+
+	t.Run("causal_mask", func(t *testing.T) {
+		// With causal masking, first position can only attend to itself.
+		// B=1, H=1, S=3, D=2
+		qData := []float32{1, 0, 0, 1, 1, 1}
+		kData := []float32{1, 0, 0, 1, 1, 1}
+		vData := []float32{1, 0, 0, 1, 0.5, 0.5}
+		scale := 1.0
+
+		result := graph.MustExecOnce(backend, func(q, k, v *graph.Node) *graph.Node {
+			return graph.BackendFusedScaledDotProductAttention(
+				q, k, v, nil, 1, 1, backends.AxesLayoutBHSD, scale, true)
+		},
+			tensors.FromFlatDataAndDimensions(qData, 1, 1, 3, 2),
+			tensors.FromFlatDataAndDimensions(kData, 1, 1, 3, 2),
+			tensors.FromFlatDataAndDimensions(vData, 1, 1, 3, 2),
+		)
+		got, _ := tensors.CopyFlatData[float32](result)
+		// First position: only attends to position 0 → output should be V[0] = [1,0]
+		assertClose(t, got[:2], []float32{1, 0}, 1e-3)
+	})
+
+	t.Run("BSHD_layout", func(t *testing.T) {
+		// Test BSHD layout: B=1, S=2, H=1, D=2
+		data := []float32{1, 0, 0, 1}
+		scale := 1.0 / math.Sqrt(2.0)
+
+		result := graph.MustExecOnce(backend, func(q, k, v *graph.Node) *graph.Node {
+			return graph.BackendFusedScaledDotProductAttention(
+				q, k, v, nil, 1, 1, backends.AxesLayoutBSHD, scale, false)
+		},
+			tensors.FromFlatDataAndDimensions(data, 1, 2, 1, 2),
+			tensors.FromFlatDataAndDimensions(data, 1, 2, 1, 2),
+			tensors.FromFlatDataAndDimensions(data, 1, 2, 1, 2),
+		)
+		// Should produce valid output with BSHD layout [1,2,1,2].
+		if result.Shape().Rank() != 4 || result.Shape().Dimensions[1] != 2 || result.Shape().Dimensions[2] != 1 {
+			t.Errorf("BSHD output shape = %v, want [1,2,1,2]", result.Shape())
+		}
+	})
+
+	t.Run("boolean_mask", func(t *testing.T) {
+		// Test boolean mask: mask out second KV position.
+		// B=1, H=1, S=2, D=2
+		qData := []float32{1, 0, 0, 1}
+		kData := []float32{1, 0, 0, 1}
+		vData := []float32{10, 20, 30, 40}
+		// Mask: [[true, false], [true, true]] — position 0 can only attend to position 0.
+		maskData := []bool{true, false, true, true}
+
+		result := graph.MustExecOnce(backend, func(q, k, v, m *graph.Node) *graph.Node {
+			return graph.BackendFusedScaledDotProductAttention(
+				q, k, v, m, 1, 1, backends.AxesLayoutBHSD, 1.0, false)
+		},
+			tensors.FromFlatDataAndDimensions(qData, 1, 1, 2, 2),
+			tensors.FromFlatDataAndDimensions(kData, 1, 1, 2, 2),
+			tensors.FromFlatDataAndDimensions(vData, 1, 1, 2, 2),
+			tensors.FromFlatDataAndDimensions(maskData, 1, 1, 2, 2),
+		)
+		got, _ := tensors.CopyFlatData[float32](result)
+		// Position 0 can only attend to position 0 → output[0] = V[0] = [10, 20]
+		assertClose(t, got[:2], []float32{10, 20}, 1e-3)
+	})
+}
+
+// TestBatchNormForTraining tests the BatchNormForTraining operation.
+func TestBatchNormForTraining(t *testing.T) {
+	backend := newTestBackend(t)
+
+	t.Run("basic", func(t *testing.T) {
+		// Input: [4, 2] with featureAxis=1 (2 features, batch of 4).
+		// Feature 0: [1, 3, 5, 7] → mean=4, var=5
+		// Feature 1: [2, 4, 6, 8] → mean=5, var=5
+		inputData := []float32{1, 2, 3, 4, 5, 6, 7, 8}
+		scaleData := []float32{1, 1}
+		offsetData := []float32{0, 0}
+
+		results := graph.MustExecOnceN(backend, func(op, sc, off *graph.Node) []*graph.Node {
+			normalized, batchMean, batchVar := graph.InternalBatchNormForTraining(op, sc, off, 1e-5, 1)
+			return []*graph.Node{normalized, batchMean, batchVar}
+		},
+			tensors.FromFlatDataAndDimensions(inputData, 4, 2),
+			tensors.FromFlatDataAndDimensions(scaleData, 2),
+			tensors.FromFlatDataAndDimensions(offsetData, 2),
+		)
+
+		normGot, _ := tensors.CopyFlatData[float32](results[0])
+		meanGot, _ := tensors.CopyFlatData[float32](results[1])
+		varGot, _ := tensors.CopyFlatData[float32](results[2])
+
+		// Check mean: [4, 5]
+		assertClose(t, meanGot, []float32{4, 5}, 1e-3)
+		// Check variance: [5, 5]
+		assertClose(t, varGot, []float32{5, 5}, 1e-3)
+		// Check normalized: each feature should have mean≈0 after normalization.
+		var sum0, sum1 float32
+		for i := 0; i < 4; i++ {
+			sum0 += normGot[i*2]
+			sum1 += normGot[i*2+1]
+		}
+		if math.Abs(float64(sum0/4)) > 1e-3 {
+			t.Errorf("Normalized feature 0 mean = %f, expected ~0", sum0/4)
+		}
+		if math.Abs(float64(sum1/4)) > 1e-3 {
+			t.Errorf("Normalized feature 1 mean = %f, expected ~0", sum1/4)
+		}
+	})
+
+	t.Run("with_scale_offset", func(t *testing.T) {
+		inputData := []float32{0, 10, 0, 10}
+		scaleData := []float32{2, 3}
+		offsetData := []float32{1, -1}
+
+		results := graph.MustExecOnceN(backend, func(op, sc, off *graph.Node) []*graph.Node {
+			normalized, batchMean, batchVar := graph.InternalBatchNormForTraining(op, sc, off, 1e-5, 1)
+			return []*graph.Node{normalized, batchMean, batchVar}
+		},
+			tensors.FromFlatDataAndDimensions(inputData, 2, 2),
+			tensors.FromFlatDataAndDimensions(scaleData, 2),
+			tensors.FromFlatDataAndDimensions(offsetData, 2),
+		)
+
+		normGot, _ := tensors.CopyFlatData[float32](results[0])
+		meanGot, _ := tensors.CopyFlatData[float32](results[1])
+
+		// Feature 0: values [0, 0] → mean=0, var=0, normalized=[0,0], scaled=[0*2+1, 0*2+1]=[1,1]
+		// Feature 1: values [10, 10] → mean=10, var=0, normalized=[0,0], scaled=[0*3-1, 0*3-1]=[-1,-1]
+		assertClose(t, meanGot, []float32{0, 10}, 1e-3)
+		assertClose(t, normGot, []float32{1, -1, 1, -1}, 1e-3)
+	})
+}
+
+// TestBFloat16 tests basic BFloat16 support.
+func TestBFloat16(t *testing.T) {
+	backend := newTestBackend(t)
+
+	t.Run("add", func(t *testing.T) {
+		// Test BFloat16 addition via ConvertDType round-trip.
+		result := graph.MustExecOnce(backend, func(x *graph.Node) *graph.Node {
+			bf := graph.ConvertDType(x, dtypes.BFloat16)
+			bf = graph.Add(bf, bf) // 2x
+			return graph.ConvertDType(bf, dtypes.Float32)
+		}, []float32{1.0, 2.0, 3.0, 4.0})
+		got, _ := tensors.CopyFlatData[float32](result)
+		assertClose(t, got, []float32{2.0, 4.0, 6.0, 8.0}, 0.1)
+	})
+
+	t.Run("matmul", func(t *testing.T) {
+		result := graph.MustExecOnce(backend, func(a, b *graph.Node) *graph.Node {
+			aBF := graph.ConvertDType(a, dtypes.BFloat16)
+			bBF := graph.ConvertDType(b, dtypes.BFloat16)
+			c := graph.Dot(aBF, bBF)
+			return graph.ConvertDType(c, dtypes.Float32)
+		},
+			tensors.FromFlatDataAndDimensions([]float32{1, 2, 3, 4}, 2, 2),
+			tensors.FromFlatDataAndDimensions([]float32{5, 6, 7, 8}, 2, 2),
+		)
+		got, _ := tensors.CopyFlatData[float32](result)
+		// [[1,2],[3,4]] @ [[5,6],[7,8]] = [[19,22],[43,50]]
+		assertClose(t, got, []float32{19, 22, 43, 50}, 1.0) // BFloat16 has limited precision
+	})
+}
+
 // BenchmarkTransformerStep measures per-step time for a transformer-like training iteration.
 // Run with: go test -bench BenchmarkTransformerStep -benchtime 10s -count 1
 func BenchmarkTransformerStep(b *testing.B) {
@@ -3013,4 +3366,212 @@ func BenchmarkUnaryOps(b *testing.B) {
 	for range b.N {
 		exec.MustExec(data)
 	}
+}
+
+// =============================================================================
+// Control Flow Tests
+// =============================================================================
+
+// TestWhile tests the While control flow operation.
+func TestWhile(t *testing.T) {
+	backend := newTestBackend(t)
+
+	t.Run("sum_1_to_10", func(t *testing.T) {
+		// Compute sum 1+2+...+10 = 55 using a while loop.
+		exec := graph.MustNewExec(backend, func(g *graph.Node) *graph.Node {
+			cond := graph.NewClosure(g.Graph(), func(g *graph.Graph) []*graph.Node {
+				counter := graph.Parameter(g, "counter", shapes.Scalar[int32]())
+				_ = graph.Parameter(g, "sum", shapes.Scalar[int32]())
+				return []*graph.Node{graph.LessOrEqual(counter, graph.Const(g, int32(10)))}
+			})
+
+			body := graph.NewClosure(g.Graph(), func(g *graph.Graph) []*graph.Node {
+				counter := graph.Parameter(g, "counter", shapes.Scalar[int32]())
+				sum := graph.Parameter(g, "sum", shapes.Scalar[int32]())
+				newCounter := graph.Add(counter, graph.Const(g, int32(1)))
+				newSum := graph.Add(sum, counter)
+				return []*graph.Node{newCounter, newSum}
+			})
+
+			results := graph.While(cond, body,
+				graph.Const(g.Graph(), int32(1)),
+				graph.Const(g.Graph(), int32(0)))
+			return results[1] // Return sum
+		})
+		defer exec.Finalize()
+
+		// Pass a dummy input (required by the signature).
+		result := exec.MustExec(int32(0))
+		got := result[0].Value().(int32)
+		if got != 55 {
+			t.Errorf("sum 1..10 = %d, want 55", got)
+		}
+		t.Logf("While sum 1..10 = %d", got)
+	})
+
+	t.Run("factorial", func(t *testing.T) {
+		// Compute 5! = 120.
+		exec := graph.MustNewExec(backend, func(g *graph.Node) *graph.Node {
+			cond := graph.NewClosure(g.Graph(), func(g *graph.Graph) []*graph.Node {
+				n := graph.Parameter(g, "n", shapes.Scalar[int32]())
+				_ = graph.Parameter(g, "result", shapes.Scalar[int32]())
+				return []*graph.Node{graph.GreaterThan(n, graph.Const(g, int32(1)))}
+			})
+
+			body := graph.NewClosure(g.Graph(), func(g *graph.Graph) []*graph.Node {
+				n := graph.Parameter(g, "n", shapes.Scalar[int32]())
+				result := graph.Parameter(g, "result", shapes.Scalar[int32]())
+				newResult := graph.Mul(result, n)
+				newN := graph.Sub(n, graph.Const(g, int32(1)))
+				return []*graph.Node{newN, newResult}
+			})
+
+			results := graph.While(cond, body,
+				graph.Const(g.Graph(), int32(5)),
+				graph.Const(g.Graph(), int32(1)))
+			return results[1] // Return result
+		})
+		defer exec.Finalize()
+
+		result := exec.MustExec(int32(0))
+		got := result[0].Value().(int32)
+		if got != 120 {
+			t.Errorf("5! = %d, want 120", got)
+		}
+		t.Logf("While 5! = %d", got)
+	})
+}
+
+// TestIf tests the If control flow operation.
+func TestIf(t *testing.T) {
+	backend := newTestBackend(t)
+
+	t.Run("true_branch", func(t *testing.T) {
+		exec := graph.MustNewExec(backend, func(x *graph.Node) *graph.Node {
+			pred := graph.GreaterThan(x, graph.Const(x.Graph(), float32(5)))
+
+			trueBranch := graph.NewClosure(x.Graph(), func(g *graph.Graph) []*graph.Node {
+				return []*graph.Node{graph.Const(g, float32(1))}
+			})
+			falseBranch := graph.NewClosure(x.Graph(), func(g *graph.Graph) []*graph.Node {
+				return []*graph.Node{graph.Const(g, float32(-1))}
+			})
+
+			results := graph.If(pred, trueBranch, falseBranch)
+			return results[0]
+		})
+		defer exec.Finalize()
+
+		result := exec.MustExec(float32(10))
+		got := result[0].Value().(float32)
+		if got != 1 {
+			t.Errorf("If(10>5) = %g, want 1", got)
+		}
+		t.Logf("If(10>5) = %g (true branch)", got)
+	})
+
+	t.Run("false_branch", func(t *testing.T) {
+		exec := graph.MustNewExec(backend, func(x *graph.Node) *graph.Node {
+			pred := graph.GreaterThan(x, graph.Const(x.Graph(), float32(5)))
+
+			trueBranch := graph.NewClosure(x.Graph(), func(g *graph.Graph) []*graph.Node {
+				return []*graph.Node{graph.Const(g, float32(1))}
+			})
+			falseBranch := graph.NewClosure(x.Graph(), func(g *graph.Graph) []*graph.Node {
+				return []*graph.Node{graph.Const(g, float32(-1))}
+			})
+
+			results := graph.If(pred, trueBranch, falseBranch)
+			return results[0]
+		})
+		defer exec.Finalize()
+
+		result := exec.MustExec(float32(3))
+		got := result[0].Value().(float32)
+		if got != -1 {
+			t.Errorf("If(3>5) = %g, want -1", got)
+		}
+		t.Logf("If(3>5) = %g (false branch)", got)
+	})
+
+	t.Run("with_captured_values", func(t *testing.T) {
+		// Branches capture a value from parent scope and use it.
+		exec := graph.MustNewExec(backend, func(x *graph.Node) *graph.Node {
+			factor := graph.Const(x.Graph(), float32(10))
+			pred := graph.GreaterThan(x, graph.Const(x.Graph(), float32(0)))
+
+			trueBranch := graph.NewClosure(x.Graph(), func(g *graph.Graph) []*graph.Node {
+				return []*graph.Node{graph.Mul(x, factor)} // capture x and factor
+			})
+			falseBranch := graph.NewClosure(x.Graph(), func(g *graph.Graph) []*graph.Node {
+				return []*graph.Node{graph.Neg(graph.Mul(x, factor))} // capture x and factor
+			})
+
+			results := graph.If(pred, trueBranch, falseBranch)
+			return results[0]
+		})
+		defer exec.Finalize()
+
+		// x=3 > 0 → true branch → 3*10 = 30
+		result := exec.MustExec(float32(3))
+		got := result[0].Value().(float32)
+		if got != 30 {
+			t.Errorf("If(3>0, 3*10) = %g, want 30", got)
+		}
+		t.Logf("If(3>0, 3*10) = %g", got)
+	})
+}
+
+// TestSort tests the Sort control flow operation.
+func TestSort(t *testing.T) {
+	backend := newTestBackend(t)
+
+	t.Run("ascending", func(t *testing.T) {
+		result := graph.MustExecOnce(backend, func(x *graph.Node) *graph.Node {
+			return graph.Sort(x, 0, true)
+		}, []float32{5, 2, 8, 1, 9, 3})
+
+		got := result.Value().([]float32)
+		want := []float32{1, 2, 3, 5, 8, 9}
+		assertClose(t, got, want, 0)
+		t.Logf("Sort ascending: %v", got)
+	})
+
+	t.Run("descending", func(t *testing.T) {
+		result := graph.MustExecOnce(backend, func(x *graph.Node) *graph.Node {
+			return graph.Sort(x, 0, false)
+		}, []float32{5, 2, 8, 1, 9, 3})
+
+		got := result.Value().([]float32)
+		want := []float32{9, 8, 5, 3, 2, 1}
+		assertClose(t, got, want, 0)
+		t.Logf("Sort descending: %v", got)
+	})
+}
+
+// TestCall tests the Call control flow operation.
+func TestCall(t *testing.T) {
+	backend := newTestBackend(t)
+
+	t.Run("simple_add", func(t *testing.T) {
+		exec := graph.MustNewExec(backend, func(g *graph.Node) *graph.Node {
+			addFn := graph.NewFunction(g.Graph(), "add", func(g *graph.Graph) []*graph.Node {
+				a := graph.Parameter(g, "a", shapes.Make(dtypes.Float32))
+				b := graph.Parameter(g, "b", shapes.Make(dtypes.Float32))
+				return []*graph.Node{graph.Add(a, b)}
+			})
+
+			a := graph.Const(g.Graph(), float32(10))
+			b := graph.Const(g.Graph(), float32(32))
+			return addFn.Call(a, b)[0]
+		})
+		defer exec.Finalize()
+
+		result := exec.MustExec(float32(0)) // dummy input
+		got := result[0].Value().(float32)
+		if got != 42 {
+			t.Errorf("Call(10+32) = %g, want 42", got)
+		}
+		t.Logf("Call(10+32) = %g", got)
+	})
 }

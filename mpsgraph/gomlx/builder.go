@@ -80,7 +80,18 @@ func (b *Builder) Compile() (backends.Executable, error) {
 		return nil, errors.New("Main function has no Return() call")
 	}
 
-	// Gather feeds (parameters/placeholders) and targets (outputs).
+	b.compiled = true
+
+	// If the main function has a control flow step, use CF-aware compilation.
+	if b.mainFn.controlFlowStep != nil {
+		return b.compileWithControlFlow()
+	}
+
+	return b.compileSimple()
+}
+
+// compileSimple compiles a function without control flow into a single Executable.
+func (b *Builder) compileSimple() (backends.Executable, error) {
 	info := bridge.CompileInfo{
 		Feeds:      make([]bridge.Tensor, len(b.mainFn.params)),
 		FeedDtypes: make([]int, len(b.mainFn.params)),
@@ -107,8 +118,6 @@ func (b *Builder) Compile() (backends.Executable, error) {
 		return nil, errors.Wrap(err, "compiling MPSGraph")
 	}
 
-	b.compiled = true
-
 	inputNames := make([]string, len(b.mainFn.params))
 	inputShapes := make([]shapes.Shape, len(b.mainFn.params))
 	for i, p := range b.mainFn.params {
@@ -128,4 +137,153 @@ func (b *Builder) Compile() (backends.Executable, error) {
 		inputShapes:  inputShapes,
 		outputShapes: outputShapes,
 	}, nil
+}
+
+// compileWithControlFlow compiles a function containing a control flow operation.
+// The pre-CF graph is compiled into one Exec, and closures are compiled into
+// separate Execs. The resulting ExecutableWithCF orchestrates execution.
+func (b *Builder) compileWithControlFlow() (backends.Executable, error) {
+	cf := b.mainFn.controlFlowStep
+
+	// Gather all nodes that need to be outputs of the pre-CF graph:
+	// 1. CF inputs (initial state, predicate, etc.)
+	// 2. Captured values from closures
+	// 3. Any Return outputs that are NOT CF results (direct pre-CF values)
+	preGraphTargets := make([]*graphNode, 0)
+	preGraphTargets = append(preGraphTargets, cf.inputs...)
+
+	// Gather all captured parent nodes from closures.
+	allClosureFns := b.gatherClosureFunctions(cf)
+	for _, closureFn := range allClosureFns {
+		for _, captured := range closureFn.capturedParentNodes {
+			// Only add if it's from the main function and not already in targets.
+			if captured.owner == b.mainFn && !containsNode(preGraphTargets, captured) {
+				preGraphTargets = append(preGraphTargets, captured)
+			}
+		}
+	}
+
+	// Check if any Return outputs are direct pre-CF values (not CF results).
+	for _, out := range b.mainFn.outputs {
+		if !containsNode(cf.outputNodes, out) && out.tensor != nil {
+			if !containsNode(preGraphTargets, out) {
+				preGraphTargets = append(preGraphTargets, out)
+			}
+		}
+	}
+
+	// Compile the pre-CF graph.
+	var preExec *bridge.Exec
+	if len(preGraphTargets) > 0 && preGraphTargets[0].tensor != nil {
+		info := bridge.CompileInfo{
+			Feeds:      make([]bridge.Tensor, len(b.mainFn.params)),
+			FeedDtypes: make([]int, len(b.mainFn.params)),
+			FeedShapes: make([][]int64, len(b.mainFn.params)),
+			Targets:    make([]bridge.Tensor, len(preGraphTargets)),
+		}
+		for i, p := range b.mainFn.params {
+			info.Feeds[i] = p.tensor
+			info.FeedDtypes[i] = dtypeToBridgeDType(p.shape.DType)
+			dims := p.shape.Dimensions
+			info.FeedShapes[i] = make([]int64, len(dims))
+			for j, d := range dims {
+				info.FeedShapes[i][j] = int64(d)
+			}
+		}
+		for i, t := range preGraphTargets {
+			info.Targets[i] = t.tensor
+		}
+		var err error
+		preExec, err = b.ctx.Compile(info)
+		if err != nil {
+			return nil, errors.Wrap(err, "compiling pre-CF graph")
+		}
+	}
+
+	// Compile closures.
+	closureExecs := make(map[*Function]*Executable)
+	for _, fn := range allClosureFns {
+		exec, err := fn.compileClosure()
+		if err != nil {
+			return nil, errors.Wrapf(err, "compiling closure %q", fn.name)
+		}
+		closureExecs[fn] = exec
+	}
+
+	// Build output mapping: for each Return output, record where it comes from.
+	outputMapping := make([]outputSource, len(b.mainFn.outputs))
+	for i, out := range b.mainFn.outputs {
+		// Check if this output is a CF result.
+		cfIdx := indexOfNode(cf.outputNodes, out)
+		if cfIdx >= 0 {
+			outputMapping[i] = outputSource{fromCF: true, cfIndex: cfIdx}
+			continue
+		}
+		// Otherwise it's from the pre-CF graph.
+		preIdx := indexOfNode(preGraphTargets, out)
+		if preIdx >= 0 {
+			outputMapping[i] = outputSource{fromCF: false, preIndex: preIdx}
+		}
+	}
+
+	inputNames := make([]string, len(b.mainFn.params))
+	inputShapes := make([]shapes.Shape, len(b.mainFn.params))
+	for i, p := range b.mainFn.params {
+		inputNames[i] = p.name
+		inputShapes[i] = p.shape
+	}
+
+	outputShapes := make([]shapes.Shape, len(b.mainFn.outputs))
+	for i, out := range b.mainFn.outputs {
+		outputShapes[i] = out.shape
+	}
+
+	return &ExecutableWithCF{
+		backend:         b.backend,
+		preExec:         preExec,
+		preGraphTargets: preGraphTargets,
+		cfStep:          cf,
+		closureExecs:    closureExecs,
+		closureFns:      allClosureFns,
+		outputMapping:   outputMapping,
+		inputNames:      inputNames,
+		inputShapes:     inputShapes,
+		outputShapes:    outputShapes,
+	}, nil
+}
+
+// gatherClosureFunctions collects all closure Functions used by a CF step.
+func (b *Builder) gatherClosureFunctions(cf *controlFlowStep) []*Function {
+	var fns []*Function
+	switch cf.opType {
+	case backends.OpTypeWhile:
+		fns = append(fns, cf.whileData.condFn, cf.whileData.bodyFn)
+	case backends.OpTypeIf:
+		fns = append(fns, cf.ifData.trueFn, cf.ifData.falseFn)
+	case backends.OpTypeSort:
+		fns = append(fns, cf.sortData.comparatorFn)
+	case backends.OpTypeCall:
+		fns = append(fns, cf.callData.targetFn)
+	}
+	return fns
+}
+
+// containsNode checks if a node is in a slice.
+func containsNode(nodes []*graphNode, n *graphNode) bool {
+	for _, node := range nodes {
+		if node == n {
+			return true
+		}
+	}
+	return false
+}
+
+// indexOfNode returns the index of a node in a slice, or -1.
+func indexOfNode(nodes []*graphNode, n *graphNode) int {
+	for i, node := range nodes {
+		if node == n {
+			return i
+		}
+	}
+	return -1
 }
