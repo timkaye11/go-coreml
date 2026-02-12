@@ -871,34 +871,187 @@ MPSGraphTensorHandle mpsgraph_dynamic_slice(MPSGraphContextHandle handle,
     @autoreleasepool {
         clearError(error);
         MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
-        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        MPSGraphTensor* result = (__bridge MPSGraphTensor*)x;
 
-        // Build slice starts and sizes arrays.
-        // Dynamic slice uses runtime start indices. We use stridedSlice with dynamic starts.
-        // MPSGraph doesn't have a direct dynamicSlice, so we decompose.
-        NSMutableArray<NSNumber*>* sizes = [NSMutableArray arrayWithCapacity:rank];
-        for (int i = 0; i < rank; i++) {
-            [sizes addObject:@(sliceSizes[i])];
+        // Per-axis dynamic slicing using gather.
+        // For each axis: create indices [start, start+1, ..., start+size-1],
+        // then gatherAlongAxis to select those elements.
+        for (int i = 0; i < numIndices; i++) {
+            NSUInteger length = (NSUInteger)sliceSizes[i];
+            NSArray<NSNumber*>* resultShape = result.shape;
+            NSUInteger axisDim = resultShape[i].unsignedLongValue;
+
+            // Skip if slice size equals the full dimension (no-op for this axis).
+            if (length == axisDim) continue;
+
+            MPSGraphTensor* startIdx = (__bridge MPSGraphTensor*)startIndices[i];
+
+            // Create range [0, 1, ..., length-1] as Int32.
+            NSMutableArray<NSNumber*>* rangeShape = [NSMutableArray arrayWithObject:@(length)];
+            MPSGraphTensor* range = [ctx.graph coordinateAlongAxis:0
+                                                        withShape:rangeShape
+                                                             name:nil];
+            // Cast range to match startIdx type.
+            range = [ctx.graph castTensor:range toType:startIdx.dataType name:nil];
+
+            // Reshape startIdx to scalar-compatible shape for broadcasting.
+            startIdx = [ctx.graph reshapeTensor:startIdx withShape:@[@1] name:nil];
+
+            // indices = range + startIdx → [start, start+1, ..., start+length-1]
+            MPSGraphTensor* indices = [ctx.graph additionWithPrimaryTensor:range
+                                                          secondaryTensor:startIdx
+                                                                     name:nil];
+
+            // Expand indices to match result rank for gatherAlongAxis.
+            // gatherAlongAxis requires indices rank == data rank.
+            NSUInteger resultRank = resultShape.count;
+            NSMutableArray<NSNumber*>* expandedShape = [NSMutableArray arrayWithCapacity:resultRank];
+            for (NSUInteger d = 0; d < resultRank; d++) {
+                if (d == (NSUInteger)i) {
+                    [expandedShape addObject:@(length)];
+                } else {
+                    [expandedShape addObject:@1];
+                }
+            }
+            indices = [ctx.graph reshapeTensor:indices withShape:expandedShape name:nil];
+
+            // Broadcast indices to match result shape (with sliced axis = length).
+            NSMutableArray<NSNumber*>* broadcastShape = [NSMutableArray arrayWithArray:resultShape];
+            broadcastShape[i] = @(length);
+            indices = [ctx.graph broadcastTensor:indices toShape:broadcastShape name:nil];
+
+            result = [ctx.graph gatherAlongAxis:(NSInteger)i
+                              withUpdatesTensor:result
+                                  indicesTensor:indices
+                                           name:nil];
+            if (!result) {
+                setError(error, 100, [NSString stringWithFormat:@"dynamic_slice gather failed on axis %d", i]);
+                return NULL;
+            }
         }
 
-        // Stack the start indices into a single tensor, then use gatherND-like slicing.
-        // For simplicity, decompose: for each axis, do a dynamic gather/slice.
-        // Actually, MPSGraph has sliceTensor:starts:ends:strides: with dynamic tensors.
-        // But for truly dynamic starts, we need a workaround.
-        // TODO: Implement proper dynamic slice. For now, return error.
-        setError(error, 100, @"dynamic_slice not yet implemented");
-        return NULL;
+        return (__bridge void*)result;
     }
 }
 
 MPSGraphTensorHandle mpsgraph_dynamic_update_slice(MPSGraphContextHandle handle,
-    MPSGraphTensorHandle x, MPSGraphTensorHandle update,
+    MPSGraphTensorHandle x, MPSGraphTensorHandle updateH,
     MPSGraphTensorHandle* startIndices, int numIndices, MPSGraphError* error) {
     @autoreleasepool {
         clearError(error);
-        // TODO: Implement dynamic update slice.
-        setError(error, 101, @"dynamic_update_slice not yet implemented");
-        return NULL;
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        MPSGraphTensor* update = (__bridge MPSGraphTensor*)updateH;
+        NSArray<NSNumber*>* inputShape = input.shape;
+
+        // Strategy: mask + gather to position update + where to combine.
+        // 1. Build boolean mask: true where the update region is.
+        // 2. Build padded_update: a full-size tensor with update values at the right positions.
+        // 3. Result = where(mask, padded_update, input).
+
+        // Step 1: Build mask by ANDing per-axis range conditions.
+        MPSGraphTensor* mask = nil;
+        for (int axis = 0; axis < numIndices; axis++) {
+            MPSGraphTensor* startIdx = (__bridge MPSGraphTensor*)startIndices[axis];
+            startIdx = [ctx.graph reshapeTensor:startIdx withShape:@[@1] name:nil];
+
+            // range = [0, 1, ..., dim-1] along this axis, broadcast to input shape.
+            MPSGraphTensor* range = [ctx.graph coordinateAlongAxis:axis
+                                                        withShape:inputShape
+                                                             name:nil];
+            // Cast range to match startIdx type for comparison.
+            range = [ctx.graph castTensor:range toType:startIdx.dataType name:nil];
+
+            MPSGraphTensor* lower = [ctx.graph greaterThanOrEqualToWithPrimaryTensor:range
+                                                                    secondaryTensor:startIdx
+                                                                               name:nil];
+            NSUInteger updateSize = update.shape[axis].unsignedLongValue;
+            MPSGraphTensor* endIdx = [ctx.graph additionWithPrimaryTensor:startIdx
+                                                         secondaryTensor:[ctx.graph constantWithScalar:updateSize
+                                                                                             dataType:startIdx.dataType]
+                                                                    name:nil];
+            MPSGraphTensor* upper = [ctx.graph lessThanWithPrimaryTensor:range
+                                                        secondaryTensor:endIdx
+                                                                   name:nil];
+            MPSGraphTensor* axisMask = [ctx.graph logicalANDWithPrimaryTensor:lower
+                                                             secondaryTensor:upper
+                                                                        name:nil];
+            mask = (mask == nil) ? axisMask :
+                [ctx.graph logicalANDWithPrimaryTensor:mask secondaryTensor:axisMask name:nil];
+        }
+
+        if (!mask) {
+            setError(error, 101, @"dynamic_update_slice: failed to build mask");
+            return NULL;
+        }
+
+        // Step 2: Build padded_update by gathering update values into input-sized tensor.
+        // For each axis: create reverse indices (pos - start, clamped to [0, updateDim-1]),
+        // then gatherAlongAxis from the update.
+        MPSGraphTensor* paddedUpdate = update;
+        for (int axis = 0; axis < numIndices; axis++) {
+            MPSGraphTensor* startIdx = (__bridge MPSGraphTensor*)startIndices[axis];
+            startIdx = [ctx.graph reshapeTensor:startIdx withShape:@[@1] name:nil];
+
+            NSInteger inputDim = inputShape[axis].integerValue;
+            NSInteger updateDim = update.shape[axis].integerValue;
+
+            if (inputDim == updateDim) continue; // No expansion needed on this axis.
+
+            // Create range [0, ..., inputDim-1].
+            NSMutableArray<NSNumber*>* rangeShape = [NSMutableArray arrayWithObject:@(inputDim)];
+            MPSGraphTensor* range = [ctx.graph coordinateAlongAxis:0 withShape:rangeShape name:nil];
+            range = [ctx.graph castTensor:range toType:startIdx.dataType name:nil];
+
+            // reverseIdx = range - start (maps input positions to update positions).
+            MPSGraphTensor* reverseIdx = [ctx.graph subtractionWithPrimaryTensor:range
+                                                                secondaryTensor:startIdx
+                                                                           name:nil];
+            // Clamp to [0, updateDim-1] to avoid out-of-bounds gather.
+            // Values outside the update region will be masked away by where().
+            MPSGraphTensor* zero = [ctx.graph constantWithScalar:0 dataType:reverseIdx.dataType];
+            MPSGraphTensor* maxIdx = [ctx.graph constantWithScalar:(updateDim - 1) dataType:reverseIdx.dataType];
+            reverseIdx = [ctx.graph clampWithTensor:reverseIdx
+                                        minValueTensor:zero
+                                        maxValueTensor:maxIdx
+                                                  name:nil];
+            // Cast to Int32 for gather indices.
+            reverseIdx = [ctx.graph castTensor:reverseIdx toType:MPSDataTypeInt32 name:nil];
+
+            // Expand reverseIdx to match paddedUpdate rank.
+            NSArray<NSNumber*>* curShape = paddedUpdate.shape;
+            NSUInteger curRank = curShape.count;
+            NSMutableArray<NSNumber*>* expandedShape = [NSMutableArray arrayWithCapacity:curRank];
+            for (NSUInteger d = 0; d < curRank; d++) {
+                [expandedShape addObject:(d == (NSUInteger)axis) ? @(inputDim) : @1];
+            }
+            reverseIdx = [ctx.graph reshapeTensor:reverseIdx withShape:expandedShape name:nil];
+
+            // Broadcast to full shape.
+            NSMutableArray<NSNumber*>* broadcastShape = [NSMutableArray arrayWithArray:curShape];
+            broadcastShape[axis] = @(inputDim);
+            reverseIdx = [ctx.graph broadcastTensor:reverseIdx toShape:broadcastShape name:nil];
+
+            paddedUpdate = [ctx.graph gatherAlongAxis:(NSInteger)axis
+                                    withUpdatesTensor:paddedUpdate
+                                        indicesTensor:reverseIdx
+                                                 name:nil];
+        }
+
+        // Step 3: where(mask, paddedUpdate, input)
+        // Cast paddedUpdate to input dtype if needed.
+        if (paddedUpdate.dataType != input.dataType) {
+            paddedUpdate = [ctx.graph castTensor:paddedUpdate toType:input.dataType name:nil];
+        }
+        MPSGraphTensor* result = [ctx.graph selectWithPredicateTensor:mask
+                                                 truePredicateTensor:paddedUpdate
+                                                falsePredicateTensor:input
+                                                                name:nil];
+        if (!result) {
+            setError(error, 102, @"dynamic_update_slice: where failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
     }
 }
 
@@ -1070,5 +1223,189 @@ void mpsgraph_buffer_destroy(MTLBufferHandle handle) {
             id<MTLBuffer> buffer = (__bridge_transfer id<MTLBuffer>)handle;
             (void)buffer; // ARC releases
         }
+    }
+}
+
+// ===========================================================================
+// Softmax
+// ===========================================================================
+
+MPSGraphTensorHandle mpsgraph_softmax(MPSGraphContextHandle handle, MPSGraphTensorHandle x,
+    int axis, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        MPSGraphTensor* result = [ctx.graph softMaxWithTensor:input axis:axis name:nil];
+        if (!result) {
+            setError(error, 200, @"softmax failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+// ===========================================================================
+// Random Number Generation
+// ===========================================================================
+
+MPSGraphTensorHandle mpsgraph_random_uniform(MPSGraphContextHandle handle,
+    int dtype, int64_t* shape, int rank, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSDataType mpsType = toMPSDataType(dtype);
+        NSArray<NSNumber*>* shapeArr = shapeArray(shape, rank);
+        // Generate random bits using Philox stateless op.
+        MPSGraphRandomOpDescriptor* desc = [MPSGraphRandomOpDescriptor descriptorWithDistribution:MPSGraphRandomDistributionUniform
+                                                                                         dataType:mpsType];
+        MPSGraphTensor* result = [ctx.graph randomTensorWithShape:shapeArr
+                                                            descriptor:desc
+                                                                  name:nil];
+        if (!result) {
+            setError(error, 210, @"random uniform failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+MPSGraphTensorHandle mpsgraph_random_philox_state(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle seed, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        // Placeholder — MPSGraph manages its own RNG state internally.
+        // For GoMLX compatibility, we pass state through but don't use it.
+        return seed;
+    }
+}
+
+// ===========================================================================
+// Pooling (ReduceWindow)
+// ===========================================================================
+
+MPSGraphTensorHandle mpsgraph_pool2d(MPSGraphContextHandle handle, MPSGraphTensorHandle x,
+    int mode, int64_t* windowDims, int64_t* strides, int64_t* padBefore, int64_t* padAfter,
+    MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+
+        MPSGraphPooling2DOpDescriptor* desc = [MPSGraphPooling2DOpDescriptor
+            descriptorWithKernelWidth:(NSUInteger)windowDims[1]
+                        kernelHeight:(NSUInteger)windowDims[0]
+                           strideInX:(NSUInteger)strides[1]
+                           strideInY:(NSUInteger)strides[0]
+                        paddingStyle:MPSGraphPaddingStyleExplicit
+                          dataLayout:MPSGraphTensorNamedDataLayoutNCHW];
+        desc.paddingLeft = (NSUInteger)padBefore[1];
+        desc.paddingRight = (NSUInteger)padAfter[1];
+        desc.paddingTop = (NSUInteger)padBefore[0];
+        desc.paddingBottom = (NSUInteger)padAfter[0];
+
+        MPSGraphTensor* result = nil;
+        switch (mode) {
+            case 0: // Max pooling
+                result = [ctx.graph maxPooling2DWithSourceTensor:input descriptor:desc name:nil];
+                break;
+            case 1: // Average pooling
+                result = [ctx.graph avgPooling2DWithSourceTensor:input descriptor:desc name:nil];
+                break;
+            default:
+                setError(error, 220, @"unsupported pooling mode");
+                return NULL;
+        }
+        if (!result) {
+            setError(error, 221, @"pooling failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+// ===========================================================================
+// General Convolution
+// ===========================================================================
+
+MPSGraphTensorHandle mpsgraph_conv_general(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle inputH, MPSGraphTensorHandle kernelH,
+    int numSpatialDims,
+    int64_t* strides, int64_t* dilations,
+    int64_t* padBefore, int64_t* padAfter,
+    int groups, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)inputH;
+        MPSGraphTensor* kernel = (__bridge MPSGraphTensor*)kernelH;
+
+        if (numSpatialDims != 2) {
+            setError(error, 230, @"conv_general: only 2D convolution supported");
+            return NULL;
+        }
+
+        MPSGraphConvolution2DOpDescriptor* desc = [MPSGraphConvolution2DOpDescriptor
+            descriptorWithStrideInX:(NSUInteger)strides[1]
+                          strideInY:(NSUInteger)strides[0]
+                    dilationRateInX:(NSUInteger)dilations[1]
+                    dilationRateInY:(NSUInteger)dilations[0]
+                             groups:(NSUInteger)groups
+                       paddingStyle:MPSGraphPaddingStyleExplicit
+                         dataLayout:MPSGraphTensorNamedDataLayoutNCHW
+                      weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
+        desc.paddingLeft = (NSUInteger)padBefore[1];
+        desc.paddingRight = (NSUInteger)padAfter[1];
+        desc.paddingTop = (NSUInteger)padBefore[0];
+        desc.paddingBottom = (NSUInteger)padAfter[0];
+
+        MPSGraphTensor* result = [ctx.graph convolution2DWithSourceTensor:input
+                                                           weightsTensor:kernel
+                                                              descriptor:desc
+                                                                    name:nil];
+        if (!result) {
+            setError(error, 231, @"convolution2D failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+// ===========================================================================
+// Scatter Along Axis
+// ===========================================================================
+
+MPSGraphTensorHandle mpsgraph_scatter_along_axis(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle dataH, MPSGraphTensorHandle indicesH, MPSGraphTensorHandle updatesH,
+    int axis, int mode, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* data = (__bridge MPSGraphTensor*)dataH;
+        MPSGraphTensor* indices = (__bridge MPSGraphTensor*)indicesH;
+        MPSGraphTensor* updates = (__bridge MPSGraphTensor*)updatesH;
+
+        MPSGraphScatterMode scatterMode;
+        switch (mode) {
+            case 0: scatterMode = MPSGraphScatterModeSet; break;
+            case 1: scatterMode = MPSGraphScatterModeAdd; break;
+            case 2: scatterMode = MPSGraphScatterModeMax; break;
+            case 3: scatterMode = MPSGraphScatterModeMin; break;
+            default:
+                setError(error, 240, @"unknown scatter mode");
+                return NULL;
+        }
+
+        MPSGraphTensor* result = [ctx.graph scatterAlongAxis:axis
+                                               withDataTensor:data
+                                              updatesTensor:updates
+                                              indicesTensor:indices
+                                                       mode:scatterMode
+                                                       name:nil];
+        if (!result) {
+            setError(error, 241, @"scatter along axis failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
     }
 }

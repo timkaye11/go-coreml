@@ -47,12 +47,12 @@ const (
 	ReduceMin     = C.MPSGRAPH_REDUCE_MIN
 )
 
-// ScatterMode for scatter operations.
+// ScatterMode for scatter operations — must match bridge.m switch cases.
 const (
 	ScatterModeSet = 0
 	ScatterModeAdd = 1
-	ScatterModeMin = 2
-	ScatterModeMax = 3
+	ScatterModeMax = 2
+	ScatterModeMin = 3
 )
 
 // Tensor is an opaque handle to an MPSGraphTensor in the computation graph.
@@ -577,6 +577,137 @@ func (c *Context) BatchNormInference(input, mean, variance, gamma, beta Tensor, 
 		C.MPSGraphTensorHandle(input), C.MPSGraphTensorHandle(mean),
 		C.MPSGraphTensorHandle(variance), C.MPSGraphTensorHandle(gamma),
 		C.MPSGraphTensorHandle(beta), C.float(epsilon), C.int(featureAxis), &cErr)
+	if err := extractError(cErr); err != nil {
+		return nil, err
+	}
+	return Tensor(t), nil
+}
+
+// ===========================================================================
+// Softmax
+// ===========================================================================
+
+// Softmax computes softmax along the given axis.
+func (c *Context) Softmax(x Tensor, axis int) (Tensor, error) {
+	var cErr C.MPSGraphError
+	t := C.mpsgraph_softmax(c.handle, C.MPSGraphTensorHandle(x), C.int(axis), &cErr)
+	if err := extractError(cErr); err != nil {
+		return nil, err
+	}
+	return Tensor(t), nil
+}
+
+// ===========================================================================
+// Pooling (ReduceWindow)
+// ===========================================================================
+
+// Pool2D performs 2D pooling (max or average).
+// mode: 0=max, 1=avg
+func (c *Context) Pool2D(x Tensor, mode int, windowDims, strides, padBefore, padAfter []int64) (Tensor, error) {
+	var cErr C.MPSGraphError
+	t := C.mpsgraph_pool2d(c.handle, C.MPSGraphTensorHandle(x), C.int(mode),
+		(*C.int64_t)(unsafe.Pointer(&windowDims[0])),
+		(*C.int64_t)(unsafe.Pointer(&strides[0])),
+		(*C.int64_t)(unsafe.Pointer(&padBefore[0])),
+		(*C.int64_t)(unsafe.Pointer(&padAfter[0])),
+		&cErr)
+	if err := extractError(cErr); err != nil {
+		return nil, err
+	}
+	return Tensor(t), nil
+}
+
+// ===========================================================================
+// Random Number Generation
+// ===========================================================================
+
+// RandomUniform generates a tensor filled with uniform random values in [0, 1).
+func (c *Context) RandomUniform(dtype DType, shape []int64) (Tensor, error) {
+	var cErr C.MPSGraphError
+	var shapePtr *C.int64_t
+	if len(shape) > 0 {
+		shapePtr = (*C.int64_t)(unsafe.Pointer(&shape[0]))
+	}
+	t := C.mpsgraph_random_uniform(c.handle, C.int(dtype), shapePtr, C.int(len(shape)), &cErr)
+	if err := extractError(cErr); err != nil {
+		return nil, err
+	}
+	return Tensor(t), nil
+}
+
+// ===========================================================================
+// Convolution (General)
+// ===========================================================================
+
+// ConvGeneral performs a general N-D convolution (currently only 2D supported).
+func (c *Context) ConvGeneral(input, kernel Tensor, numSpatialDims int,
+	strides, dilations, padBefore, padAfter []int64, groups int) (Tensor, error) {
+	var cErr C.MPSGraphError
+	t := C.mpsgraph_conv_general(c.handle,
+		C.MPSGraphTensorHandle(input), C.MPSGraphTensorHandle(kernel),
+		C.int(numSpatialDims),
+		(*C.int64_t)(unsafe.Pointer(&strides[0])),
+		(*C.int64_t)(unsafe.Pointer(&dilations[0])),
+		(*C.int64_t)(unsafe.Pointer(&padBefore[0])),
+		(*C.int64_t)(unsafe.Pointer(&padAfter[0])),
+		C.int(groups), &cErr)
+	if err := extractError(cErr); err != nil {
+		return nil, err
+	}
+	return Tensor(t), nil
+}
+
+// ===========================================================================
+// Scatter Along Axis
+// ===========================================================================
+
+// ScatterAlongAxis scatters updates into data along the given axis using indices.
+func (c *Context) ScatterAlongAxis(data, indices, updates Tensor, axis, mode int) (Tensor, error) {
+	var cErr C.MPSGraphError
+	t := C.mpsgraph_scatter_along_axis(c.handle,
+		C.MPSGraphTensorHandle(data), C.MPSGraphTensorHandle(indices),
+		C.MPSGraphTensorHandle(updates), C.int(axis), C.int(mode), &cErr)
+	if err := extractError(cErr); err != nil {
+		return nil, err
+	}
+	return Tensor(t), nil
+}
+
+// ===========================================================================
+// Dynamic Slice
+// ===========================================================================
+
+// DynamicSlice performs a dynamic slice with runtime start indices.
+func (c *Context) DynamicSlice(x Tensor, startIndices []Tensor, sliceSizes []int64) (Tensor, error) {
+	var cErr C.MPSGraphError
+	numIndices := len(startIndices)
+
+	cStartIndices := make([]C.MPSGraphTensorHandle, numIndices)
+	for i, idx := range startIndices {
+		cStartIndices[i] = C.MPSGraphTensorHandle(idx)
+	}
+
+	t := C.mpsgraph_dynamic_slice(c.handle, C.MPSGraphTensorHandle(x),
+		&cStartIndices[0], C.int(numIndices),
+		(*C.int64_t)(unsafe.Pointer(&sliceSizes[0])), C.int(len(sliceSizes)), &cErr)
+	if err := extractError(cErr); err != nil {
+		return nil, err
+	}
+	return Tensor(t), nil
+}
+
+// DynamicUpdateSlice replaces a slice of the input with the update at the given start indices.
+func (c *Context) DynamicUpdateSlice(x, update Tensor, startIndices []Tensor) (Tensor, error) {
+	var cErr C.MPSGraphError
+	numIndices := len(startIndices)
+
+	cStartIndices := make([]C.MPSGraphTensorHandle, numIndices)
+	for i, idx := range startIndices {
+		cStartIndices[i] = C.MPSGraphTensorHandle(idx)
+	}
+
+	t := C.mpsgraph_dynamic_update_slice(c.handle, C.MPSGraphTensorHandle(x), C.MPSGraphTensorHandle(update),
+		&cStartIndices[0], C.int(numIndices), &cErr)
 	if err := extractError(cErr); err != nil {
 		return nil, err
 	}

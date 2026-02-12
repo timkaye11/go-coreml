@@ -201,4 +201,37 @@ MPSGraphTensorHandle mpsgraph_conv2d(MPSGraphContextHandle ctx,
     int64_t* strides, int64_t* dilations, int64_t* padBefore, int64_t* padAfter,
     int groups, MPSGraphError* error);
 
+// --- Softmax ---
+MPSGraphTensorHandle mpsgraph_softmax(MPSGraphContextHandle ctx,
+    MPSGraphTensorHandle x, int axis, MPSGraphError* error);
+
+// --- Random Number Generation ---
+// Fills output with random uniform bits using the Philox algorithm.
+// state is [3]uint64, returns updated state and random values.
+MPSGraphTensorHandle mpsgraph_random_philox_state(MPSGraphContextHandle ctx,
+    MPSGraphTensorHandle seed, MPSGraphError* error);
+MPSGraphTensorHandle mpsgraph_random_uniform(MPSGraphContextHandle ctx,
+    int dtype, int64_t* shape, int rank, MPSGraphError* error);
+
+// --- Pooling (ReduceWindow) ---
+// mode: 0=max, 1=sum, 2=avg
+MPSGraphTensorHandle mpsgraph_pool2d(MPSGraphContextHandle ctx,
+    MPSGraphTensorHandle x, int mode,
+    int64_t* windowDims, int64_t* strides, int64_t* padBefore, int64_t* padAfter,
+    MPSGraphError* error);
+
+// --- General Convolution with axis transposition ---
+MPSGraphTensorHandle mpsgraph_conv_general(MPSGraphContextHandle ctx,
+    MPSGraphTensorHandle input, MPSGraphTensorHandle kernel,
+    int numSpatialDims,
+    int64_t* strides, int64_t* dilations,
+    int64_t* padBefore, int64_t* padAfter,
+    int groups, MPSGraphError* error);
+
+// --- Scatter with reduction modes ---
+// mode: 0=set, 1=add, 2=max, 3=min
+MPSGraphTensorHandle mpsgraph_scatter_along_axis(MPSGraphContextHandle ctx,
+    MPSGraphTensorHandle data, MPSGraphTensorHandle indices, MPSGraphTensorHandle updates,
+    int axis, int mode, MPSGraphError* error);
+
 #endif // MPSGRAPH_BRIDGE_H

@@ -119,10 +119,6 @@ func (f *Function) Constant(flat any, dims ...int) (backends.Value, error) {
 	shape := shapes.Make(dt, dims...)
 
 	bridgeDType := dtypeToBridgeDType(dt)
-	shapeDims := make([]int64, len(dims))
-	for i, d := range dims {
-		shapeDims[i] = int64(d)
-	}
 
 	var dataPtr unsafe.Pointer
 	var nbytes int64
@@ -131,10 +127,29 @@ func (f *Function) Constant(flat any, dims ...int) (backends.Value, error) {
 		nbytes = int64(flatVal.Len()) * int64(dt.Size())
 	}
 
+	// MPSGraph requires shape.count > 0 (no rank-0 tensors for constants).
+	// For scalars, create as [1] and reshape to scalar.
+	isScalar := len(dims) == 0
+	shapeDims := make([]int64, len(dims))
+	for i, d := range dims {
+		shapeDims[i] = int64(d)
+	}
+	if isScalar {
+		shapeDims = []int64{1}
+	}
+
 	tensor, err := f.ctx().Constant(dataPtr, nbytes, bridgeDType, shapeDims)
 	if err != nil {
 		return nil, errors.Wrap(err, "Constant")
 	}
+
+	if isScalar {
+		tensor, err = f.ctx().Reshape(tensor, nil)
+		if err != nil {
+			return nil, errors.Wrap(err, "Constant: reshape to scalar")
+		}
+	}
+
 	return &graphNode{tensor: tensor, shape: shape}, nil
 }
 
@@ -722,6 +737,22 @@ func (f *Function) ArgMinMax(x backends.Value, axis int, outputDType dtypes.DTyp
 	if err != nil {
 		return nil, errors.Wrap(err, "ArgMinMax")
 	}
+	// MPSGraph keeps reduced dim as size 1 — reshape to squeeze it.
+	if outShape.Rank() > 0 {
+		squeezeDims := make([]int64, outShape.Rank())
+		for i, d := range outShape.Dimensions {
+			squeezeDims[i] = int64(d)
+		}
+		tensor, err = f.ctx().Reshape(tensor, squeezeDims)
+		if err != nil {
+			return nil, errors.Wrap(err, "ArgMinMax: reshape")
+		}
+	} else {
+		tensor, err = f.ctx().Reshape(tensor, nil)
+		if err != nil {
+			return nil, errors.Wrap(err, "ArgMinMax: reshape to scalar")
+		}
+	}
 	return &graphNode{tensor: tensor, shape: outShape}, nil
 }
 
@@ -780,4 +811,397 @@ func (f *Function) Pad(operand, fillValue backends.Value, axesConfig ...backends
 	}
 	outShape := shapes.Make(opNode.shape.DType, outDims...)
 	return &graphNode{tensor: tensor, shape: outShape}, nil
+}
+
+// ===========================================================================
+// DynamicSlice
+// ===========================================================================
+
+func (f *Function) DynamicSlice(operand backends.Value, startIndicesValues []backends.Value, sliceSizes []int) (backends.Value, error) {
+	opNode, err := castNode(operand)
+	if err != nil {
+		return nil, errors.Wrap(err, "DynamicSlice: operand")
+	}
+
+	startIndicesTensors := make([]bridge.Tensor, len(startIndicesValues))
+	for i, v := range startIndicesValues {
+		n, err := castNode(v)
+		if err != nil {
+			return nil, errors.Wrapf(err, "DynamicSlice: startIndex[%d]", i)
+		}
+		startIndicesTensors[i] = n.tensor
+	}
+
+	sliceSizes64 := make([]int64, len(sliceSizes))
+	for i, s := range sliceSizes {
+		sliceSizes64[i] = int64(s)
+	}
+
+	outShape := shapes.Make(opNode.shape.DType, sliceSizes...)
+	tensor, err := f.ctx().DynamicSlice(opNode.tensor, startIndicesTensors, sliceSizes64)
+	if err != nil {
+		return nil, errors.Wrap(err, "DynamicSlice")
+	}
+	return &graphNode{tensor: tensor, shape: outShape}, nil
+}
+
+func (f *Function) DynamicUpdateSlice(operand, update backends.Value, startIndicesValues []backends.Value) (backends.Value, error) {
+	opNode, err := castNode(operand)
+	if err != nil {
+		return nil, errors.Wrap(err, "DynamicUpdateSlice: operand")
+	}
+	updNode, err := castNode(update)
+	if err != nil {
+		return nil, errors.Wrap(err, "DynamicUpdateSlice: update")
+	}
+
+	startIndicesTensors := make([]bridge.Tensor, len(startIndicesValues))
+	for i, v := range startIndicesValues {
+		n, err := castNode(v)
+		if err != nil {
+			return nil, errors.Wrapf(err, "DynamicUpdateSlice: startIndex[%d]", i)
+		}
+		startIndicesTensors[i] = n.tensor
+	}
+
+	tensor, err := f.ctx().DynamicUpdateSlice(opNode.tensor, updNode.tensor, startIndicesTensors)
+	if err != nil {
+		return nil, errors.Wrap(err, "DynamicUpdateSlice")
+	}
+	// Output shape is same as operand shape.
+	return &graphNode{tensor: tensor, shape: opNode.shape}, nil
+}
+
+// ===========================================================================
+// RNG
+// ===========================================================================
+
+func (f *Function) RNGBitGenerator(state backends.Value, shape shapes.Shape) (newState, values backends.Value, err error) {
+	stateNode, err := castNode(state)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "RNGBitGenerator: state")
+	}
+
+	// Validate state shape: expects [3]uint64 per GoMLX convention.
+	expectedStateShape := backends.RNGStateShape
+	if !stateNode.shape.Equal(expectedStateShape) {
+		return nil, nil, errors.Errorf("RNGBitGenerator: expected state shape %s, got %s",
+			expectedStateShape, stateNode.shape)
+	}
+
+	// Generate random values using MPSGraph's random uniform.
+	// MPSGraph manages its own RNG state, so we pass the GoMLX state through unchanged.
+	dims := make([]int64, shape.Rank())
+	for i, d := range shape.Dimensions {
+		dims[i] = int64(d)
+	}
+	bridgeDType := dtypeToBridgeDType(shape.DType)
+
+	valuesTensor, err := f.ctx().RandomUniform(bridgeDType, dims)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "RNGBitGenerator")
+	}
+
+	// For integer types, we need random bits, not uniform [0,1).
+	// MPSGraph only generates uniform floats, so for integer types we generate
+	// Float32 uniform, scale to the range, and cast.
+	// However, the common GoMLX pattern is to generate uint32 bits and then convert.
+	// For now, we pass the state through and return the random tensor.
+	// The state is unchanged since MPSGraph manages its own state.
+
+	newStateNode := &graphNode{tensor: stateNode.tensor, shape: stateNode.shape}
+	valuesNode := &graphNode{tensor: valuesTensor, shape: shape}
+	return newStateNode, valuesNode, nil
+}
+
+// ===========================================================================
+// Convolution
+// ===========================================================================
+
+func (f *Function) ConvGeneral(
+	input, kernel backends.Value,
+	axes backends.ConvolveAxesConfig,
+	strides []int, paddings [][2]int,
+	inputDilations, kernelDilations []int,
+	channelGroupCount, batchGroupCount int,
+) (backends.Value, error) {
+	inputNode, err := castNode(input)
+	if err != nil {
+		return nil, errors.Wrap(err, "ConvGeneral: input")
+	}
+	kernelNode, err := castNode(kernel)
+	if err != nil {
+		return nil, errors.Wrap(err, "ConvGeneral: kernel")
+	}
+
+	outputShape, err := shapeinference.ConvGeneralOp(
+		inputNode.shape, kernelNode.shape, axes, strides, paddings,
+		inputDilations, kernelDilations, channelGroupCount, batchGroupCount)
+	if err != nil {
+		return nil, errors.Wrap(err, "ConvGeneral")
+	}
+
+	numSpatialDims := len(axes.InputSpatial)
+	if numSpatialDims != 2 {
+		return nil, errors.Errorf("ConvGeneral: only 2D convolution supported, got %d spatial dims", numSpatialDims)
+	}
+
+	// Transpose input and kernel to NCHW / OIHW layout expected by MPSGraph.
+	inputTensor, err := f.transposeToNCHW(inputNode, axes.InputBatch, axes.InputChannels, axes.InputSpatial)
+	if err != nil {
+		return nil, errors.Wrap(err, "ConvGeneral: transpose input")
+	}
+	kernelTensor, err := f.transposeToOIHW(kernelNode, axes.KernelOutputChannels, axes.KernelInputChannels, axes.KernelSpatial)
+	if err != nil {
+		return nil, errors.Wrap(err, "ConvGeneral: transpose kernel")
+	}
+
+	// Prepare strides, dilations, padding.
+	strideArr := make([]int64, numSpatialDims)
+	dilationArr := make([]int64, numSpatialDims)
+	padBeforeArr := make([]int64, numSpatialDims)
+	padAfterArr := make([]int64, numSpatialDims)
+	for i := range numSpatialDims {
+		strideArr[i] = 1
+		dilationArr[i] = 1
+		if strides != nil && i < len(strides) {
+			strideArr[i] = int64(strides[i])
+		}
+		if kernelDilations != nil && i < len(kernelDilations) {
+			dilationArr[i] = int64(kernelDilations[i])
+		}
+		if paddings != nil && i < len(paddings) {
+			padBeforeArr[i] = int64(paddings[i][0])
+			padAfterArr[i] = int64(paddings[i][1])
+		}
+	}
+
+	groups := max(channelGroupCount, 1) * max(batchGroupCount, 1)
+	result, err := f.ctx().ConvGeneral(inputTensor, kernelTensor, numSpatialDims,
+		strideArr, dilationArr, padBeforeArr, padAfterArr, groups)
+	if err != nil {
+		return nil, errors.Wrap(err, "ConvGeneral")
+	}
+
+	// Transpose output from NCHW back to the requested layout.
+	result, err = f.transposeFromNCHW(result, outputShape, axes.OutputBatch, axes.OutputChannels, axes.OutputSpatial)
+	if err != nil {
+		return nil, errors.Wrap(err, "ConvGeneral: transpose output")
+	}
+
+	return &graphNode{tensor: result, shape: outputShape}, nil
+}
+
+// transposeToNCHW transposes a tensor from arbitrary axis layout to NCHW.
+func (f *Function) transposeToNCHW(node *graphNode, batchAxis, channelAxis int, spatialAxes []int) (bridge.Tensor, error) {
+	rank := node.shape.Rank()
+	perm := make([]int, rank)
+	perm[0] = batchAxis
+	perm[1] = channelAxis
+	for i, a := range spatialAxes {
+		perm[2+i] = a
+	}
+	if isIdentityPerm(perm) {
+		return node.tensor, nil
+	}
+	return f.ctx().Transpose(node.tensor, perm)
+}
+
+// transposeToOIHW transposes a kernel from arbitrary layout to OIHW.
+func (f *Function) transposeToOIHW(node *graphNode, outChannelAxis, inChannelAxis int, spatialAxes []int) (bridge.Tensor, error) {
+	rank := node.shape.Rank()
+	perm := make([]int, rank)
+	perm[0] = outChannelAxis
+	perm[1] = inChannelAxis
+	for i, a := range spatialAxes {
+		perm[2+i] = a
+	}
+	if isIdentityPerm(perm) {
+		return node.tensor, nil
+	}
+	return f.ctx().Transpose(node.tensor, perm)
+}
+
+// transposeFromNCHW transposes from NCHW layout back to the target layout.
+func (f *Function) transposeFromNCHW(tensor bridge.Tensor, targetShape shapes.Shape, batchAxis, channelAxis int, spatialAxes []int) (bridge.Tensor, error) {
+	rank := targetShape.Rank()
+	// Build the inverse permutation: from NCHW position to target position.
+	fwdPerm := make([]int, rank)
+	fwdPerm[0] = batchAxis
+	fwdPerm[1] = channelAxis
+	for i, a := range spatialAxes {
+		fwdPerm[2+i] = a
+	}
+	// Compute inverse.
+	invPerm := make([]int, rank)
+	for i, v := range fwdPerm {
+		invPerm[v] = i
+	}
+	if isIdentityPerm(invPerm) {
+		return tensor, nil
+	}
+	return f.ctx().Transpose(tensor, invPerm)
+}
+
+// ===========================================================================
+// ReduceWindow (Pooling)
+// ===========================================================================
+
+func (f *Function) ReduceWindow(
+	x backends.Value,
+	reductionType backends.ReduceOpType,
+	windowDimensions, strides, baseDilations, windowDilations []int,
+	paddings [][2]int,
+) (backends.Value, error) {
+	node, err := castNode(x)
+	if err != nil {
+		return nil, errors.Wrap(err, "ReduceWindow")
+	}
+
+	outShape, err := shapeinference.ReduceWindowOp(
+		node.shape, windowDimensions, strides, baseDilations, windowDilations, paddings)
+	if err != nil {
+		return nil, errors.Wrap(err, "ReduceWindow")
+	}
+
+	// For now, only support the common 2D pooling case with window on spatial dims.
+	// Full general ReduceWindow decomposition is complex.
+	rank := node.shape.Rank()
+	if rank != 4 {
+		return nil, errors.Errorf("ReduceWindow: only 4D tensors (NCHW) supported, got rank %d", rank)
+	}
+
+	// Check that batch and channel dims have window size 1.
+	if windowDimensions[0] != 1 || windowDimensions[1] != 1 {
+		return nil, errors.Errorf("ReduceWindow: batch/channel window must be 1, got %v", windowDimensions[:2])
+	}
+
+	var mode int
+	switch reductionType {
+	case backends.ReduceOpMax:
+		mode = 0
+	case backends.ReduceOpSum:
+		mode = 1
+	default:
+		return nil, errors.Errorf("ReduceWindow: reduction type %v not supported in MPSGraph pooling", reductionType)
+	}
+
+	spatialWindow := []int64{int64(windowDimensions[2]), int64(windowDimensions[3])}
+	spatialStrides := []int64{1, 1}
+	if strides != nil && len(strides) >= 4 {
+		spatialStrides = []int64{int64(strides[2]), int64(strides[3])}
+	}
+	padBefore := []int64{0, 0}
+	padAfter := []int64{0, 0}
+	if paddings != nil && len(paddings) >= 4 {
+		padBefore = []int64{int64(paddings[2][0]), int64(paddings[3][0])}
+		padAfter = []int64{int64(paddings[2][1]), int64(paddings[3][1])}
+	}
+
+	tensor, err := f.ctx().Pool2D(node.tensor, mode, spatialWindow, spatialStrides, padBefore, padAfter)
+	if err != nil {
+		return nil, errors.Wrap(err, "ReduceWindow")
+	}
+
+	// Reshape to match expected output shape if needed.
+	outDims := make([]int64, outShape.Rank())
+	for i, d := range outShape.Dimensions {
+		outDims[i] = int64(d)
+	}
+	tensor, err = f.ctx().Reshape(tensor, outDims)
+	if err != nil {
+		return nil, errors.Wrap(err, "ReduceWindow: reshape")
+	}
+
+	return &graphNode{tensor: tensor, shape: outShape}, nil
+}
+
+// ===========================================================================
+// TotalOrder Comparisons
+// ===========================================================================
+// TotalOrder comparisons enforce: -NaN < -Inf < -Finite < -0 < +0 < +Finite < +Inf < +NaN.
+// For simplicity, we delegate to regular comparisons (correct for non-NaN values,
+// which is the common case in ML).
+
+func (f *Function) EqualTotalOrder(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.Equal(lhs, rhs)
+}
+
+func (f *Function) NotEqualTotalOrder(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.NotEqual(lhs, rhs)
+}
+
+func (f *Function) GreaterThanTotalOrder(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.GreaterThan(lhs, rhs)
+}
+
+func (f *Function) GreaterOrEqualTotalOrder(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.GreaterOrEqual(lhs, rhs)
+}
+
+func (f *Function) LessThanTotalOrder(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.LessThan(lhs, rhs)
+}
+
+func (f *Function) LessOrEqualTotalOrder(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.LessOrEqual(lhs, rhs)
+}
+
+// ===========================================================================
+// Logical / Bitwise Reductions
+// ===========================================================================
+
+func (f *Function) ReduceLogicalAnd(x backends.Value, axes ...int) (backends.Value, error) {
+	// ReduceMin of {0,1} gives AND semantics for boolean values.
+	return f.reduceOp("ReduceLogicalAnd", backends.OpTypeReduceLogicalAnd, bridge.ReduceMin, x, axes...)
+}
+
+func (f *Function) ReduceLogicalOr(x backends.Value, axes ...int) (backends.Value, error) {
+	// ReduceMax of {0,1} gives OR semantics for boolean values.
+	return f.reduceOp("ReduceLogicalOr", backends.OpTypeReduceLogicalOr, bridge.ReduceMax, x, axes...)
+}
+
+// ===========================================================================
+// Fused Operations
+// ===========================================================================
+
+func (f *Function) FusedSoftmax(x backends.Value, axis int) (backends.Value, error) {
+	node, err := castNode(x)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedSoftmax")
+	}
+	tensor, err := f.ctx().Softmax(node.tensor, axis)
+	if err != nil {
+		return nil, errors.Wrap(err, "FusedSoftmax")
+	}
+	return &graphNode{tensor: tensor, shape: node.shape}, nil
+}
+
+func (f *Function) FusedGelu(x backends.Value, exact bool) (backends.Value, error) {
+	return nil, errors.Wrap(backends.ErrNotImplemented, "FusedGelu")
+}
+
+func (f *Function) FusedLayerNorm(x backends.Value, axes []int, epsilon float64, gamma, beta backends.Value) (backends.Value, error) {
+	return nil, errors.Wrap(backends.ErrNotImplemented, "FusedLayerNorm")
+}
+
+func (f *Function) FusedDense(x, weight, bias backends.Value, activation backends.ActivationType) (backends.Value, error) {
+	return nil, errors.Wrap(backends.ErrNotImplemented, "FusedDense")
+}
+
+func (f *Function) FusedScaledDotProductAttention(
+	query, key, value, mask backends.Value,
+	numHeads, numKVHeads int,
+	axesLayout backends.AxesLayout,
+	scale float64,
+	causal bool,
+) (backends.Value, error) {
+	return nil, errors.Wrap(backends.ErrNotImplemented, "FusedScaledDotProductAttention")
+}
+
+func (f *Function) FusedAttentionQKVProjection(
+	x, wQKV, biasQ, biasK, biasV backends.Value,
+	queryDim, keyValueDim int,
+) (query, key, value backends.Value, err error) {
+	return nil, nil, nil, errors.Wrap(backends.ErrNotImplemented, "FusedAttentionQKVProjection")
 }

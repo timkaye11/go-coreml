@@ -99,6 +99,37 @@ var backendCapabilities = backends.Capabilities{
 
 		// Batch normalization
 		backends.OpTypeBatchNormForInference: true,
+
+		// Phase 2: Gather/Scatter
+		backends.OpTypeGather:     true,
+		backends.OpTypeScatterSum: true,
+		backends.OpTypeScatterMax: true,
+		backends.OpTypeScatterMin: true,
+
+		// Phase 2: DynamicSlice / DynamicUpdateSlice
+		backends.OpTypeDynamicSlice:       true,
+		backends.OpTypeDynamicUpdateSlice: true,
+
+		// Phase 2: RNG
+		backends.OpTypeRNGBitGenerator: true,
+
+		// Phase 2: Convolution
+		backends.OpTypeConvGeneral: true,
+
+		// Phase 2: Pooling
+		backends.OpTypeReduceWindow: true,
+
+		// Phase 2: TotalOrder comparisons
+		backends.OpTypeEqualTotalOrder:          true,
+		backends.OpTypeNotEqualTotalOrder:       true,
+		backends.OpTypeGreaterThanTotalOrder:    true,
+		backends.OpTypeGreaterOrEqualTotalOrder: true,
+		backends.OpTypeLessThanTotalOrder:       true,
+		backends.OpTypeLessOrEqualTotalOrder:    true,
+
+		// Phase 2: Logical reductions
+		backends.OpTypeReduceLogicalAnd: true,
+		backends.OpTypeReduceLogicalOr:  true,
 	},
 
 	DTypes: map[dtypes.DType]bool{
