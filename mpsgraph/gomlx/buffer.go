@@ -5,6 +5,7 @@
 package mpsgraph
 
 import (
+	"fmt"
 	"reflect"
 	"unsafe"
 
@@ -109,6 +110,6 @@ func dtypeToBridgeDType(dt dtypes.DType) int {
 	case dtypes.Uint64:
 		return 12 // MPSGRAPH_DTYPE_UINT64
 	default:
-		return 7 // Default to float32
+		panic(fmt.Sprintf("dtypeToBridgeDType: unsupported dtype %v", dt))
 	}
 }

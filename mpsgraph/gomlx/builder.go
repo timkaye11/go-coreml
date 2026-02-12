@@ -38,6 +38,14 @@ func newBuilder(backend *Backend, name string, ctx *bridge.Context) *Builder {
 // Name returns the builder name.
 func (b *Builder) Name() string { return b.name }
 
+// Finalize releases the builder's MPSGraph context.
+func (b *Builder) Finalize() {
+	if b.ctx != nil {
+		b.ctx.Destroy()
+		b.ctx = nil
+	}
+}
+
 // Main returns the main function, creating it lazily.
 func (b *Builder) Main() backends.Function {
 	if b.mainFn == nil {

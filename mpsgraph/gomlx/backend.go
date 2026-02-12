@@ -7,8 +7,6 @@
 package mpsgraph
 
 import (
-	"sync"
-
 	"github.com/gomlx/go-coreml/mpsgraph/gomlx/internal/bridge"
 	"github.com/gomlx/gomlx/backends"
 	"github.com/gomlx/gomlx/pkg/core/shapes"
@@ -22,14 +20,7 @@ const BackendName = "mpsgraph"
 type Backend struct {
 	ctx         *bridge.Context
 	deviceName  string
-	bufferPools sync.Map // map[bufferPoolKey]*sync.Pool
 	isFinalized bool
-}
-
-// bufferPoolKey identifies a pool by dtype and element count.
-type bufferPoolKey struct {
-	dtype  int // using int to avoid importing dtypes in key
-	length int
 }
 
 // Verify interface compliance.

@@ -39,8 +39,8 @@ const (
 const (
 	ScatterModeSet = 0
 	ScatterModeAdd = 1
-	ScatterModeMin = 2
-	ScatterModeMax = 3
+	ScatterModeMax = 2
+	ScatterModeMin = 3
 )
 
 type Tensor = unsafe.Pointer

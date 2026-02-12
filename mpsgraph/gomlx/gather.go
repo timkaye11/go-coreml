@@ -165,6 +165,26 @@ func (f *Function) gatherEmbeddingLookup(
 		return nil, false
 	}
 
+	// After gatherAlongAxis, the result has the gathered dimension at gatherAxis.
+	// For the output, batch dims should come first. If gatherAxis > 0, we need
+	// to transpose the gatherAxis to position 0, then reshape to output shape.
+	if gatherAxis > 0 {
+		// Build permutation: move gatherAxis to front, keep rest in order.
+		perm := make([]int, operandRank)
+		perm[0] = gatherAxis
+		idx := 1
+		for i := range operandRank {
+			if i != gatherAxis {
+				perm[idx] = i
+				idx++
+			}
+		}
+		result, err = f.ctx().Transpose(result, perm)
+		if err != nil {
+			return nil, false
+		}
+	}
+
 	// Reshape to the expected output shape.
 	outDims := make([]int64, outShape.Rank())
 	for i, d := range outShape.Dimensions {
@@ -508,6 +528,3 @@ func (f *Function) ScatterMin(
 		indexVectorAxis, updateWindowAxes, insertedWindowAxes, scatterAxesToOperandAxes,
 		indicesAreSorted, uniqueIndices, bridge.ScatterModeMin)
 }
-
-// Ensure slices is imported.
-var _ = slices.Contains[[]int]

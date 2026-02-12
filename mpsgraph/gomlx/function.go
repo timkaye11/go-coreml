@@ -393,8 +393,48 @@ func (f *Function) ShiftRightArithmetic(lhs, rhs backends.Value) (backends.Value
 }
 
 func (f *Function) ShiftRightLogical(lhs, rhs backends.Value) (backends.Value, error) {
-	// TODO: implement logical shift right (treat as unsigned).
-	return f.binaryOp("ShiftRightLogical", backends.OpTypeShiftRightLogical, f.ctx().ShiftRight, lhs, rhs)
+	lhsNode, err := castNode(lhs)
+	if err != nil {
+		return nil, errors.Wrap(err, "ShiftRightLogical")
+	}
+	dt := lhsNode.shape.DType
+
+	// For unsigned types, arithmetic shift right IS logical shift right.
+	unsignedDT, isSigned := signedToUnsigned(dt)
+	if !isSigned {
+		return f.binaryOp("ShiftRightLogical", backends.OpTypeShiftRightLogical, f.ctx().ShiftRight, lhs, rhs)
+	}
+
+	// For signed types: cast to unsigned, shift, cast back.
+	castLHS, err := f.ConvertDType(lhs, unsignedDT)
+	if err != nil {
+		return nil, errors.Wrap(err, "ShiftRightLogical: cast to unsigned")
+	}
+	castRHS, err := f.ConvertDType(rhs, unsignedDT)
+	if err != nil {
+		return nil, errors.Wrap(err, "ShiftRightLogical: cast rhs to unsigned")
+	}
+	shifted, err := f.binaryOp("ShiftRightLogical", backends.OpTypeShiftRightLogical, f.ctx().ShiftRight, castLHS, castRHS)
+	if err != nil {
+		return nil, errors.Wrap(err, "ShiftRightLogical: shift")
+	}
+	return f.ConvertDType(shifted, dt)
+}
+
+// signedToUnsigned returns the unsigned equivalent of a signed integer dtype.
+func signedToUnsigned(dt dtypes.DType) (dtypes.DType, bool) {
+	switch dt {
+	case dtypes.Int8:
+		return dtypes.Uint8, true
+	case dtypes.Int16:
+		return dtypes.Uint16, true
+	case dtypes.Int32:
+		return dtypes.Uint32, true
+	case dtypes.Int64:
+		return dtypes.Uint64, true
+	default:
+		return dt, false
+	}
 }
 
 // --- Comparison ---
@@ -1075,79 +1115,21 @@ func (f *Function) ConvGeneral(
 // Input is already in NCHW layout. dilations are per spatial axis.
 func (f *Function) dilateInput(tensor bridge.Tensor, origShape shapes.Shape, batchAxis, channelAxis int, spatialAxes []int, dilations []int) (bridge.Tensor, error) {
 	// After transpose to NCHW, spatial dims are at indices 2 and 3.
-	// Dilation of D on an axis with size N → new size = (N-1)*D + 1.
-	// We use Pad with interior padding to achieve this.
+	// Dilation of D on an axis with size N -> new size = (N-1)*D + 1.
+	// Approach per axis: reshape to split axis into [N, 1], pad to [N, D],
+	// reshape to flatten [N*D], then slice to [(N-1)*D+1].
 	origDims := origShape.Dimensions
-	// Get spatial dims in original order.
 	spatialSizes := make([]int64, len(spatialAxes))
 	for i, ax := range spatialAxes {
 		spatialSizes[i] = int64(origDims[ax])
 	}
 
-	// Compute dilated sizes and pad amounts.
-	// In NCHW layout: [batch, channels, H, W], spatial at indices 2, 3.
-	// Build padBefore/padAfter arrays with interior padding.
-	// MPSGraph pad doesn't support interior padding, so we build with Iota + scatter approach.
-	// Actually, a simpler approach: create a zero tensor of the dilated size and scatter original values.
-
 	batchSize := int64(origDims[batchAxis])
 	channelSize := int64(origDims[channelAxis])
 	dilatedH := (spatialSizes[0]-1)*int64(dilations[0]) + 1
-	dilatedW := (spatialSizes[1]-1)*int64(dilations[1]) + 1
-
-	// Create a zero tensor of the dilated size [batch, channels, dilatedH, dilatedW].
-	zeroVal := float32(0)
-	zeroTensor, err := f.ctx().Constant(
-		unsafe.Pointer(&zeroVal), 4, dtypeToBridgeDType(origShape.DType), []int64{1})
-	if err != nil {
-		return nil, errors.Wrap(err, "dilateInput: zero constant")
-	}
-	dilatedShape := []int64{batchSize, channelSize, dilatedH, dilatedW}
-	zeroTensor, err = f.ctx().BroadcastTo(zeroTensor, dilatedShape)
-	if err != nil {
-		return nil, errors.Wrap(err, "dilateInput: broadcast zeros")
-	}
-
-	// Use slice + dynamic_update_slice to place original values at strided positions.
-	// Actually, the simplest approach: use Pad with 0 before, 0 after, and (dilation-1) interior.
-	// But our bridge doesn't support interior padding.
-
-	// Alternative: create with strides using Slice in reverse.
-	// Actually the simplest correct approach for input dilation:
-	// Build indices for scattered positions and use gather/scatter.
-	// But that's complex. Let me use a different approach:
-	// Reshape + interleave with zeros using Concatenate along spatial axes.
-
-	// Simplest approach: iterate and build with concat.
-	// For moderate dilation factors, this is reasonable.
-
-	// Actually, let me just implement this with a strided assignment pattern using
-	// DynamicUpdateSlice. For each row/col, update the appropriate position.
-
-	// The most efficient approach: use pad with interior padding.
-	// We can implement interior padding as: create dilated zero tensor, then
-	// for each (h, w) in original, place at (h*dilH, w*dilW) in dilated.
-	// This is a gather operation: create stride indices.
-
-	// Actually, the cleanest approach: use Slice with negative strides (not supported),
-	// or simply use a workaround.
-
-	// Let me try: create the dilated tensor directly using the stridedSlice approach:
-	// tensor is [B, C, H, W], we want [B, C, (H-1)*d+1, (W-1)*d+1]
-	// with original values at positions [0, d, 2d, ...] in each spatial axis.
-
-	// The simplest correct approach uses Iota to generate scatter indices:
-	// For now, just create a Pad operation that inserts zeros.
-	// Our Pad bridge doesn't support interior padding, so let's implement it
-	// by reshaping + concat.
-
-	// For dilation D on axis of size N:
-	//   1. Reshape: [..., N, 1, ...]
-	//   2. Pad with D-1 zeros on the last new dim: [..., N, D, ...]
-	//   3. Reshape to flatten: [..., N*D, ...]
-	//   4. Slice to remove trailing D-1 zeros: [..., (N-1)*D+1, ...]
 
 	result := tensor
+	var err error
 
 	// Dilate height (axis 2 in NCHW).
 	if dilations[0] > 1 {
@@ -1396,12 +1378,26 @@ func (f *Function) ReduceWindow(
 		return nil, errors.Errorf("ReduceWindow: only 4D tensors supported, got rank %d", rank)
 	}
 
+	// Validate dilations (not supported by MPSGraph pooling).
+	for _, d := range baseDilations {
+		if d > 1 {
+			return nil, errors.Errorf("ReduceWindow: baseDilations > 1 not supported in MPSGraph pooling")
+		}
+	}
+	for _, d := range windowDilations {
+		if d > 1 {
+			return nil, errors.Errorf("ReduceWindow: windowDilations > 1 not supported in MPSGraph pooling")
+		}
+	}
+
 	var mode int
+	isSum := false
 	switch reductionType {
 	case backends.ReduceOpMax:
 		mode = 0
 	case backends.ReduceOpSum:
-		mode = 1
+		mode = 1 // MPSGraph has avg pooling (mode 1); we'll multiply by window area to get sum.
+		isSum = true
 	default:
 		return nil, errors.Errorf("ReduceWindow: reduction type %v not supported in MPSGraph pooling", reductionType)
 	}
@@ -1428,6 +1424,24 @@ func (f *Function) ReduceWindow(
 	tensor, err = f.ctx().Pool2D(tensor, mode, spatialWindow, spatialStrides, padBefore, padAfter)
 	if err != nil {
 		return nil, errors.Wrap(err, "ReduceWindow")
+	}
+
+	// For sum pooling, convert avg to sum by multiplying by window area.
+	if isSum {
+		windowArea := float32(axesInfo.spatialWindow[0] * axesInfo.spatialWindow[1])
+		areaTensor, err := f.ctx().Constant(
+			unsafe.Pointer(&windowArea), 4, dtypeToBridgeDType(node.shape.DType), []int64{1})
+		if err != nil {
+			return nil, errors.Wrap(err, "ReduceWindow: window area constant")
+		}
+		areaTensor, err = f.ctx().Reshape(areaTensor, nil) // scalar
+		if err != nil {
+			return nil, errors.Wrap(err, "ReduceWindow: reshape area")
+		}
+		tensor, err = f.ctx().Mul(tensor, areaTensor)
+		if err != nil {
+			return nil, errors.Wrap(err, "ReduceWindow: sum = avg * window_area")
+		}
 	}
 
 	// Transpose back from NCHW if needed.
@@ -1584,7 +1598,6 @@ func (f *Function) FusedSoftmax(x backends.Value, axis int) (backends.Value, err
 }
 
 func (f *Function) FusedGelu(x backends.Value, exact bool) (backends.Value, error) {
-	// GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 	node, err := castNode(x)
 	if err != nil {
 		return nil, errors.Wrap(err, "FusedGelu")
@@ -1599,6 +1612,51 @@ func (f *Function) FusedGelu(x backends.Value, exact bool) (backends.Value, erro
 		return f.ctx().Reshape(t, nil) // scalar
 	}
 
+	if exact {
+		// Exact GELU: x * 0.5 * (1 + erf(x / sqrt(2)))
+		half, err := makeConst(0.5)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedGelu")
+		}
+		invSqrt2, err := makeConst(0.7071067811865475) // 1/sqrt(2)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedGelu")
+		}
+		one, err := makeConst(1.0)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedGelu")
+		}
+
+		t := node.tensor
+		// x / sqrt(2) = x * (1/sqrt(2))
+		xScaled, err := f.ctx().Mul(t, invSqrt2)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedGelu: scale")
+		}
+		// erf(x / sqrt(2))
+		erfVal, err := f.ctx().Erf(xScaled)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedGelu: erf")
+		}
+		// 1 + erf(...)
+		onePlusErf, err := f.ctx().Add(one, erfVal)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedGelu: 1+erf")
+		}
+		// 0.5 * x
+		halfX, err := f.ctx().Mul(half, t)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedGelu: 0.5*x")
+		}
+		// 0.5 * x * (1 + erf(...))
+		result, err := f.ctx().Mul(halfX, onePlusErf)
+		if err != nil {
+			return nil, errors.Wrap(err, "FusedGelu: final mul")
+		}
+		return &graphNode{tensor: result, shape: node.shape}, nil
+	}
+
+	// Approximate GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 	half, err := makeConst(0.5)
 	if err != nil {
 		return nil, errors.Wrap(err, "FusedGelu")

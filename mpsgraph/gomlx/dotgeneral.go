@@ -5,8 +5,6 @@
 package mpsgraph
 
 import (
-	"slices"
-
 	"github.com/gomlx/gomlx/backends"
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/pkg/errors"
@@ -236,6 +234,3 @@ func isIdentityPerm(perm []int) bool {
 	}
 	return true
 }
-
-// Ensure slices is imported (used in other files too).
-var _ = slices.Contains[[]int]

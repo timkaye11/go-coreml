@@ -710,8 +710,8 @@ MPSGraphTensorHandle mpsgraph_scatter_nd(MPSGraphContextHandle handle,
         switch (mode) {
             case 0: scatterMode = MPSGraphScatterModeSet; break;
             case 1: scatterMode = MPSGraphScatterModeAdd; break;
-            case 2: scatterMode = MPSGraphScatterModeMin; break;
-            case 3: scatterMode = MPSGraphScatterModeMax; break;
+            case 2: scatterMode = MPSGraphScatterModeMax; break;
+            case 3: scatterMode = MPSGraphScatterModeMin; break;
             default: scatterMode = MPSGraphScatterModeSet; break;
         }
 
