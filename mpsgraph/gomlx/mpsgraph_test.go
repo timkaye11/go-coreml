@@ -511,7 +511,7 @@ func TestDotGeneral(t *testing.T) {
 		}
 
 		// Standard matmul: contract axis 1 of lhs with axis 0 of rhs.
-		y, err := mainFn.DotGeneral(lhs, []int{1}, nil, rhs, []int{0}, nil)
+		y, err := mainFn.DotGeneral(lhs, []int{1}, nil, rhs, []int{0}, nil, backends.DotGeneralConfig{})
 		if err != nil {
 			t.Fatalf("DotGeneral() failed: %+v", err)
 		}
@@ -560,7 +560,7 @@ func TestDotGeneral(t *testing.T) {
 			t.Fatalf("Parameter() failed: %+v", err)
 		}
 
-		y, err := mainFn.DotGeneral(lhs, []int{2}, []int{0}, rhs, []int{1}, []int{0})
+		y, err := mainFn.DotGeneral(lhs, []int{2}, []int{0}, rhs, []int{1}, []int{0}, backends.DotGeneralConfig{})
 		if err != nil {
 			t.Fatalf("DotGeneral() failed: %+v", err)
 		}
@@ -1652,7 +1652,7 @@ func TestTransformerBlock(t *testing.T) {
 	V, _ := mainFn.Parameter("V", qkvShape, nil)
 
 	// scores = Q @ K^T → [2, 2]
-	scores, err := mainFn.DotGeneral(Q, []int{1}, nil, K, []int{1}, nil)
+	scores, err := mainFn.DotGeneral(Q, []int{1}, nil, K, []int{1}, nil, backends.DotGeneralConfig{})
 	if err != nil {
 		t.Fatalf("DotGeneral(Q, K^T) failed: %+v", err)
 	}
@@ -1671,7 +1671,7 @@ func TestTransformerBlock(t *testing.T) {
 	}
 
 	// output = weights @ V → [2, 3]
-	output, err := mainFn.DotGeneral(weights, []int{1}, nil, V, []int{0}, nil)
+	output, err := mainFn.DotGeneral(weights, []int{1}, nil, V, []int{0}, nil, backends.DotGeneralConfig{})
 	if err != nil {
 		t.Fatalf("DotGeneral(weights, V) failed: %+v", err)
 	}
@@ -1983,7 +1983,7 @@ func TestGoMLXMatMul(t *testing.T) {
 	rhs := tensors.FromFlatDataAndDimensions([]float32{1, 2, 3, 4, 5, 6}, 3, 2)
 
 	result := graph.MustExecOnce(backend, func(a, b *graph.Node) *graph.Node {
-		return graph.Dot(a, b)
+		return graph.Dot(a, b).MatMul()
 	}, lhs, rhs)
 
 	got, err := tensors.CopyFlatData[float32](result)
@@ -2292,7 +2292,7 @@ func TestGradientSimple(t *testing.T) {
 		// f(W) = sum(x @ W) where x=[1,2], W=[2,1] → df/dW = x^T
 		x := tensors.FromFlatDataAndDimensions([]float32{1, 2}, 1, 2)
 		result := graph.MustExecOnce(backend, func(xNode, wNode *graph.Node) *graph.Node {
-			y := graph.Dot(xNode, wNode)
+			y := graph.Dot(xNode, wNode).MatMul()
 			loss := graph.ReduceAllSum(y)
 			grads := graph.Gradient(loss, wNode)
 			return grads[0]
@@ -3143,7 +3143,7 @@ func TestBFloat16(t *testing.T) {
 		result := graph.MustExecOnce(backend, func(a, b *graph.Node) *graph.Node {
 			aBF := graph.ConvertDType(a, dtypes.BFloat16)
 			bBF := graph.ConvertDType(b, dtypes.BFloat16)
-			c := graph.Dot(aBF, bBF)
+			c := graph.Dot(aBF, bBF).MatMul()
 			return graph.ConvertDType(c, dtypes.Float32)
 		},
 			tensors.FromFlatDataAndDimensions([]float32{1, 2, 3, 4}, 2, 2),
@@ -3254,7 +3254,7 @@ func benchmarkMatMul(b *testing.B, M, K, N int) {
 	bTensor := tensors.FromFlatDataAndDimensions(bData, K, N)
 
 	exec, err := graph.NewExec(backend, func(a, b *graph.Node) *graph.Node {
-		return graph.Dot(a, b)
+		return graph.Dot(a, b).MatMul()
 	})
 	if err != nil {
 		b.Fatalf("NewExec failed: %+v", err)

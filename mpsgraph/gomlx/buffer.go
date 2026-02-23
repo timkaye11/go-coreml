@@ -1,6 +1,6 @@
 // Copyright 2023-2026 The GoMLX Authors. SPDX-License-Identifier: Apache-2.0
 
-//go:build darwin
+//go:build darwin && cgo
 
 package mpsgraph
 
@@ -40,6 +40,9 @@ func newBuffer(shape shapes.Shape) *gpuBuffer {
 
 // flatDataPtr returns a raw pointer to the flat data and its byte size.
 func (buf *gpuBuffer) flatDataPtr() (unsafe.Pointer, int64) {
+	if !buf.valid || buf.flat == nil {
+		return nil, 0
+	}
 	v := reflect.ValueOf(buf.flat)
 	if v.Len() == 0 {
 		return nil, 0
@@ -60,6 +63,9 @@ func bufferFromFlat(flat any, shape shapes.Shape) (*gpuBuffer, error) {
 
 // bufferCopyToFlat copies buffer data to the given flat slice.
 func bufferCopyToFlat(buf *gpuBuffer, flat any) error {
+	if !buf.valid {
+		return errors.New("bufferCopyToFlat: buffer has been finalized")
+	}
 	return copyFlat(flat, buf.flat)
 }
 
@@ -99,8 +105,6 @@ func dtypeToBridgeDType(dt dtypes.DType) int {
 		return 6 // MPSGRAPH_DTYPE_BFLOAT16
 	case dtypes.Float32:
 		return 7 // MPSGRAPH_DTYPE_FLOAT32
-	case dtypes.Float64:
-		return 8 // MPSGRAPH_DTYPE_FLOAT64
 	case dtypes.Uint8:
 		return 9 // MPSGRAPH_DTYPE_UINT8
 	case dtypes.Uint16:

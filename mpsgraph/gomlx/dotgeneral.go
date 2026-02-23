@@ -1,6 +1,6 @@
 // Copyright 2023-2026 The GoMLX Authors. SPDX-License-Identifier: Apache-2.0
 
-//go:build darwin
+//go:build darwin && cgo
 
 package mpsgraph
 
@@ -65,6 +65,7 @@ func dotGeneralOutputShape(
 func (f *Function) DotGeneral(
 	lhs backends.Value, lhsContractingAxes []int, lhsBatchAxes []int,
 	rhs backends.Value, rhsContractingAxes []int, rhsBatchAxes []int,
+	config backends.DotGeneralConfig,
 ) (backends.Value, error) {
 	lhsNode, err := f.resolveNode(lhs)
 	if err != nil {

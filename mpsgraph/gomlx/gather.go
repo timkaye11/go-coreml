@@ -1,6 +1,6 @@
 // Copyright 2023-2026 The GoMLX Authors. SPDX-License-Identifier: Apache-2.0
 
-//go:build darwin
+//go:build darwin && cgo
 
 package mpsgraph
 
@@ -86,6 +86,13 @@ func (f *Function) gatherEmbeddingLookup(
 			continue
 		}
 		if sz != operandNode.shape.Dimensions[i] {
+			return nil, false
+		}
+	}
+
+	// offsetOutputAxes must be contiguous ascending.
+	for i := 1; i < len(offsetOutputAxes); i++ {
+		if offsetOutputAxes[i] != offsetOutputAxes[i-1]+1 {
 			return nil, false
 		}
 	}
@@ -234,13 +241,34 @@ func (f *Function) gatherGeneral(
 	batchSize := 1
 	for i := range indicesShape.Rank() {
 		if i != indexVectorAxis || indexVectorAxis == indicesShape.Rank() {
-			if i < len(indicesShape.Dimensions) {
-				batchSize *= indicesShape.Dimensions[i]
-			}
+			batchSize *= indicesShape.Dimensions[i]
 		}
 	}
 
 	indexVectorSize := len(startIndexMap)
+
+	// Step 2b: Transpose indexVectorAxis to trailing position if needed.
+	// When indexVectorAxis == indicesShape.Rank(), we already added a trailing axis above,
+	// so it's already in the trailing position.
+	effectiveRank := indicesShape.Rank()
+	if indexVectorAxis == indicesShape.Rank() {
+		effectiveRank = indicesShape.Rank() + 1
+	}
+	if indexVectorAxis != effectiveRank-1 {
+		perm := make([]int, effectiveRank)
+		pi := 0
+		for i := 0; i < effectiveRank; i++ {
+			if i != indexVectorAxis {
+				perm[pi] = i
+				pi++
+			}
+		}
+		perm[effectiveRank-1] = indexVectorAxis
+		idxTensor, err = f.ctx().Transpose(idxTensor, perm)
+		if err != nil {
+			return nil, errors.Wrap(err, "Gather: transposing index vector axis to trailing position")
+		}
+	}
 
 	// Step 3: If startIndexMap is a contiguous prefix [0,1,...,k-1], we can use gatherND directly.
 	// Otherwise, we need to remap indices.
@@ -280,6 +308,7 @@ func (f *Function) gatherGeneral(
 	if isContiguousPrefix && allSlicesFullOrCollapsed && len(collapsedSliceAxes) == len(startIndexMap) {
 		// Optimal path: gatherND with contiguous index prefix.
 		// Reshape indices to [batchSize, indexVectorSize] for gatherND.
+		// indexVectorAxis is already in trailing position after the transpose above.
 		idxTensor, err = f.ctx().Reshape(idxTensor, []int64{int64(batchSize), int64(indexVectorSize)})
 		if err != nil {
 			return nil, errors.Wrap(err, "Gather: reshape indices for gatherND")
@@ -311,6 +340,7 @@ func (f *Function) gatherGeneral(
 
 	// For non-contiguous startIndexMap, we need to rearrange the index columns.
 	// Reshape indices to [batchSize, indexVectorSize].
+	// indexVectorAxis is already in trailing position after the transpose above.
 	idxTensor, err = f.ctx().Reshape(idxTensor, []int64{int64(batchSize), int64(indexVectorSize)})
 	if err != nil {
 		return nil, errors.Wrap(err, "Gather: reshape indices")
@@ -353,6 +383,44 @@ func (f *Function) gatherGeneral(
 	result, err := f.ctx().GatherND(operandTensor, idxTensor, 0)
 	if err != nil {
 		return nil, errors.Wrap(err, "Gather: gatherND general")
+	}
+
+	// Post-GatherND: trim non-collapsed, non-indexed axes where sliceSizes < full dimension.
+	// The GatherND result has shape [batchSize, <remaining transposed operand dims>].
+	// The remaining axes correspond to perm[len(startIndexMap):].
+	needsSlice := false
+	for k := len(startIndexMap); k < operandRank; k++ {
+		origAxis := perm[k]
+		if !collapsedSet[origAxis] && sliceSizes[origAxis] < operandShape.Dimensions[origAxis] {
+			needsSlice = true
+			break
+		}
+	}
+	if needsSlice {
+		// Build starts/ends/strides for the slice.
+		// Axis 0 is the batch dimension, kept fully.
+		sliceRank := 1 + (operandRank - len(startIndexMap))
+		starts := make([]int64, sliceRank)
+		ends := make([]int64, sliceRank)
+		strides := make([]int64, sliceRank)
+		starts[0] = 0
+		ends[0] = int64(batchSize)
+		strides[0] = 1
+		for k := len(startIndexMap); k < operandRank; k++ {
+			si := 1 + k - len(startIndexMap)
+			origAxis := perm[k]
+			starts[si] = 0
+			strides[si] = 1
+			if collapsedSet[origAxis] {
+				ends[si] = 1
+			} else {
+				ends[si] = int64(sliceSizes[origAxis])
+			}
+		}
+		result, err = f.ctx().Slice(result, starts, ends, strides)
+		if err != nil {
+			return nil, errors.Wrap(err, "Gather: post-gatherND slice")
+		}
 	}
 
 	// Reshape to output shape.
@@ -469,8 +537,9 @@ func (f *Function) scatterImpl(
 
 	// General case: use scatterND.
 	// Reshape indices for scatterND.
+	indicesShape := indicesNode.shape
 	batchSize := 1
-	for i, d := range indicesNode.shape.Dimensions {
+	for i, d := range indicesShape.Dimensions {
 		if i != indexVectorAxis {
 			batchSize *= d
 		}
@@ -478,21 +547,104 @@ func (f *Function) scatterImpl(
 	indexVectorSize := len(scatterAxesToOperandAxes)
 
 	idxTensor := indicesNode.tensor
+
+	// If indexVectorAxis == indicesShape.Rank(), add a trailing axis of size 1.
+	if indexVectorAxis == indicesShape.Rank() {
+		newDims := make([]int64, indicesShape.Rank()+1)
+		for i, d := range indicesShape.Dimensions {
+			newDims[i] = int64(d)
+		}
+		newDims[indicesShape.Rank()] = 1
+		idxTensor, err = f.ctx().Reshape(idxTensor, newDims)
+		if err != nil {
+			return nil, errors.Wrap(err, opName+": reshape indices for implicit axis")
+		}
+	}
+
+	// Transpose indexVectorAxis to trailing position if needed.
+	// When indexVectorAxis == indicesShape.Rank(), we already added a trailing axis above,
+	// so it's already in the trailing position.
+	effectiveRank := indicesShape.Rank()
+	if indexVectorAxis == indicesShape.Rank() {
+		effectiveRank = indicesShape.Rank() + 1
+	}
+	if indexVectorAxis != effectiveRank-1 {
+		perm := make([]int, effectiveRank)
+		pi := 0
+		for i := 0; i < effectiveRank; i++ {
+			if i != indexVectorAxis {
+				perm[pi] = i
+				pi++
+			}
+		}
+		perm[effectiveRank-1] = indexVectorAxis
+		idxTensor, err = f.ctx().Transpose(idxTensor, perm)
+		if err != nil {
+			return nil, errors.Wrap(err, opName+": transposing index vector axis to trailing position")
+		}
+	}
+
+	// indexVectorAxis is now in trailing position; reshape to [batchSize, indexVectorSize].
 	idxTensor, err = f.ctx().Reshape(idxTensor, []int64{int64(batchSize), int64(indexVectorSize)})
 	if err != nil {
 		return nil, errors.Wrap(err, opName+": reshape indices for scatterND")
 	}
 
-	// For scatterND, determine the output shape.
-	outDims := make([]int64, outShape.Rank())
-	for i, d := range outShape.Dimensions {
-		outDims[i] = int64(d)
+	// Transpose operand so scatterAxesToOperandAxes axes come first,
+	// matching the index columns.
+	operandRank := operandNode.shape.Rank()
+	scatterIndexedSet := make(map[int]bool)
+	for _, a := range scatterAxesToOperandAxes {
+		scatterIndexedSet[a] = true
+	}
+	scatterPerm := make([]int, operandRank)
+	copy(scatterPerm, scatterAxesToOperandAxes)
+	si := len(scatterAxesToOperandAxes)
+	for i := range operandRank {
+		if !scatterIndexedSet[i] {
+			scatterPerm[si] = i
+			si++
+		}
 	}
 
-	result, err := f.ctx().ScatterND(operandNode.tensor, idxTensor, updatesNode.tensor, outDims, scatterMode)
+	operandTensor := operandNode.tensor
+	needsScatterTranspose := false
+	for i, v := range scatterPerm {
+		if v != i {
+			needsScatterTranspose = true
+			break
+		}
+	}
+	if needsScatterTranspose {
+		operandTensor, err = f.ctx().Transpose(operandTensor, scatterPerm)
+		if err != nil {
+			return nil, errors.Wrap(err, opName+": transpose operand for scatterND")
+		}
+	}
+
+	// For scatterND, determine the output shape from the (possibly transposed) operand.
+	transposedDims := make([]int64, operandRank)
+	for i, p := range scatterPerm {
+		transposedDims[i] = int64(operandNode.shape.Dimensions[p])
+	}
+
+	result, err := f.ctx().ScatterND(operandTensor, idxTensor, updatesNode.tensor, transposedDims, scatterMode)
 	if err != nil {
 		return nil, errors.Wrap(err, opName+": scatterND")
 	}
+
+	// Transpose result back if we transposed the operand.
+	if needsScatterTranspose {
+		inversePerm := make([]int, operandRank)
+		for i, v := range scatterPerm {
+			inversePerm[v] = i
+		}
+		result, err = f.ctx().Transpose(result, inversePerm)
+		if err != nil {
+			return nil, errors.Wrap(err, opName+": inverse transpose after scatterND")
+		}
+	}
+
 	return &graphNode{tensor: result, shape: outShape, owner: f}, nil
 }
 

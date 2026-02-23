@@ -51,9 +51,11 @@ type Buffer struct{}
 
 var errNoCGo = fmt.Errorf("mpsgraph: CGO is disabled; rebuild with CGO_ENABLED=1")
 
-func NewContext() (*Context, error)                                          { return nil, errNoCGo }
-func (c *Context) Destroy()                                                 {}
-func (c *Context) DeviceName() string                                       { return "" }
+func NewContext() (*Context, error)                                                   { return nil, errNoCGo }
+func NewContextWithDevice(deviceHandle unsafe.Pointer) (*Context, error)              { return nil, errNoCGo }
+func (c *Context) Destroy()                                                           {}
+func (c *Context) DeviceHandle() unsafe.Pointer                                       { return nil }
+func (c *Context) DeviceName() string                                                 { return "" }
 func (c *Context) Placeholder(dtype DType, shape []int64) (Tensor, error)   { return nil, errNoCGo }
 func (c *Context) Constant(data unsafe.Pointer, nbytes int64, dtype DType, shape []int64) (Tensor, error) {
 	return nil, errNoCGo

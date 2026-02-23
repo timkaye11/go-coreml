@@ -1,6 +1,6 @@
 // Copyright 2023-2026 The GoMLX Authors. SPDX-License-Identifier: Apache-2.0
 
-//go:build darwin
+//go:build darwin && cgo
 
 // Package mpsgraph implements a GoMLX backend using Apple's MPSGraph framework
 // for GPU-accelerated tensor computation on Apple Silicon.
@@ -109,6 +109,7 @@ func (b *Backend) BufferFinalize(buffer backends.Buffer) error {
 		return errors.Errorf("BufferFinalize: expected *gpuBuffer, got %T", buffer)
 	}
 	buf.valid = false
+	buf.flat = nil
 	return nil
 }
 

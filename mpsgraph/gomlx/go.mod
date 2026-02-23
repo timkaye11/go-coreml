@@ -1,9 +1,9 @@
 module github.com/gomlx/go-coreml/mpsgraph/gomlx
 
-go 1.25.5
+go 1.25
 
 require (
-	github.com/gomlx/gomlx v0.26.1-0.20260121051322-dbf0e3293e25
+	github.com/gomlx/gomlx v0.26.1-0.20260223064152-358aaf0bc270
 	github.com/pkg/errors v0.9.1
 )
 
@@ -15,5 +15,3 @@ require (
 	golang.org/x/exp v0.0.0-20260112195511-716be5621a96 // indirect
 	k8s.io/klog/v2 v2.130.1 // indirect
 )
-
-replace github.com/gomlx/gomlx => /Users/tim/Documents/af/gomlx

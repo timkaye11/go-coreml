@@ -216,7 +216,7 @@ MPSGraphTensorHandle mpsgraph_random_uniform(MPSGraphContextHandle ctx,
     int dtype, int64_t* shape, int rank, MPSGraphError* error);
 
 // --- Pooling (ReduceWindow) ---
-// mode: 0=max, 1=sum, 2=avg
+// mode: 0=max, 1=avg
 MPSGraphTensorHandle mpsgraph_pool2d(MPSGraphContextHandle ctx,
     MPSGraphTensorHandle x, int mode,
     int64_t* windowDims, int64_t* strides, int64_t* padBefore, int64_t* padAfter,

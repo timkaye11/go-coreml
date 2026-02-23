@@ -1,6 +1,6 @@
 // Copyright 2023-2026 The GoMLX Authors. SPDX-License-Identifier: Apache-2.0
 
-//go:build darwin
+//go:build darwin && cgo
 
 package mpsgraph
 
@@ -227,6 +227,9 @@ func (e *ExecutableWithCF) execWhile(cf *controlFlowStep, preOutputs []backends.
 	state := make([]backends.Buffer, stateCount)
 	for i := range stateCount {
 		idx := indexOfNodeInTargets(e.preGraphTargets, cf.inputs[i])
+		if idx < 0 {
+			return nil, errors.Errorf("While: CF input %d not found in pre-graph targets", i)
+		}
 		state[i] = cloneBuffer(preOutputs[idx].(*gpuBuffer))
 	}
 
@@ -235,6 +238,7 @@ func (e *ExecutableWithCF) execWhile(cf *controlFlowStep, preOutputs []backends.
 	bodyCaptures := e.gatherCapturedBuffers(wd.bodyFn, preOutputs)
 
 	const maxIterations = 1000000
+	loopCompleted := false
 	for iter := range maxIterations {
 		// Run cond with current state + captures.
 		condInputs := make([]backends.Buffer, stateCount+len(condCaptures))
@@ -252,6 +256,7 @@ func (e *ExecutableWithCF) execWhile(cf *controlFlowStep, preOutputs []backends.
 		condPtr, _ := condBuf.flatDataPtr()
 		condValue := *(*bool)(condPtr)
 		if !condValue {
+			loopCompleted = true
 			break // Loop done.
 		}
 
@@ -270,6 +275,10 @@ func (e *ExecutableWithCF) execWhile(cf *controlFlowStep, preOutputs []backends.
 		state = newState
 	}
 
+	if !loopCompleted {
+		return nil, errors.Errorf("While: exceeded maximum iterations (%d)", maxIterations)
+	}
+
 	return state, nil
 }
 
@@ -279,6 +288,9 @@ func (e *ExecutableWithCF) execIf(cf *controlFlowStep, preOutputs []backends.Buf
 
 	// Read the predicate.
 	predIdx := indexOfNodeInTargets(e.preGraphTargets, cf.inputs[0])
+	if predIdx < 0 {
+		return nil, errors.Errorf("If: predicate not found in pre-graph targets")
+	}
 	predBuf := preOutputs[predIdx].(*gpuBuffer)
 	predPtr, _ := predBuf.flatDataPtr()
 	predValue := *(*bool)(predPtr)
@@ -315,6 +327,9 @@ func (e *ExecutableWithCF) execSort(cf *controlFlowStep, preOutputs []backends.B
 	inputBufs := make([]*gpuBuffer, inputCount)
 	for i := range inputCount {
 		idx := indexOfNodeInTargets(e.preGraphTargets, cf.inputs[i])
+		if idx < 0 {
+			return nil, errors.Errorf("Sort: input %d not found in pre-graph targets", i)
+		}
 		inputBufs[i] = preOutputs[idx].(*gpuBuffer)
 	}
 
@@ -348,7 +363,12 @@ func (e *ExecutableWithCF) execSort(cf *controlFlowStep, preOutputs []backends.B
 				indices[k] = k
 			}
 
+			var sortErr error
+
 			sortFn := func(a, b int) bool {
+				if sortErr != nil {
+					return false // Already errored, just finish quickly.
+				}
 				// Build comparator inputs: lhs_0, rhs_0, lhs_1, rhs_1, ...
 				compInputs := make([]backends.Buffer, 2*inputCount+len(compCaptures))
 				for t := range inputCount {
@@ -375,7 +395,8 @@ func (e *ExecutableWithCF) execSort(cf *controlFlowStep, preOutputs []backends.B
 
 				results, err := compExec.Execute(compInputs, donate, 0)
 				if err != nil {
-					return false // On error, don't swap.
+					sortErr = err
+					return false
 				}
 				resultBuf := results[0].(*gpuBuffer)
 				resPtr, _ := resultBuf.flatDataPtr()
@@ -388,26 +409,35 @@ func (e *ExecutableWithCF) execSort(cf *controlFlowStep, preOutputs []backends.B
 				sort.Slice(indices, sortFn)
 			}
 
+			if sortErr != nil {
+				return nil, errors.Wrap(sortErr, "Sort: comparator execution failed")
+			}
+
 			// Apply permutation to outputs.
+			// Each "element" along the sort axis is a single scalar (elemSize bytes).
+			// The stride between consecutive elements along the sort axis is
+			// innerSize * elemSize (they are not contiguous in memory).
 			for t := range inputCount {
 				elemSize := int(inputBufs[t].shape.DType.Size())
+				stride := innerSize * elemSize
 				baseOffset := (outer*axisSize*innerSize + inner) * elemSize
 
-				// Read original data.
+				// Copy original scalars from input buffer.
 				inPtr, _ := inputBufs[t].flatDataPtr()
 				origData := make([]byte, axisSize*elemSize)
 				for k := range axisSize {
-					srcOffset := baseOffset + k*innerSize*elemSize
+					srcOffset := baseOffset + k*stride
 					src := unsafe.Pointer(uintptr(inPtr) + uintptr(srcOffset))
 					copyBytesToSlice(origData[k*elemSize:(k+1)*elemSize], src, elemSize)
 				}
 
-				// Write in sorted order.
+				// Write permuted scalars to output buffer.
 				outPtr, _ := outputBufs[t].flatDataPtr()
-				for k, idx := range indices {
-					dstOffset := baseOffset + k*innerSize*elemSize
+				for k := range axisSize {
+					srcIdx := indices[k]
+					dstOffset := baseOffset + k*stride
 					dst := unsafe.Pointer(uintptr(outPtr) + uintptr(dstOffset))
-					copyBytesFromSlice(dst, origData[idx*elemSize:(idx+1)*elemSize], elemSize)
+					copyBytesFromSlice(dst, origData[srcIdx*elemSize:(srcIdx+1)*elemSize], elemSize)
 				}
 			}
 		}
@@ -429,6 +459,9 @@ func (e *ExecutableWithCF) execCall(cf *controlFlowStep, preOutputs []backends.B
 	callInputs := make([]backends.Buffer, len(cf.inputs))
 	for i, input := range cf.inputs {
 		idx := indexOfNodeInTargets(e.preGraphTargets, input)
+		if idx < 0 {
+			return nil, errors.Errorf("Call: input %d not found in pre-graph targets", i)
+		}
 		callInputs[i] = preOutputs[idx]
 	}
 

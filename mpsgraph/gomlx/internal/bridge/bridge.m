@@ -569,17 +569,50 @@ MPSGraphTensorHandle mpsgraph_pad(MPSGraphContextHandle handle, MPSGraphTensorHa
             [rightPad addObject:@(padAfter[i])];
         }
 
-        MPSGraphTensor* result = [ctx.graph padTensor:input
-                                      withPaddingMode:mode
-                                          leftPadding:leftPad
-                                         rightPadding:rightPad
-                                        constantValue:0.0
-                                                 name:nil];
-        // Note: MPSGraph padTensor with constant mode uses the constantValue parameter.
-        // For non-zero pad values, we would need a different approach, but this covers
-        // the common case. TODO: handle non-zero pad values if needed.
-        if (!result) {
+        // Step 1: Pad the input with constant 0.0.
+        MPSGraphTensor* paddedInput = [ctx.graph padTensor:input
+                                           withPaddingMode:mode
+                                               leftPadding:leftPad
+                                              rightPadding:rightPad
+                                             constantValue:0.0
+                                                      name:nil];
+        if (!paddedInput) {
             setError(error, 37, @"pad failed");
+            return NULL;
+        }
+
+        // Step 2: Build a mask to identify padding positions.
+        // Create a ones tensor with the input shape, pad it with 0.0.
+        // Result: 1 where original data, 0 where padding.
+        MPSGraphTensor* ones = [ctx.graph constantWithScalar:1.0
+                                                       shape:input.shape
+                                                    dataType:input.dataType];
+        MPSGraphTensor* mask = [ctx.graph padTensor:ones
+                                    withPaddingMode:mode
+                                        leftPadding:leftPad
+                                       rightPadding:rightPad
+                                      constantValue:0.0
+                                               name:nil];
+
+        // Step 3: Invert the mask: 1 where padding, 0 where data.
+        MPSGraphTensor* onesLike = [ctx.graph constantWithScalar:1.0
+                                                           shape:paddedInput.shape
+                                                        dataType:input.dataType];
+        MPSGraphTensor* invertedMask = [ctx.graph subtractionWithPrimaryTensor:onesLike
+                                                              secondaryTensor:mask
+                                                                         name:nil];
+
+        // Step 4: Multiply inverted mask by fillTensor (broadcast).
+        MPSGraphTensor* fillBroadcast = [ctx.graph multiplicationWithPrimaryTensor:invertedMask
+                                                                  secondaryTensor:fillTensor
+                                                                             name:nil];
+
+        // Step 5: Add to padded input.
+        MPSGraphTensor* result = [ctx.graph additionWithPrimaryTensor:paddedInput
+                                                     secondaryTensor:fillBroadcast
+                                                                name:nil];
+        if (!result) {
+            setError(error, 37, @"pad with fill value failed");
             return NULL;
         }
         return (__bridge void*)result;
@@ -754,12 +787,12 @@ MPSGraphTensorHandle mpsgraph_scatter_nd(MPSGraphContextHandle handle,
             default: scatterMode = MPSGraphScatterModeSet; break;
         }
 
-        MPSGraphTensor* result = [ctx.graph scatterNDWithUpdatesTensor:upd
-                                                        indicesTensor:idx
-                                                                shape:shapeArr
-                                                       batchDimensions:0
-                                                                  mode:scatterMode
-                                                                  name:nil];
+        MPSGraphTensor* result = [ctx.graph scatterNDWithDataTensor:d
+                                                    updatesTensor:upd
+                                                    indicesTensor:idx
+                                                   batchDimensions:0
+                                                              mode:scatterMode
+                                                              name:nil];
         if (!result) {
             setError(error, 72, @"scatter_nd failed");
             return NULL;
@@ -1204,6 +1237,7 @@ MPSGraphExecHandle mpsgraph_compile(MPSGraphContextHandle handle,
         }
 
         // DEBUG: Log compilation info for large graphs.
+#ifdef DEBUG
         if (numFeeds > 10) {
             fprintf(stderr, "[COMPILE] numFeeds=%d, numTargets=%d\n", numFeeds, numTargets);
             fprintf(stderr, "[COMPILE] execFeeds.count=%lu, execTargets.count=%lu\n",
@@ -1221,6 +1255,7 @@ MPSGraphExecHandle mpsgraph_compile(MPSGraphContextHandle handle,
             }
             fflush(stderr);
         }
+#endif
 
         return (__bridge_retained void*)wrapper;
     }
@@ -1247,8 +1282,7 @@ bool mpsgraph_execute(MPSGraphExecHandle handle,
 
         @try {
 
-        // Build feeds dictionary for non-compiled execution.
-        // Uses original feed tensors in our order — no permutation needed.
+        // Use the compiled MPSGraphExecutable for execution.
         MPSGraphDevice* graphDevice = [MPSGraphDevice deviceWithMTLDevice:wrapper.device];
 
         // Verify feed/target counts match.
@@ -1265,10 +1299,8 @@ bool mpsgraph_execute(MPSGraphExecHandle handle,
             return false;
         }
 
-        // Build feeds dictionary: MPSGraphTensor* → MPSGraphTensorData*
-        NSMutableDictionary<MPSGraphTensor*, MPSGraphTensorData*>* feedsDict =
-            [NSMutableDictionary dictionaryWithCapacity:numInputs];
-
+        // Build MPSGraphTensorData array for inputs in our caller order.
+        NSMutableArray<MPSGraphTensorData*>* callerInputs = [NSMutableArray arrayWithCapacity:numInputs];
         for (int i = 0; i < numInputs; i++) {
             if (inputData[i] == NULL) {
                 NSString* msg = [NSString stringWithFormat:@"Input %d has NULL data pointer (size=%lld bytes)", i, inputSizes[i]];
@@ -1279,16 +1311,28 @@ bool mpsgraph_execute(MPSGraphExecHandle handle,
             MPSDataType mpsType = toMPSDataType(inputDtypes[i]);
             NSArray<NSNumber*>* shape = shapeArray(inputShapes[i], inputRanks[i]);
 
-            // Copy input data to NSData. We used to try zero-copy (dataWithBytesNoCopy)
-            // but Metal needs its own copy for GPU access.
+            // Copy input data to NSData. Metal needs its own copy for GPU access.
             NSData* data = [NSData dataWithBytes:inputData[i] length:(NSUInteger)inputSizes[i]];
             MPSGraphTensorData* tensorData = [[MPSGraphTensorData alloc] initWithDevice:graphDevice
                                                                                    data:data
                                                                                   shape:shape
                                                                                dataType:mpsType];
-            feedsDict[wrapper.origFeedTensors[i]] = tensorData;
+            [callerInputs addObject:tensorData];
         }
 
+        // Reorder inputs from caller order to executable's feed order using feedPermutation.
+        // feedPermutation[i] = index in caller's array for executable's i-th feed.
+        NSMutableArray<MPSGraphTensorData*>* execInputs = [NSMutableArray arrayWithCapacity:numInputs];
+        if (wrapper.feedPermutation) {
+            for (NSUInteger i = 0; i < (NSUInteger)numInputs; i++) {
+                NSUInteger callerIdx = [wrapper.feedPermutation[i] unsignedIntegerValue];
+                [execInputs addObject:callerInputs[callerIdx]];
+            }
+        } else {
+            [execInputs addObjectsFromArray:callerInputs];
+        }
+
+#ifdef DEBUG
         if (numInputs > 10) {
             int64_t totalBytes = 0;
             for (int i = 0; i < numInputs; i++) totalBytes += inputSizes[i];
@@ -1296,25 +1340,23 @@ bool mpsgraph_execute(MPSGraphExecHandle handle,
                 numInputs, numOutputs, totalBytes / (1024*1024));
             fflush(stderr);
         }
+#endif
 
-        // Use encodeToCommandBuffer for explicit control over the Metal command buffer lifecycle.
-        // This is more reliable than runWithMTLCommandQueue for complex graphs because it
-        // avoids internal command buffer management issues in MPSGraph.
+        // Use encodeToCommandBuffer on the compiled executable.
         MPSCommandBuffer* commandBuffer = [MPSCommandBuffer commandBufferFromCommandQueue:wrapper.commandQueue];
         if (!commandBuffer) {
             setError(error, 118, @"Failed to create MPSCommandBuffer");
             return false;
         }
 
-        MPSGraphExecutionDescriptor* execDesc = [[MPSGraphExecutionDescriptor alloc] init];
+        MPSGraphExecutableExecutionDescriptor* execDesc = [[MPSGraphExecutableExecutionDescriptor alloc] init];
 
-        // encodeToCommandBuffer returns a dictionary (tensor → tensor data).
-        NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* resultDict =
-            [wrapper.graph encodeToCommandBuffer:commandBuffer
-                                           feeds:feedsDict
-                                   targetTensors:wrapper.origTargetTensors
-                                targetOperations:nil
-                             executionDescriptor:execDesc];
+        // The executable returns an array of MPSGraphTensorData in its target order.
+        NSArray<MPSGraphTensorData*>* resultsArray =
+            [wrapper.executable encodeToCommandBuffer:commandBuffer
+                                          inputsArray:execInputs
+                                         resultsArray:nil
+                                  executionDescriptor:execDesc];
 
         [commandBuffer commit];
         [commandBuffer waitUntilCompleted];
@@ -1325,26 +1367,43 @@ bool mpsgraph_execute(MPSGraphExecHandle handle,
             return false;
         }
 
+#ifdef DEBUG
         if (numInputs > 10) {
-            fprintf(stderr, "[EXEC] encodeToCommandBuffer completed, resultDict.count=%lu\n",
-                (unsigned long)(resultDict ? resultDict.count : 0));
+            fprintf(stderr, "[EXEC] encodeToCommandBuffer completed, resultsArray.count=%lu\n",
+                (unsigned long)(resultsArray ? resultsArray.count : 0));
             fflush(stderr);
         }
+#endif
 
-        if (!resultDict) {
-            setError(error, 111, @"MPSGraph encodeToCommandBuffer returned nil");
+        if (!resultsArray || resultsArray.count == 0) {
+            setError(error, 111, @"MPSGraphExecutable encodeToCommandBuffer returned nil/empty results");
             return false;
         }
 
-        // Copy output data back. Look up each target tensor in the result dictionary.
+        // Copy output data back. The executable's results are in its target order.
+        // targetPermutation[i] = index in caller's array for executable's i-th target.
+        // We need to map from executable order to caller order.
         for (int i = 0; i < numOutputs; i++) {
-            MPSGraphTensor* targetTensor = wrapper.origTargetTensors[i];
-            MPSGraphTensorData* result = resultDict[targetTensor];
-            if (!result) {
-                NSString* msg = [NSString stringWithFormat:@"No result for target tensor at index %d", i];
+            // Find which executable result index corresponds to caller output index i.
+            NSUInteger execIdx = (NSUInteger)i;
+            if (wrapper.targetPermutation) {
+                // targetPermutation maps exec index -> caller index.
+                // We need the reverse: for caller index i, find exec index.
+                for (NSUInteger j = 0; j < wrapper.targetPermutation.count; j++) {
+                    if ([wrapper.targetPermutation[j] unsignedIntegerValue] == (NSUInteger)i) {
+                        execIdx = j;
+                        break;
+                    }
+                }
+            }
+
+            if (execIdx >= resultsArray.count) {
+                NSString* msg = [NSString stringWithFormat:@"Result index %lu out of bounds (count=%lu) for output %d",
+                    (unsigned long)execIdx, (unsigned long)resultsArray.count, i];
                 setError(error, 117, msg);
                 return false;
             }
+            MPSGraphTensorData* result = resultsArray[execIdx];
             MPSNDArray* ndarray = result.mpsndarray;
             if (outputData[i] == NULL) {
                 NSString* msg = [NSString stringWithFormat:@"Output %d has NULL data pointer", i];
@@ -1481,6 +1540,9 @@ MPSGraphTensorHandle mpsgraph_pool2d(MPSGraphContextHandle handle, MPSGraphTenso
         desc.paddingRight = (NSUInteger)padAfter[1];
         desc.paddingTop = (NSUInteger)padBefore[0];
         desc.paddingBottom = (NSUInteger)padAfter[0];
+        if (mode == 1) {
+            desc.includeZeroPadToAverage = YES;
+        }
 
         MPSGraphTensor* result = nil;
         switch (mode) {

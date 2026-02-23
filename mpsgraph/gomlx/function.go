@@ -1,6 +1,6 @@
 // Copyright 2023-2026 The GoMLX Authors. SPDX-License-Identifier: Apache-2.0
 
-//go:build darwin
+//go:build darwin && cgo
 
 package mpsgraph
 
@@ -109,7 +109,10 @@ func (f *Function) Parent() backends.Function {
 
 // Closure creates a closure function with its own MPSGraph context.
 func (f *Function) Closure() (backends.Function, error) {
-	ctx, err := bridge.NewContext()
+	if f.builder.backend.ctx == nil {
+		return nil, errors.New("Closure: backend context is nil")
+	}
+	ctx, err := bridge.NewContextWithDevice(f.builder.backend.ctx.DeviceHandle())
 	if err != nil {
 		return nil, errors.Wrap(err, "Closure: creating context")
 	}
@@ -196,6 +199,29 @@ func (f *Function) resolveNodes(name string, values ...backends.Value) ([]*graph
 		nodes[i] = n
 	}
 	return nodes, nil
+}
+
+// makeScalarConst creates a scalar constant of the given dtype with the given float64 value.
+// It creates the constant as float32 and then casts to the target dtype if needed.
+func (f *Function) makeScalarConst(val float64, dt dtypes.DType) (bridge.Tensor, error) {
+	f32Val := float32(val)
+	tensor, err := f.ctx().Constant(unsafe.Pointer(&f32Val), 4, dtypeToBridgeDType(dtypes.Float32), []int64{1})
+	if err != nil {
+		return nil, err
+	}
+	// Reshape to scalar
+	tensor, err = f.ctx().Reshape(tensor, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Cast to target dtype if not already float32
+	if dt != dtypes.Float32 {
+		tensor, err = f.ctx().Cast(tensor, dtypeToBridgeDType(dt))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return tensor, nil
 }
 
 // validateClosure validates that a backends.Function is a compiled closure of the current function.
@@ -1176,38 +1202,6 @@ func (f *Function) Iota(shape shapes.Shape, iotaAxis int) (backends.Value, error
 // Matrix Operations
 // ===========================================================================
 
-func (f *Function) Dot(lhs, rhs backends.Value) (backends.Value, error) {
-	nodes, err := f.resolveNodes("Dot", lhs, rhs)
-	if err != nil {
-		return nil, err
-	}
-	lhsShape := nodes[0].shape
-	rhsShape := nodes[1].shape
-
-	// Dot product: [M,K] x [K,N] → [M,N], or [K] x [K] → scalar.
-	var outShape shapes.Shape
-	switch {
-	case lhsShape.Rank() == 2 && rhsShape.Rank() == 2:
-		if lhsShape.Dimensions[1] != rhsShape.Dimensions[0] {
-			return nil, errors.Errorf("Dot: incompatible shapes %s and %s", lhsShape, rhsShape)
-		}
-		outShape = shapes.Make(lhsShape.DType, lhsShape.Dimensions[0], rhsShape.Dimensions[1])
-	case lhsShape.Rank() == 1 && rhsShape.Rank() == 1:
-		if lhsShape.Dimensions[0] != rhsShape.Dimensions[0] {
-			return nil, errors.Errorf("Dot: incompatible shapes %s and %s", lhsShape, rhsShape)
-		}
-		outShape = shapes.Make(lhsShape.DType)
-	default:
-		return nil, errors.Errorf("Dot: unsupported rank combination %d and %d", lhsShape.Rank(), rhsShape.Rank())
-	}
-
-	tensor, err := f.ctx().MatMul(nodes[0].tensor, nodes[1].tensor)
-	if err != nil {
-		return nil, errors.Wrap(err, "Dot")
-	}
-	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
-}
-
 // DotGeneral is implemented in dotgeneral.go.
 
 // ===========================================================================
@@ -1374,14 +1368,9 @@ func (f *Function) BatchNormForTraining(
 	for _, ax := range batchAxes {
 		batchSize *= int64(opNode.shape.Dimensions[ax])
 	}
-	countVal := float32(batchSize)
-	countTensor, err := f.ctx().Constant(unsafe.Pointer(&countVal), 4, dtypeToBridgeDType(dt), []int64{1})
+	countTensor, err := f.makeScalarConst(float64(batchSize), dt)
 	if err != nil {
 		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: count constant")
-	}
-	countTensor, err = f.ctx().Reshape(countTensor, nil) // scalar
-	if err != nil {
-		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: count reshape")
 	}
 	meanTensor, err = f.ctx().Div(meanTensor, countTensor)
 	if err != nil {
@@ -1409,14 +1398,9 @@ func (f *Function) BatchNormForTraining(
 	}
 
 	// Normalize: (operand - mean) / sqrt(variance + epsilon)
-	epsVal := float32(epsilon)
-	epsTensor, err := f.ctx().Constant(unsafe.Pointer(&epsVal), 4, dtypeToBridgeDType(dt), []int64{1})
+	epsTensor, err := f.makeScalarConst(float64(epsilon), dt)
 	if err != nil {
 		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: epsilon constant")
-	}
-	epsTensor, err = f.ctx().Reshape(epsTensor, nil) // scalar
-	if err != nil {
-		return nil, nil, nil, errors.Wrap(err, "BatchNormForTraining: epsilon reshape")
 	}
 	varPlusEps, err := f.ctx().Add(varTensor, epsTensor)
 	if err != nil {
@@ -1507,14 +1491,9 @@ func (f *Function) BatchNormGradient(
 	// aligned with the featureAxis.
 
 	// invStd = 1 / sqrt(variance + epsilon)
-	epsVal := float32(epsilon)
-	epsTensor, err := f.ctx().Constant(unsafe.Pointer(&epsVal), 4, dtypeToBridgeDType(dt), []int64{1})
+	epsTensor, err := f.makeScalarConst(float64(epsilon), dt)
 	if err != nil {
 		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: epsilon constant")
-	}
-	epsTensor, err = f.ctx().Reshape(epsTensor, nil)
-	if err != nil {
-		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: epsilon reshape")
 	}
 	varPlusEps, err := f.ctx().Add(varNode.tensor, epsTensor)
 	if err != nil {
@@ -1553,23 +1532,13 @@ func (f *Function) BatchNormGradient(
 
 	// gradOperand = (1/N) * scale * invStd * (N * gradOutput - sum(gradOutput) - xhat * sum(gradOutput * xhat))
 	// This is the standard batch norm gradient formula.
-	nVal := float32(batchSize)
-	nTensor, err := f.ctx().Constant(unsafe.Pointer(&nVal), 4, dtypeToBridgeDType(dt), []int64{1})
+	nTensor, err := f.makeScalarConst(float64(batchSize), dt)
 	if err != nil {
 		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: N constant")
 	}
-	nTensor, err = f.ctx().Reshape(nTensor, nil)
-	if err != nil {
-		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: N reshape")
-	}
-	invNVal := float32(1.0 / float64(batchSize))
-	invNTensor, err := f.ctx().Constant(unsafe.Pointer(&invNVal), 4, dtypeToBridgeDType(dt), []int64{1})
+	invNTensor, err := f.makeScalarConst(1.0/float64(batchSize), dt)
 	if err != nil {
 		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: 1/N constant")
-	}
-	invNTensor, err = f.ctx().Reshape(invNTensor, nil)
-	if err != nil {
-		return nil, nil, nil, errors.Wrap(err, "BatchNormGradient: 1/N reshape")
 	}
 
 	// term1 = N * gradOutput
@@ -1767,9 +1736,7 @@ func (f *Function) RNGBitGenerator(state backends.Value, shape shapes.Shape) (ne
 		}
 		// Scale [0, 1) → [0, 2^32) so the calling code's pipeline
 		// (ConvertDType + MulScalar(1/2^32)) produces correct [0, 1) uniform.
-		scaleVal := float32(4294967296.0) // 2^32
-		scaleTensor, err := f.ctx().Constant(
-			unsafe.Pointer(&scaleVal), 4, dtypeToBridgeDType(dtypes.Float32), []int64{1})
+		scaleTensor, err := f.makeScalarConst(4294967296.0, dtypes.Float32) // 2^32
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "RNGBitGenerator: scale constant")
 		}
@@ -1779,8 +1746,26 @@ func (f *Function) RNGBitGenerator(state backends.Value, shape shapes.Shape) (ne
 		}
 	}
 
-	// Pass the GoMLX RNG state through unchanged (MPSGraph manages its own state).
-	newStateNode := &graphNode{tensor: stateNode.tensor, shape: stateNode.shape, owner: f}
+	// Advance the RNG state by adding 1 to the state tensor, so subsequent calls
+	// produce different random values.
+	one, err := f.makeScalarConst(1.0, stateNode.shape.DType)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "RNGBitGenerator: creating state increment")
+	}
+	// Broadcast to state shape.
+	stateDims := make([]int64, stateNode.shape.Rank())
+	for i, d := range stateNode.shape.Dimensions {
+		stateDims[i] = int64(d)
+	}
+	one, err = f.ctx().BroadcastTo(one, stateDims)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "RNGBitGenerator: broadcasting state increment")
+	}
+	newStateTensor, err := f.ctx().Add(stateNode.tensor, one)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "RNGBitGenerator: advancing state")
+	}
+	newStateNode := &graphNode{tensor: newStateTensor, shape: stateNode.shape, owner: f}
 	valuesNode := &graphNode{tensor: valuesTensor, shape: shape, owner: f}
 	return newStateNode, valuesNode, nil
 }
@@ -1975,14 +1960,7 @@ func (f *Function) dilateAxis(tensor bridge.Tensor, axis int, axisSize, dilation
 	padAfter := make([]int64, rank+1)
 	padAfter[axis+1] = dilation - 1
 
-	zeroVal := float32(0)
-	zeroTensor, err := f.ctx().Constant(
-		unsafe.Pointer(&zeroVal), 4, dtypeToBridgeDType(dtype), []int64{1})
-	if err != nil {
-		return nil, err
-	}
-	// Reshape zero to scalar for pad.
-	zeroTensor, err = f.ctx().Reshape(zeroTensor, nil)
+	zeroTensor, err := f.makeScalarConst(0, dtype)
 	if err != nil {
 		return nil, err
 	}
@@ -2225,15 +2203,10 @@ func (f *Function) ReduceWindow(
 
 	// For sum pooling, convert avg to sum by multiplying by window area.
 	if isSum {
-		windowArea := float32(axesInfo.spatialWindow[0] * axesInfo.spatialWindow[1])
-		areaTensor, err := f.ctx().Constant(
-			unsafe.Pointer(&windowArea), 4, dtypeToBridgeDType(node.shape.DType), []int64{1})
+		windowArea := float64(axesInfo.spatialWindow[0] * axesInfo.spatialWindow[1])
+		areaTensor, err := f.makeScalarConst(windowArea, node.shape.DType)
 		if err != nil {
 			return nil, errors.Wrap(err, "ReduceWindow: window area constant")
-		}
-		areaTensor, err = f.ctx().Reshape(areaTensor, nil) // scalar
-		if err != nil {
-			return nil, errors.Wrap(err, "ReduceWindow: reshape area")
 		}
 		tensor, err = f.ctx().Mul(tensor, areaTensor)
 		if err != nil {
@@ -2401,12 +2374,8 @@ func (f *Function) FusedGelu(x backends.Value, exact bool) (backends.Value, erro
 	}
 	dt := node.shape.DType
 
-	makeConst := func(val float32) (bridge.Tensor, error) {
-		t, err := f.ctx().Constant(unsafe.Pointer(&val), 4, dtypeToBridgeDType(dt), []int64{1})
-		if err != nil {
-			return nil, err
-		}
-		return f.ctx().Reshape(t, nil) // scalar
+	makeConst := func(val float64) (bridge.Tensor, error) {
+		return f.makeScalarConst(val, dt)
 	}
 
 	if exact {
@@ -2551,14 +2520,9 @@ func (f *Function) FusedLayerNorm(x backends.Value, axes []int, epsilon float64,
 		numElements *= int64(node.shape.Dimensions[ax])
 	}
 	dt := node.shape.DType
-	countVal := float32(numElements)
-	countTensor, err := f.ctx().Constant(unsafe.Pointer(&countVal), 4, dtypeToBridgeDType(dt), []int64{1})
+	countTensor, err := f.makeScalarConst(float64(numElements), dt)
 	if err != nil {
 		return nil, errors.Wrap(err, "FusedLayerNorm: count constant")
-	}
-	countTensor, err = f.ctx().Reshape(countTensor, nil) // scalar
-	if err != nil {
-		return nil, errors.Wrap(err, "FusedLayerNorm: count reshape")
 	}
 
 	// mean = sum / count
@@ -2588,14 +2552,9 @@ func (f *Function) FusedLayerNorm(x backends.Value, axes []int, epsilon float64,
 	}
 
 	// variance + epsilon
-	epsVal := float32(epsilon)
-	epsTensor, err := f.ctx().Constant(unsafe.Pointer(&epsVal), 4, dtypeToBridgeDType(dt), []int64{1})
+	epsTensor, err := f.makeScalarConst(epsilon, dt)
 	if err != nil {
 		return nil, errors.Wrap(err, "FusedLayerNorm: epsilon constant")
-	}
-	epsTensor, err = f.ctx().Reshape(epsTensor, nil) // scalar
-	if err != nil {
-		return nil, errors.Wrap(err, "FusedLayerNorm: epsilon reshape")
 	}
 	varPlusEps, err := f.ctx().Add(varTensor, epsTensor)
 	if err != nil {
@@ -2711,7 +2670,7 @@ func (f *Function) FusedDense(x, weight, bias backends.Value, activation backend
 	}
 
 	// Step 1: Matmul via DotGeneral: contract x's last axis with weight's first axis.
-	result, err := f.DotGeneral(x, []int{xNode.shape.Rank() - 1}, nil, weight, []int{0}, nil)
+	result, err := f.DotGeneral(x, []int{xNode.shape.Rank() - 1}, nil, weight, []int{0}, nil, backends.DotGeneralConfig{})
 	if err != nil {
 		return nil, errors.Wrap(err, "FusedDense: DotGeneral")
 	}
@@ -2759,14 +2718,9 @@ func (f *Function) FusedDense(x, weight, bias backends.Value, activation backend
 	case backends.ActivationRelu:
 		// ReLU: max(0, x)
 		dt := resultNode.shape.DType
-		zeroVal := float32(0)
-		zeroTensor, err := f.ctx().Constant(unsafe.Pointer(&zeroVal), 4, dtypeToBridgeDType(dt), []int64{1})
+		zeroTensor, err := f.makeScalarConst(0, dt)
 		if err != nil {
 			return nil, errors.Wrap(err, "FusedDense: ReLU zero constant")
-		}
-		zeroTensor, err = f.ctx().Reshape(zeroTensor, nil) // scalar
-		if err != nil {
-			return nil, errors.Wrap(err, "FusedDense: ReLU zero reshape")
 		}
 		tensor, err := f.ctx().Max(resultNode.tensor, zeroTensor)
 		if err != nil {
@@ -2877,7 +2831,8 @@ func (f *Function) FusedScaledDotProductAttention(
 	// Q: [B,H,Sq,D], K: [B,H,Sk,D] → scores: [B,H,Sq,Sk]
 	scores, err := f.DotGeneral(
 		query, []int{3}, []int{0, 1}, // contract dim(3), batch [B(0),H(1)]
-		kvKey, []int{3}, []int{0, 1}) // contract dim(3), batch [B(0),H(1)]
+		kvKey, []int{3}, []int{0, 1}, // contract dim(3), batch [B(0),H(1)]
+		backends.DotGeneralConfig{})
 	if err != nil {
 		return nil, errors.Wrap(err, "SDPA: scores matmul")
 	}
@@ -2888,14 +2843,9 @@ func (f *Function) FusedScaledDotProductAttention(
 		return nil, errors.Wrap(err, "SDPA: cast scores")
 	}
 	dt := scoresNode.shape.DType
-	scaleVal := float32(scale)
-	scaleTensor, err := f.ctx().Constant(unsafe.Pointer(&scaleVal), 4, dtypeToBridgeDType(dt), []int64{1})
+	scaleTensor, err := f.makeScalarConst(scale, dt)
 	if err != nil {
 		return nil, errors.Wrap(err, "SDPA: scale constant")
-	}
-	scaleTensor, err = f.ctx().Reshape(scaleTensor, nil) // scalar
-	if err != nil {
-		return nil, errors.Wrap(err, "SDPA: scale reshape")
 	}
 	scaledTensor, err := f.ctx().Mul(scoresNode.tensor, scaleTensor)
 	if err != nil {
@@ -2926,7 +2876,49 @@ func (f *Function) FusedScaledDotProductAttention(
 		if err != nil {
 			return nil, errors.Wrap(err, "SDPA: causal mask reshape")
 		}
-		mask = causalMask
+		if mask != nil {
+			// Combine causal mask with provided mask.
+			maskNode, mErr := f.resolveNode(mask)
+			if mErr != nil {
+				return nil, errors.Wrap(mErr, "SDPA: resolve mask for causal combine")
+			}
+			if maskNode.shape.DType == dtypes.Bool {
+				// Boolean masks: AND them together.
+				mask, err = f.LogicalAnd(mask, causalMask)
+				if err != nil {
+					return nil, errors.Wrap(err, "SDPA: combining boolean masks")
+				}
+			} else {
+				// Additive mask: convert causal to additive (-inf where false, 0 where true)
+				// and add to the existing additive mask.
+				causalNode, cErr := f.resolveNode(causalMask)
+				if cErr != nil {
+					return nil, errors.Wrap(cErr, "SDPA: resolve causal mask")
+				}
+				negInfTensor, cErr := f.makeScalarConst(math.Inf(-1), dt)
+				if cErr != nil {
+					return nil, errors.Wrap(cErr, "SDPA: causal -inf constant")
+				}
+				zeroTensor, cErr := f.makeScalarConst(0, dt)
+				if cErr != nil {
+					return nil, errors.Wrap(cErr, "SDPA: causal zero constant")
+				}
+				// Where(causalBool, 0, -inf) to create additive causal mask
+				additiveCausal, cErr := f.ctx().Where(causalNode.tensor, zeroTensor, negInfTensor)
+				if cErr != nil {
+					return nil, errors.Wrap(cErr, "SDPA: causal to additive")
+				}
+				additiveCausalNode := &graphNode{tensor: additiveCausal, shape: causalNode.shape, owner: f}
+				// Note: causalNode shape has Bool dtype, but additiveCausal is float - fix shape
+				additiveCausalNode.shape = shapes.Make(dt, causalNode.shape.Dimensions...)
+				mask, err = f.Add(mask, additiveCausalNode)
+				if err != nil {
+					return nil, errors.Wrap(err, "SDPA: combining additive masks")
+				}
+			}
+		} else {
+			mask = causalMask
+		}
 	}
 
 	// Apply mask to scores.
@@ -2938,14 +2930,9 @@ func (f *Function) FusedScaledDotProductAttention(
 
 		if maskNode.shape.DType == dtypes.Bool {
 			// Boolean mask: where mask is false, set score to -inf.
-			negInfVal := float32(math.Inf(-1))
-			negInfTensor, err := f.ctx().Constant(unsafe.Pointer(&negInfVal), 4, dtypeToBridgeDType(dt), []int64{1})
+			negInfTensor, err := f.makeScalarConst(math.Inf(-1), dt)
 			if err != nil {
 				return nil, errors.Wrap(err, "SDPA: -inf constant")
-			}
-			negInfTensor, err = f.ctx().Reshape(negInfTensor, nil)
-			if err != nil {
-				return nil, errors.Wrap(err, "SDPA: -inf reshape")
 			}
 			// Broadcast -inf to scores shape.
 			scoresNode, _ = f.resolveNode(scores)
@@ -2989,7 +2976,8 @@ func (f *Function) FusedScaledDotProductAttention(
 	// scores: [B,H,Sq,Sk], V: [B,H,Sk,D] → output: [B,H,Sq,D]
 	output, err := f.DotGeneral(
 		scores, []int{3}, []int{0, 1}, // contract Sk(3), batch [B(0),H(1)]
-		kvValue, []int{2}, []int{0, 1}) // contract Sk(2), batch [B(0),H(1)]
+		kvValue, []int{2}, []int{0, 1}, // contract Sk(2), batch [B(0),H(1)]
+		backends.DotGeneralConfig{})
 	if err != nil {
 		return nil, errors.Wrap(err, "SDPA: output matmul")
 	}
@@ -3085,7 +3073,7 @@ func (f *Function) FusedAttentionQKVProjection(
 	}
 
 	// Step 1: Combined matmul: x @ wQKV → [batch..., queryDim + 2*keyValueDim]
-	combined, err := f.DotGeneral(x, []int{xNode.shape.Rank() - 1}, nil, wQKV, []int{0}, nil)
+	combined, err := f.DotGeneral(x, []int{xNode.shape.Rank() - 1}, nil, wQKV, []int{0}, nil, backends.DotGeneralConfig{})
 	if err != nil {
 		return nil, nil, nil, errors.Wrap(err, "FusedAttentionQKVProjection: DotGeneral")
 	}
