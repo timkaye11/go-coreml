@@ -100,6 +100,22 @@ func NewContext() (*Context, error) {
 	return &Context{handle: handle}, nil
 }
 
+// NewContextWithDevice creates a new MPSGraph context reusing an existing Metal device.
+// This avoids creating redundant MTLDevice objects when multiple builders share the same GPU.
+func NewContextWithDevice(deviceHandle unsafe.Pointer) (*Context, error) {
+	var cErr C.MPSGraphError
+	handle := C.mpsgraph_create_context_with_device(deviceHandle, &cErr)
+	if err := extractError(cErr); err != nil {
+		return nil, err
+	}
+	return &Context{handle: handle}, nil
+}
+
+// DeviceHandle returns the raw MTLDevice pointer for sharing across contexts.
+func (c *Context) DeviceHandle() unsafe.Pointer {
+	return C.mpsgraph_device_handle(c.handle)
+}
+
 // Destroy releases the context and all associated MPSGraph resources.
 func (c *Context) Destroy() {
 	if c.handle != nil {
@@ -822,6 +838,12 @@ type ExecOutput struct {
 
 // Execute runs the compiled graph with the given inputs and writes results to outputs.
 func (e *Exec) Execute(inputs []ExecInput, outputs []ExecOutput) error {
+	// Lock this goroutine to a single OS thread for the entire Metal execution.
+	// This prevents the Go scheduler from moving us between threads mid-execution,
+	// which can cause Metal/MPSGraph corruption.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	var cErr C.MPSGraphError
 	numInputs := len(inputs)
 	numOutputs := len(outputs)

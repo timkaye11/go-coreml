@@ -7,6 +7,7 @@ package mpsgraph
 import (
 	"math"
 	"reflect"
+	"runtime"
 	"unsafe"
 
 	"github.com/gomlx/go-coreml/mpsgraph/gomlx/internal/bridge"
@@ -347,6 +348,7 @@ func (f *Function) Constant(flat any, dims ...int) (backends.Value, error) {
 	}
 
 	tensor, err := f.ctx().Constant(dataPtr, nbytes, bridgeDType, shapeDims)
+	runtime.KeepAlive(flat) // Prevent GC from collecting flat during CGo call
 	if err != nil {
 		return nil, errors.Wrap(err, "Constant")
 	}

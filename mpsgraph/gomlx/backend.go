@@ -7,6 +7,8 @@
 package mpsgraph
 
 import (
+	"sync"
+
 	"github.com/gomlx/go-coreml/mpsgraph/gomlx/internal/bridge"
 	"github.com/gomlx/gomlx/backends"
 	"github.com/gomlx/gomlx/pkg/core/shapes"
@@ -20,6 +22,7 @@ const BackendName = "mpsgraph"
 type Backend struct {
 	ctx         *bridge.Context
 	deviceName  string
+	mu          sync.RWMutex
 	isFinalized bool
 }
 
@@ -63,9 +66,9 @@ func (b *Backend) Capabilities() backends.Capabilities {
 	return backendCapabilities
 }
 
-// Builder creates a new computation builder.
+// Builder creates a new computation builder, reusing the backend's Metal device.
 func (b *Backend) Builder(name string) backends.Builder {
-	ctx, err := bridge.NewContext()
+	ctx, err := bridge.NewContextWithDevice(b.ctx.DeviceHandle())
 	if err != nil {
 		// Graph building functions panic on error per GoMLX convention.
 		panic(errors.Wrapf(err, "creating MPSGraph builder %q", name))
@@ -75,6 +78,8 @@ func (b *Backend) Builder(name string) backends.Builder {
 
 // Finalize releases all backend resources.
 func (b *Backend) Finalize() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.isFinalized {
 		return
 	}
@@ -87,6 +92,8 @@ func (b *Backend) Finalize() {
 
 // IsFinalized returns whether the backend has been finalized.
 func (b *Backend) IsFinalized() bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	return b.isFinalized
 }
 

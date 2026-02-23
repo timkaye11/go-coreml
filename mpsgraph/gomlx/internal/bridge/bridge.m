@@ -25,10 +25,17 @@
 
 @interface MPSGraphExecWrapper : NSObject
 @property (nonatomic, strong) MPSGraphExecutable* executable;
+@property (nonatomic, strong) MPSGraph* graph;  // Original graph for non-compiled execution
 @property (nonatomic, strong) id<MTLDevice> device;
 @property (nonatomic, strong) id<MTLCommandQueue> commandQueue;
 @property (nonatomic, strong) NSArray<MPSGraphTensor*>* feedTensors;
 @property (nonatomic, strong) NSArray<MPSGraphTensor*>* targetTensors;
+// Original feed/target tensors in our order (for non-compiled fallback).
+@property (nonatomic, strong) NSArray<MPSGraphTensor*>* origFeedTensors;
+@property (nonatomic, strong) NSArray<MPSGraphTensor*>* origTargetTensors;
+// Permutation from our feed order to executable's feed order.
+@property (nonatomic, strong) NSArray<NSNumber*>* feedPermutation;
+@property (nonatomic, strong) NSArray<NSNumber*>* targetPermutation;
 @end
 
 @implementation MPSGraphExecWrapper
@@ -119,6 +126,38 @@ MPSGraphContextHandle mpsgraph_create_context(MPSGraphError* error) {
 
         return (__bridge_retained void*)ctx;
     }
+}
+
+MPSGraphContextHandle mpsgraph_create_context_with_device(void* deviceHandle, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+
+        id<MTLDevice> device = (__bridge id<MTLDevice>)deviceHandle;
+        if (!device) {
+            setError(error, 1, @"NULL device handle passed to create_context_with_device");
+            return NULL;
+        }
+
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        if (!queue) {
+            setError(error, 2, @"Failed to create Metal command queue");
+            return NULL;
+        }
+
+        MPSGraphContext* ctx = [[MPSGraphContext alloc] init];
+        ctx.device = device;
+        ctx.commandQueue = queue;
+        ctx.graph = [[MPSGraph alloc] init];
+        ctx.placeholders = [NSMutableArray array];
+
+        return (__bridge_retained void*)ctx;
+    }
+}
+
+void* mpsgraph_device_handle(MPSGraphContextHandle handle) {
+    if (!handle) return NULL;
+    MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+    return (__bridge void*)ctx.device;
 }
 
 void mpsgraph_destroy_context(MPSGraphContextHandle handle) {
@@ -1090,11 +1129,18 @@ MPSGraphExecHandle mpsgraph_compile(MPSGraphContextHandle handle,
 
         // Compile.
         MPSGraphCompilationDescriptor* compDesc = [[MPSGraphCompilationDescriptor alloc] init];
-        MPSGraphExecutable* exec = [ctx.graph compileWithDevice:[MPSGraphDevice deviceWithMTLDevice:ctx.device]
-                                                          feeds:feedsDict
-                                                  targetTensors:targetTensors
-                                               targetOperations:nil
-                                          compilationDescriptor:compDesc];
+        MPSGraphExecutable* exec = nil;
+        @try {
+            exec = [ctx.graph compileWithDevice:[MPSGraphDevice deviceWithMTLDevice:ctx.device]
+                                                              feeds:feedsDict
+                                                      targetTensors:targetTensors
+                                                   targetOperations:nil
+                                              compilationDescriptor:compDesc];
+        } @catch (NSException* exception) {
+            NSString* msg = [NSString stringWithFormat:@"Compilation threw: %@ - %@", exception.name, exception.reason];
+            setError(error, 210, msg);
+            return NULL;
+        }
         if (!exec) {
             setError(error, 110, @"MPSGraph compilation failed");
             return NULL;
@@ -1103,10 +1149,78 @@ MPSGraphExecHandle mpsgraph_compile(MPSGraphContextHandle handle,
         // Wrap in our context object.
         MPSGraphExecWrapper* wrapper = [[MPSGraphExecWrapper alloc] init];
         wrapper.executable = exec;
+        wrapper.graph = ctx.graph;  // Keep reference for non-compiled fallback
         wrapper.device = ctx.device;
         wrapper.commandQueue = ctx.commandQueue;
-        wrapper.feedTensors = [feedTensors copy];
-        wrapper.targetTensors = [targetTensors copy];
+        // Store original feed/target tensors in our order for non-compiled fallback.
+        wrapper.origFeedTensors = [feedTensors copy];
+        wrapper.origTargetTensors = [targetTensors copy];
+
+        // Build permutation from our feed order to executable's feed order.
+        // The NSDictionary used for compilation has undefined iteration order,
+        // so the compiled executable's feedTensors may differ from our order.
+        NSArray<MPSGraphTensor*>* execFeeds = exec.feedTensors;
+        if (execFeeds && execFeeds.count == (NSUInteger)numFeeds) {
+            NSMutableArray<NSNumber*>* perm = [NSMutableArray arrayWithCapacity:numFeeds];
+            bool needsReorder = false;
+            for (NSUInteger i = 0; i < execFeeds.count; i++) {
+                MPSGraphTensor* t = execFeeds[i];
+                NSUInteger ourIdx = [feedTensors indexOfObjectIdenticalTo:t];
+                if (ourIdx == NSNotFound) {
+                    perm = nil;
+                    break;
+                }
+                [perm addObject:@(ourIdx)];
+                if (ourIdx != i) needsReorder = true;
+            }
+            wrapper.feedPermutation = needsReorder ? [perm copy] : nil;
+            wrapper.feedTensors = [execFeeds copy];
+        } else {
+            wrapper.feedTensors = [feedTensors copy];
+            wrapper.feedPermutation = nil;
+            // exec.feedTensors count mismatch — use our original order.
+        }
+
+        // Build target permutation similarly.
+        NSArray<MPSGraphTensor*>* execTargets = exec.targetTensors;
+        if (execTargets && execTargets.count == (NSUInteger)numTargets) {
+            NSMutableArray<NSNumber*>* tPerm = [NSMutableArray arrayWithCapacity:numTargets];
+            bool needsReorder = false;
+            for (NSUInteger i = 0; i < execTargets.count; i++) {
+                MPSGraphTensor* t = execTargets[i];
+                NSUInteger ourIdx = [targetTensors indexOfObjectIdenticalTo:t];
+                if (ourIdx == NSNotFound) {
+                    tPerm = nil;
+                    break;
+                }
+                [tPerm addObject:@(ourIdx)];
+                if (ourIdx != i) needsReorder = true;
+            }
+            wrapper.targetPermutation = needsReorder ? [tPerm copy] : nil;
+            wrapper.targetTensors = [execTargets copy];
+        } else {
+            wrapper.targetTensors = [targetTensors copy];
+            wrapper.targetPermutation = nil;
+        }
+
+        // DEBUG: Log compilation info for large graphs.
+        if (numFeeds > 10) {
+            fprintf(stderr, "[COMPILE] numFeeds=%d, numTargets=%d\n", numFeeds, numTargets);
+            fprintf(stderr, "[COMPILE] execFeeds.count=%lu, execTargets.count=%lu\n",
+                (unsigned long)(exec.feedTensors ? exec.feedTensors.count : 0),
+                (unsigned long)(exec.targetTensors ? exec.targetTensors.count : 0));
+            fprintf(stderr, "[COMPILE] feedPermutation=%s, targetPermutation=%s\n",
+                wrapper.feedPermutation ? "YES" : "nil",
+                wrapper.targetPermutation ? "YES" : "nil");
+            if (wrapper.feedPermutation) {
+                fprintf(stderr, "[COMPILE] feedPerm: ");
+                for (NSUInteger pi = 0; pi < wrapper.feedPermutation.count; pi++) {
+                    fprintf(stderr, "%d ", [wrapper.feedPermutation[pi] intValue]);
+                }
+                fprintf(stderr, "\n");
+            }
+            fflush(stderr);
+        }
 
         return (__bridge_retained void*)wrapper;
     }
@@ -1131,59 +1245,123 @@ bool mpsgraph_execute(MPSGraphExecHandle handle,
         clearError(error);
         MPSGraphExecWrapper* wrapper = (__bridge MPSGraphExecWrapper*)handle;
 
-        // Build input tensor data array.
-        NSMutableArray<MPSGraphTensorData*>* inputsArray = [NSMutableArray arrayWithCapacity:numInputs];
-        for (int i = 0; i < numInputs; i++) {
-            MPSDataType mpsType = toMPSDataType(inputDtypes[i]);
-            NSArray<NSNumber*>* shape = shapeArray(inputShapes[i], inputRanks[i]);
+        @try {
 
-            // Create MPSNDArray descriptor.
-            MPSNDArrayDescriptor* desc = [MPSNDArrayDescriptor descriptorWithDataType:mpsType
-                                                                                shape:shape];
+        // Build feeds dictionary for non-compiled execution.
+        // Uses original feed tensors in our order — no permutation needed.
+        MPSGraphDevice* graphDevice = [MPSGraphDevice deviceWithMTLDevice:wrapper.device];
 
-            // Create MPSNDArray and copy input data.
-            MPSNDArray* ndarray = [[MPSNDArray alloc] initWithDevice:wrapper.device descriptor:desc];
-            [ndarray writeBytes:inputData[i] strideBytes:nil];
-
-            MPSGraphTensorData* tensorData = [[MPSGraphTensorData alloc] initWithMPSNDArray:ndarray];
-            [inputsArray addObject:tensorData];
+        // Verify feed/target counts match.
+        if ((NSUInteger)numInputs != wrapper.origFeedTensors.count) {
+            NSString* msg = [NSString stringWithFormat:@"Input count mismatch: got %d inputs, graph expects %lu feeds",
+                numInputs, (unsigned long)wrapper.origFeedTensors.count];
+            setError(error, 115, msg);
+            return false;
         }
-
-        // Build output tensor data array (pre-allocated).
-        NSMutableArray<MPSGraphTensorData*>* resultsArray = [NSMutableArray arrayWithCapacity:numOutputs];
-        NSMutableArray<MPSNDArray*>* outputNDArrays = [NSMutableArray arrayWithCapacity:numOutputs];
-        for (int i = 0; i < numOutputs; i++) {
-            MPSDataType mpsType = toMPSDataType(outputDtypes[i]);
-            NSArray<NSNumber*>* shape = shapeArray(outputShapes[i], outputRanks[i]);
-
-            MPSNDArrayDescriptor* desc = [MPSNDArrayDescriptor descriptorWithDataType:mpsType
-                                                                                shape:shape];
-            MPSNDArray* ndarray = [[MPSNDArray alloc] initWithDevice:wrapper.device descriptor:desc];
-            MPSGraphTensorData* tensorData = [[MPSGraphTensorData alloc] initWithMPSNDArray:ndarray];
-            [resultsArray addObject:tensorData];
-            [outputNDArrays addObject:ndarray];
-        }
-
-        // Execute.
-        NSArray<MPSGraphTensorData*>* results = [wrapper.executable
-            runWithMTLCommandQueue:wrapper.commandQueue
-                       inputsArray:inputsArray
-                      resultsArray:resultsArray
-                 executionDescriptor:nil];
-
-        if (!results || results.count != (NSUInteger)numOutputs) {
-            setError(error, 111, @"MPSGraph execution failed or returned wrong number of outputs");
+        if ((NSUInteger)numOutputs != wrapper.origTargetTensors.count) {
+            NSString* msg = [NSString stringWithFormat:@"Output count mismatch: got %d outputs, graph expects %lu targets",
+                numOutputs, (unsigned long)wrapper.origTargetTensors.count];
+            setError(error, 116, msg);
             return false;
         }
 
-        // Copy output data back.
+        // Build feeds dictionary: MPSGraphTensor* → MPSGraphTensorData*
+        NSMutableDictionary<MPSGraphTensor*, MPSGraphTensorData*>* feedsDict =
+            [NSMutableDictionary dictionaryWithCapacity:numInputs];
+
+        for (int i = 0; i < numInputs; i++) {
+            if (inputData[i] == NULL) {
+                NSString* msg = [NSString stringWithFormat:@"Input %d has NULL data pointer (size=%lld bytes)", i, inputSizes[i]];
+                setError(error, 113, msg);
+                return false;
+            }
+
+            MPSDataType mpsType = toMPSDataType(inputDtypes[i]);
+            NSArray<NSNumber*>* shape = shapeArray(inputShapes[i], inputRanks[i]);
+
+            // Copy input data to NSData. We used to try zero-copy (dataWithBytesNoCopy)
+            // but Metal needs its own copy for GPU access.
+            NSData* data = [NSData dataWithBytes:inputData[i] length:(NSUInteger)inputSizes[i]];
+            MPSGraphTensorData* tensorData = [[MPSGraphTensorData alloc] initWithDevice:graphDevice
+                                                                                   data:data
+                                                                                  shape:shape
+                                                                               dataType:mpsType];
+            feedsDict[wrapper.origFeedTensors[i]] = tensorData;
+        }
+
+        if (numInputs > 10) {
+            int64_t totalBytes = 0;
+            for (int i = 0; i < numInputs; i++) totalBytes += inputSizes[i];
+            fprintf(stderr, "[EXEC] encodeToCommandBuffer: numInputs=%d, numOutputs=%d, totalInputBytes=%lld MB\n",
+                numInputs, numOutputs, totalBytes / (1024*1024));
+            fflush(stderr);
+        }
+
+        // Use encodeToCommandBuffer for explicit control over the Metal command buffer lifecycle.
+        // This is more reliable than runWithMTLCommandQueue for complex graphs because it
+        // avoids internal command buffer management issues in MPSGraph.
+        MPSCommandBuffer* commandBuffer = [MPSCommandBuffer commandBufferFromCommandQueue:wrapper.commandQueue];
+        if (!commandBuffer) {
+            setError(error, 118, @"Failed to create MPSCommandBuffer");
+            return false;
+        }
+
+        MPSGraphExecutionDescriptor* execDesc = [[MPSGraphExecutionDescriptor alloc] init];
+
+        // encodeToCommandBuffer returns a dictionary (tensor → tensor data).
+        NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* resultDict =
+            [wrapper.graph encodeToCommandBuffer:commandBuffer
+                                           feeds:feedsDict
+                                   targetTensors:wrapper.origTargetTensors
+                                targetOperations:nil
+                             executionDescriptor:execDesc];
+
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+
+        if (commandBuffer.error) {
+            NSString* msg = [NSString stringWithFormat:@"Metal command buffer error: %@", commandBuffer.error];
+            setError(error, 119, msg);
+            return false;
+        }
+
+        if (numInputs > 10) {
+            fprintf(stderr, "[EXEC] encodeToCommandBuffer completed, resultDict.count=%lu\n",
+                (unsigned long)(resultDict ? resultDict.count : 0));
+            fflush(stderr);
+        }
+
+        if (!resultDict) {
+            setError(error, 111, @"MPSGraph encodeToCommandBuffer returned nil");
+            return false;
+        }
+
+        // Copy output data back. Look up each target tensor in the result dictionary.
         for (int i = 0; i < numOutputs; i++) {
-            MPSGraphTensorData* result = results[i];
+            MPSGraphTensor* targetTensor = wrapper.origTargetTensors[i];
+            MPSGraphTensorData* result = resultDict[targetTensor];
+            if (!result) {
+                NSString* msg = [NSString stringWithFormat:@"No result for target tensor at index %d", i];
+                setError(error, 117, msg);
+                return false;
+            }
             MPSNDArray* ndarray = result.mpsndarray;
+            if (outputData[i] == NULL) {
+                NSString* msg = [NSString stringWithFormat:@"Output %d has NULL data pointer", i];
+                setError(error, 117, msg);
+                return false;
+            }
             [ndarray readBytes:outputData[i] strideBytes:nil];
         }
 
         return true;
+
+        } @catch (NSException* exception) {
+            NSString* msg = [NSString stringWithFormat:@"MPSGraph execution threw exception: %@ - %@",
+                exception.name, exception.reason];
+            setError(error, 200, msg);
+            return false;
+        }
     }
 }
 

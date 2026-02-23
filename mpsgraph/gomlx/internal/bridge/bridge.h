@@ -46,6 +46,8 @@ typedef enum {
 
 // --- Context Lifecycle ---
 MPSGraphContextHandle mpsgraph_create_context(MPSGraphError* error);
+MPSGraphContextHandle mpsgraph_create_context_with_device(void* deviceHandle, MPSGraphError* error);
+void* mpsgraph_device_handle(MPSGraphContextHandle ctx);
 void mpsgraph_destroy_context(MPSGraphContextHandle ctx);
 const char* mpsgraph_device_name(MPSGraphContextHandle ctx);  // Caller must free()
 
