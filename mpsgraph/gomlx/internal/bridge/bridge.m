@@ -787,12 +787,12 @@ MPSGraphTensorHandle mpsgraph_scatter_nd(MPSGraphContextHandle handle,
             default: scatterMode = MPSGraphScatterModeSet; break;
         }
 
-        MPSGraphTensor* result = [ctx.graph scatterNDWithDataTensor:d
-                                                    updatesTensor:upd
-                                                    indicesTensor:idx
-                                                   batchDimensions:0
-                                                              mode:scatterMode
-                                                              name:nil];
+        MPSGraphTensor* result = [ctx.graph scatterNDWithUpdatesTensor:upd
+                                                        indicesTensor:idx
+                                                                shape:shapeArr
+                                                       batchDimensions:0
+                                                                  mode:scatterMode
+                                                                  name:nil];
         if (!result) {
             setError(error, 72, @"scatter_nd failed");
             return NULL;
