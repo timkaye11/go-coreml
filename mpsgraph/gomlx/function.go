@@ -19,6 +19,15 @@ import (
 	"github.com/pkg/errors"
 )
 
+// toInt64Slice converts []int to []int64.
+func toInt64Slice(s []int) []int64 {
+	out := make([]int64, len(s))
+	for i, v := range s {
+		out[i] = int64(v)
+	}
+	return out
+}
+
 // graphNode represents a value in the computation graph.
 type graphNode struct {
 	tensor bridge.Tensor // MPSGraphTensor handle
@@ -152,10 +161,7 @@ func (f *Function) getOrCreateCaptureNode(parentNode *graphNode) (*graphNode, er
 	}
 
 	// Create a placeholder in our own context for the captured value.
-	dims := make([]int64, nodeToCapture.shape.Rank())
-	for i, d := range nodeToCapture.shape.Dimensions {
-		dims[i] = int64(d)
-	}
+	dims := toInt64Slice(nodeToCapture.shape.Dimensions)
 	dtype := dtypeToBridgeDType(nodeToCapture.shape.DType)
 	tensor, err := f.ctx().Placeholder(dtype, dims)
 	if err != nil {
@@ -256,73 +262,23 @@ func (f *Function) compileClosure() (*Executable, error) {
 	allFeeds = append(allFeeds, f.params...)
 	allFeeds = append(allFeeds, f.capturedLocalNodes...)
 
-	info := bridge.CompileInfo{
-		Feeds:      make([]bridge.Tensor, len(allFeeds)),
-		FeedDtypes: make([]int, len(allFeeds)),
-		FeedShapes: make([][]int64, len(allFeeds)),
-		Targets:    make([]bridge.Tensor, len(f.outputs)),
-	}
-
-	for i, p := range allFeeds {
-		info.Feeds[i] = p.tensor
-		info.FeedDtypes[i] = dtypeToBridgeDType(p.shape.DType)
-		dims := p.shape.Dimensions
-		info.FeedShapes[i] = make([]int64, len(dims))
-		for j, d := range dims {
-			info.FeedShapes[i][j] = int64(d)
-		}
-	}
-
-	for i, out := range f.outputs {
-		info.Targets[i] = out.tensor
-	}
-
+	info := buildCompileInfo(allFeeds, f.outputs)
 	exec, err := ctx.Compile(info)
 	if err != nil {
 		return nil, errors.Wrap(err, "compileClosure")
 	}
 
-	inputNames := make([]string, len(allFeeds))
-	inputShapes := make([]shapes.Shape, len(allFeeds))
-	for i, p := range allFeeds {
-		inputShapes[i] = p.shape
-	}
-
-	outputShapes := make([]shapes.Shape, len(f.outputs))
-	for i, out := range f.outputs {
-		outputShapes[i] = out.shape
-	}
-
+	inputNames, inputShapes := collectParamInfo(allFeeds)
 	return &Executable{
 		backend:      f.builder.backend,
 		exec:         exec,
 		inputNames:   inputNames,
 		inputShapes:  inputShapes,
-		outputShapes: outputShapes,
+		outputShapes: collectOutputShapes(f.outputs),
 	}, nil
 }
 
-// castNode converts a backends.Value to a graphNode (simple type assertion, no capture).
-func castNode(v backends.Value) (*graphNode, error) {
-	n, ok := v.(*graphNode)
-	if !ok {
-		return nil, errors.Errorf("expected *graphNode, got %T", v)
-	}
-	return n, nil
-}
 
-// castNodes converts multiple backends.Value to graphNodes (simple, no capture).
-func castNodes(name string, values ...backends.Value) ([]*graphNode, error) {
-	nodes := make([]*graphNode, len(values))
-	for i, v := range values {
-		n, err := castNode(v)
-		if err != nil {
-			return nil, errors.Wrapf(err, "%s: input #%d", name, i)
-		}
-		nodes[i] = n
-	}
-	return nodes, nil
-}
 
 // ===========================================================================
 // Lifecycle: Parameter, Constant, Return
@@ -330,10 +286,7 @@ func castNodes(name string, values ...backends.Value) ([]*graphNode, error) {
 
 // Parameter creates an input placeholder.
 func (f *Function) Parameter(name string, shape shapes.Shape, sharding *backends.ShardingSpec) (backends.Value, error) {
-	dims := make([]int64, shape.Rank())
-	for i, d := range shape.Dimensions {
-		dims[i] = int64(d)
-	}
+	dims := toInt64Slice(shape.Dimensions)
 	dtype := dtypeToBridgeDType(shape.DType)
 	tensor, err := f.ctx().Placeholder(dtype, dims)
 	if err != nil {
@@ -365,10 +318,7 @@ func (f *Function) Constant(flat any, dims ...int) (backends.Value, error) {
 	// MPSGraph requires shape.count > 0 (no rank-0 tensors for constants).
 	// For scalars, create as [1] and reshape to scalar.
 	isScalar := len(dims) == 0
-	shapeDims := make([]int64, len(dims))
-	for i, d := range dims {
-		shapeDims[i] = int64(d)
-	}
+	shapeDims := toInt64Slice(dims)
 	if isScalar {
 		shapeDims = []int64{1}
 	}
@@ -1022,10 +972,7 @@ func (f *Function) Reshape(x backends.Value, dimensions ...int) (backends.Value,
 		return nil, errors.Wrap(err, "Reshape")
 	}
 	outShape := shapes.Make(node.shape.DType, dimensions...)
-	dims := make([]int64, len(dimensions))
-	for i, d := range dimensions {
-		dims[i] = int64(d)
-	}
+	dims := toInt64Slice(dimensions)
 	tensor, err := f.ctx().Reshape(node.tensor, dims)
 	if err != nil {
 		return nil, errors.Wrap(err, "Reshape")
@@ -1086,10 +1033,7 @@ func (f *Function) BroadcastInDim(x backends.Value, outputShape shapes.Shape, br
 	}
 
 	// Broadcast to output shape.
-	outDims := make([]int64, outputShape.Rank())
-	for i, d := range outputShape.Dimensions {
-		outDims[i] = int64(d)
-	}
+	outDims := toInt64Slice(outputShape.Dimensions)
 	tensor, err := f.ctx().BroadcastTo(reshaped, outDims)
 	if err != nil {
 		return nil, errors.Wrap(err, "BroadcastInDim: broadcast")
@@ -1136,14 +1080,9 @@ func (f *Function) Slice(operand backends.Value, starts, limits, strides []int) 
 	if err != nil {
 		return nil, errors.Wrap(err, "Slice")
 	}
-	starts64 := make([]int64, len(starts))
-	ends64 := make([]int64, len(limits))
-	strides64 := make([]int64, len(strides))
-	for i := range starts {
-		starts64[i] = int64(starts[i])
-		ends64[i] = int64(limits[i])
-		strides64[i] = int64(strides[i])
-	}
+	starts64 := toInt64Slice(starts)
+	ends64 := toInt64Slice(limits)
+	strides64 := toInt64Slice(strides)
 	tensor, err := f.ctx().Slice(node.tensor, starts64, ends64, strides64)
 	if err != nil {
 		return nil, errors.Wrap(err, "Slice")
@@ -1186,10 +1125,7 @@ func (f *Function) Reverse(x backends.Value, axes ...int) (backends.Value, error
 }
 
 func (f *Function) Iota(shape shapes.Shape, iotaAxis int) (backends.Value, error) {
-	dims := make([]int64, shape.Rank())
-	for i, d := range shape.Dimensions {
-		dims[i] = int64(d)
-	}
+	dims := toInt64Slice(shape.Dimensions)
 	dtype := dtypeToBridgeDType(shape.DType)
 	tensor, err := f.ctx().Iota(dtype, dims, iotaAxis)
 	if err != nil {
@@ -1230,10 +1166,7 @@ func (f *Function) reduceOp(opName string, opType backends.OpType, reduceType in
 	}
 	// MPSGraph reductions keep reduced dims as size 1 — reshape to squeeze them.
 	if outShape.Rank() > 0 {
-		outDims := make([]int64, outShape.Rank())
-		for i, d := range outShape.Dimensions {
-			outDims[i] = int64(d)
-		}
+		outDims := toInt64Slice(outShape.Dimensions)
 		tensor, err = f.ctx().Reshape(tensor, outDims)
 		if err != nil {
 			return nil, errors.Wrap(err, opName+": reshape after reduce")
@@ -1294,10 +1227,7 @@ func (f *Function) ArgMinMax(x backends.Value, axis int, outputDType dtypes.DTyp
 	}
 	// MPSGraph keeps reduced dim as size 1 — reshape to squeeze it.
 	if outShape.Rank() > 0 {
-		squeezeDims := make([]int64, outShape.Rank())
-		for i, d := range outShape.Dimensions {
-			squeezeDims[i] = int64(d)
-		}
+		squeezeDims := toInt64Slice(outShape.Dimensions)
 		tensor, err = f.ctx().Reshape(tensor, squeezeDims)
 		if err != nil {
 			return nil, errors.Wrap(err, "ArgMinMax: reshape")
@@ -1653,10 +1583,7 @@ func (f *Function) DynamicSlice(operand backends.Value, startIndicesValues []bac
 		startIndicesTensors[i] = n.tensor
 	}
 
-	sliceSizes64 := make([]int64, len(sliceSizes))
-	for i, s := range sliceSizes {
-		sliceSizes64[i] = int64(s)
-	}
+	sliceSizes64 := toInt64Slice(sliceSizes)
 
 	outShape := shapes.Make(opNode.shape.DType, sliceSizes...)
 	tensor, err := f.ctx().DynamicSlice(opNode.tensor, startIndicesTensors, sliceSizes64)
@@ -1710,10 +1637,7 @@ func (f *Function) RNGBitGenerator(state backends.Value, shape shapes.Shape) (ne
 			expectedStateShape, stateNode.shape)
 	}
 
-	dims := make([]int64, shape.Rank())
-	for i, d := range shape.Dimensions {
-		dims[i] = int64(d)
-	}
+	dims := toInt64Slice(shape.Dimensions)
 
 	// GoMLX's RandomUniform calls RNGBitGenerator with Uint32 dtype to get random bits,
 	// then converts to float: ConvertDType(bits, Float32) * (1/2^32).
@@ -1753,10 +1677,7 @@ func (f *Function) RNGBitGenerator(state backends.Value, shape shapes.Shape) (ne
 		return nil, nil, errors.Wrap(err, "RNGBitGenerator: creating state increment")
 	}
 	// Broadcast to state shape.
-	stateDims := make([]int64, stateNode.shape.Rank())
-	for i, d := range stateNode.shape.Dimensions {
-		stateDims[i] = int64(d)
-	}
+	stateDims := toInt64Slice(stateNode.shape.Dimensions)
 	one, err = f.ctx().BroadcastTo(one, stateDims)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "RNGBitGenerator: broadcasting state increment")
@@ -2223,10 +2144,7 @@ func (f *Function) ReduceWindow(
 	}
 
 	// Reshape to match expected output shape if needed.
-	outDims := make([]int64, outShape.Rank())
-	for i, d := range outShape.Dimensions {
-		outDims[i] = int64(d)
-	}
+	outDims := toInt64Slice(outShape.Dimensions)
 	tensor, err = f.ctx().Reshape(tensor, outDims)
 	if err != nil {
 		return nil, errors.Wrap(err, "ReduceWindow: reshape")
@@ -2574,10 +2492,7 @@ func (f *Function) FusedLayerNorm(x backends.Value, axes []int, epsilon float64,
 	}
 
 	// Build int64 shape for broadcasting.
-	targetShape := make([]int64, rank)
-	for i, d := range node.shape.Dimensions {
-		targetShape[i] = int64(d)
-	}
+	targetShape := toInt64Slice(node.shape.Dimensions)
 
 	// broadcastToTarget reshapes a lower-rank tensor (e.g. gamma [4]) to the
 	// target shape by inserting size-1 dims for non-normalized axes, then broadcasting.
@@ -2936,10 +2851,7 @@ func (f *Function) FusedScaledDotProductAttention(
 			}
 			// Broadcast -inf to scores shape.
 			scoresNode, _ = f.resolveNode(scores)
-			outDims := make([]int64, scoresNode.shape.Rank())
-			for i, d := range scoresNode.shape.Dimensions {
-				outDims[i] = int64(d)
-			}
+			outDims := toInt64Slice(scoresNode.shape.Dimensions)
 			negInfBroadcast, err := f.ctx().BroadcastTo(negInfTensor, outDims)
 			if err != nil {
 				return nil, errors.Wrap(err, "SDPA: broadcast -inf")
@@ -3085,7 +2997,6 @@ func (f *Function) FusedAttentionQKVProjection(
 	}
 
 	rank := combinedNode.shape.Rank()
-	batchDims := xNode.shape.Dimensions[:xNode.shape.Rank()-1]
 
 	// Build starts/limits/strides for slicing.
 	makeSlice := func(startLast, limitLast int) (backends.Value, error) {
@@ -3159,6 +3070,5 @@ func (f *Function) FusedAttentionQKVProjection(
 		return nil, nil, nil, err
 	}
 
-	_ = batchDims // used in documentation comments above
 	return query, key, value, nil
 }

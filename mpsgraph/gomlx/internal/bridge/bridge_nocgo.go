@@ -1,6 +1,6 @@
 // Copyright 2023-2026 The GoMLX Authors. SPDX-License-Identifier: Apache-2.0
 
-//go:build !cgo
+//go:build darwin && !cgo
 
 // Package bridge provides CGo bindings to Apple's MPSGraph framework.
 // This file is a stub for when CGO is disabled.

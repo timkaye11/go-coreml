@@ -92,50 +92,19 @@ func (b *Builder) Compile() (backends.Executable, error) {
 
 // compileSimple compiles a function without control flow into a single Executable.
 func (b *Builder) compileSimple() (backends.Executable, error) {
-	info := bridge.CompileInfo{
-		Feeds:      make([]bridge.Tensor, len(b.mainFn.params)),
-		FeedDtypes: make([]int, len(b.mainFn.params)),
-		FeedShapes: make([][]int64, len(b.mainFn.params)),
-		Targets:    make([]bridge.Tensor, len(b.mainFn.outputs)),
-	}
-
-	for i, p := range b.mainFn.params {
-		info.Feeds[i] = p.tensor
-		info.FeedDtypes[i] = dtypeToBridgeDType(p.shape.DType)
-		dims := p.shape.Dimensions
-		info.FeedShapes[i] = make([]int64, len(dims))
-		for j, d := range dims {
-			info.FeedShapes[i][j] = int64(d)
-		}
-	}
-
-	for i, out := range b.mainFn.outputs {
-		info.Targets[i] = out.tensor
-	}
-
+	info := buildCompileInfo(b.mainFn.params, b.mainFn.outputs)
 	exec, err := b.ctx.Compile(info)
 	if err != nil {
 		return nil, errors.Wrap(err, "compiling MPSGraph")
 	}
 
-	inputNames := make([]string, len(b.mainFn.params))
-	inputShapes := make([]shapes.Shape, len(b.mainFn.params))
-	for i, p := range b.mainFn.params {
-		inputNames[i] = p.name
-		inputShapes[i] = p.shape
-	}
-
-	outputShapes := make([]shapes.Shape, len(b.mainFn.outputs))
-	for i, out := range b.mainFn.outputs {
-		outputShapes[i] = out.shape
-	}
-
+	inputNames, inputShapes := collectParamInfo(b.mainFn.params)
 	return &Executable{
 		backend:      b.backend,
 		exec:         exec,
 		inputNames:   inputNames,
 		inputShapes:  inputShapes,
-		outputShapes: outputShapes,
+		outputShapes: collectOutputShapes(b.mainFn.outputs),
 	}, nil
 }
 
@@ -175,24 +144,7 @@ func (b *Builder) compileWithControlFlow() (backends.Executable, error) {
 	// Compile the pre-CF graph.
 	var preExec *bridge.Exec
 	if len(preGraphTargets) > 0 && preGraphTargets[0].tensor != nil {
-		info := bridge.CompileInfo{
-			Feeds:      make([]bridge.Tensor, len(b.mainFn.params)),
-			FeedDtypes: make([]int, len(b.mainFn.params)),
-			FeedShapes: make([][]int64, len(b.mainFn.params)),
-			Targets:    make([]bridge.Tensor, len(preGraphTargets)),
-		}
-		for i, p := range b.mainFn.params {
-			info.Feeds[i] = p.tensor
-			info.FeedDtypes[i] = dtypeToBridgeDType(p.shape.DType)
-			dims := p.shape.Dimensions
-			info.FeedShapes[i] = make([]int64, len(dims))
-			for j, d := range dims {
-				info.FeedShapes[i][j] = int64(d)
-			}
-		}
-		for i, t := range preGraphTargets {
-			info.Targets[i] = t.tensor
-		}
+		info := buildCompileInfo(b.mainFn.params, preGraphTargets)
 		var err error
 		preExec, err = b.ctx.Compile(info)
 		if err != nil {
@@ -226,17 +178,7 @@ func (b *Builder) compileWithControlFlow() (backends.Executable, error) {
 		}
 	}
 
-	inputNames := make([]string, len(b.mainFn.params))
-	inputShapes := make([]shapes.Shape, len(b.mainFn.params))
-	for i, p := range b.mainFn.params {
-		inputNames[i] = p.name
-		inputShapes[i] = p.shape
-	}
-
-	outputShapes := make([]shapes.Shape, len(b.mainFn.outputs))
-	for i, out := range b.mainFn.outputs {
-		outputShapes[i] = out.shape
-	}
+	inputNames, inputShapes := collectParamInfo(b.mainFn.params)
 
 	return &ExecutableWithCF{
 		backend:         b.backend,
@@ -248,8 +190,51 @@ func (b *Builder) compileWithControlFlow() (backends.Executable, error) {
 		outputMapping:   outputMapping,
 		inputNames:      inputNames,
 		inputShapes:     inputShapes,
-		outputShapes:    outputShapes,
+		outputShapes:    collectOutputShapes(b.mainFn.outputs),
 	}, nil
+}
+
+// buildCompileInfo creates a CompileInfo from parameter nodes and target nodes.
+func buildCompileInfo(params, targets []*graphNode) bridge.CompileInfo {
+	info := bridge.CompileInfo{
+		Feeds:      make([]bridge.Tensor, len(params)),
+		FeedDtypes: make([]int, len(params)),
+		FeedShapes: make([][]int64, len(params)),
+		Targets:    make([]bridge.Tensor, len(targets)),
+	}
+	for i, p := range params {
+		info.Feeds[i] = p.tensor
+		info.FeedDtypes[i] = dtypeToBridgeDType(p.shape.DType)
+		dims := p.shape.Dimensions
+		info.FeedShapes[i] = make([]int64, len(dims))
+		for j, d := range dims {
+			info.FeedShapes[i][j] = int64(d)
+		}
+	}
+	for i, t := range targets {
+		info.Targets[i] = t.tensor
+	}
+	return info
+}
+
+// collectParamInfo extracts names and shapes from parameter nodes.
+func collectParamInfo(params []*graphNode) ([]string, []shapes.Shape) {
+	names := make([]string, len(params))
+	paramShapes := make([]shapes.Shape, len(params))
+	for i, p := range params {
+		names[i] = p.name
+		paramShapes[i] = p.shape
+	}
+	return names, paramShapes
+}
+
+// collectOutputShapes extracts shapes from output nodes.
+func collectOutputShapes(outputs []*graphNode) []shapes.Shape {
+	outShapes := make([]shapes.Shape, len(outputs))
+	for i, out := range outputs {
+		outShapes[i] = out.shape
+	}
+	return outShapes
 }
 
 // gatherClosureFunctions collects all closure Functions used by a CF step.

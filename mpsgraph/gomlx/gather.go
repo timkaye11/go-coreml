@@ -193,10 +193,7 @@ func (f *Function) gatherEmbeddingLookup(
 	}
 
 	// Reshape to the expected output shape.
-	outDims := make([]int64, outShape.Rank())
-	for i, d := range outShape.Dimensions {
-		outDims[i] = int64(d)
-	}
+	outDims := toInt64Slice(outShape.Dimensions)
 	result, err = f.ctx().Reshape(result, outDims)
 	if err != nil {
 		return nil, false
@@ -217,60 +214,16 @@ func (f *Function) gatherGeneral(
 	indicesShape := indicesNode.shape
 	operandRank := operandShape.Rank()
 
-	// Step 1: Extract the index vectors from startIndices.
-	// The indexVectorAxis contains the multi-dimensional index.
-	idxTensor := indicesNode.tensor
-	var err error
-
-	// If indexVectorAxis == indicesShape.Rank(), there's an implicit axis of size 1.
-	if indexVectorAxis == indicesShape.Rank() {
-		// Add a trailing axis of size 1.
-		newDims := make([]int64, indicesShape.Rank()+1)
-		for i, d := range indicesShape.Dimensions {
-			newDims[i] = int64(d)
-		}
-		newDims[indicesShape.Rank()] = 1
-		idxTensor, err = f.ctx().Reshape(idxTensor, newDims)
-		if err != nil {
-			return nil, errors.Wrap(err, "Gather: reshape indices for implicit axis")
-		}
-	}
-
-	// Step 2: Determine batch dimensions (all dims except indexVectorAxis).
-	// Flatten batch dims into one.
-	batchSize := 1
-	for i := range indicesShape.Rank() {
-		if i != indexVectorAxis || indexVectorAxis == indicesShape.Rank() {
-			batchSize *= indicesShape.Dimensions[i]
-		}
+	// Step 1: Normalize indexVectorAxis to trailing position.
+	idxTensor, batchSize, err := f.normalizeIndexVectorAxis(
+		indicesNode.tensor, indicesShape, indexVectorAxis, "Gather")
+	if err != nil {
+		return nil, err
 	}
 
 	indexVectorSize := len(startIndexMap)
 
-	// Step 2b: Transpose indexVectorAxis to trailing position if needed.
-	// When indexVectorAxis == indicesShape.Rank(), we already added a trailing axis above,
-	// so it's already in the trailing position.
-	effectiveRank := indicesShape.Rank()
-	if indexVectorAxis == indicesShape.Rank() {
-		effectiveRank = indicesShape.Rank() + 1
-	}
-	if indexVectorAxis != effectiveRank-1 {
-		perm := make([]int, effectiveRank)
-		pi := 0
-		for i := 0; i < effectiveRank; i++ {
-			if i != indexVectorAxis {
-				perm[pi] = i
-				pi++
-			}
-		}
-		perm[effectiveRank-1] = indexVectorAxis
-		idxTensor, err = f.ctx().Transpose(idxTensor, perm)
-		if err != nil {
-			return nil, errors.Wrap(err, "Gather: transposing index vector axis to trailing position")
-		}
-	}
-
-	// Step 3: If startIndexMap is a contiguous prefix [0,1,...,k-1], we can use gatherND directly.
+	// Step 2: If startIndexMap is a contiguous prefix [0,1,...,k-1], we can use gatherND directly.
 	// Otherwise, we need to remap indices.
 	isContiguousPrefix := true
 	for i, v := range startIndexMap {
@@ -280,7 +233,7 @@ func (f *Function) gatherGeneral(
 		}
 	}
 
-	// Step 4: Check if all slice sizes beyond the indexed axes are the full dimension
+	// Step 3: Check if all slice sizes beyond the indexed axes are the full dimension
 	// and all indexed axes have slice size 1 (with collapsed).
 	allSlicesFullOrCollapsed := true
 	collapsedSet := make(map[int]bool)
@@ -320,10 +273,7 @@ func (f *Function) gatherGeneral(
 		}
 
 		// Reshape to output shape.
-		outDims := make([]int64, outShape.Rank())
-		for i, d := range outShape.Dimensions {
-			outDims[i] = int64(d)
-		}
+		outDims := toInt64Slice(outShape.Dimensions)
 		result, err = f.ctx().Reshape(result, outDims)
 		if err != nil {
 			return nil, errors.Wrap(err, "Gather: reshape output")
@@ -424,16 +374,63 @@ func (f *Function) gatherGeneral(
 	}
 
 	// Reshape to output shape.
-	outDims := make([]int64, outShape.Rank())
-	for i, d := range outShape.Dimensions {
-		outDims[i] = int64(d)
-	}
+	outDims := toInt64Slice(outShape.Dimensions)
 	result, err = f.ctx().Reshape(result, outDims)
 	if err != nil {
 		return nil, errors.Wrap(err, "Gather: reshape output general")
 	}
 
 	return &graphNode{tensor: result, shape: outShape, owner: f}, nil
+}
+
+// normalizeIndexVectorAxis handles the common pattern of ensuring the indexVectorAxis
+// is expanded (if implicit) and transposed to the trailing position.
+// Returns the (possibly modified) tensor and the computed batchSize.
+func (f *Function) normalizeIndexVectorAxis(
+	idxTensor bridge.Tensor, indicesShape shapes.Shape,
+	indexVectorAxis int, opName string,
+) (bridge.Tensor, int, error) {
+	var err error
+
+	// If indexVectorAxis == rank, there's an implicit axis of size 1.
+	if indexVectorAxis == indicesShape.Rank() {
+		newDims := append(toInt64Slice(indicesShape.Dimensions), 1)
+		idxTensor, err = f.ctx().Reshape(idxTensor, newDims)
+		if err != nil {
+			return nil, 0, errors.Wrap(err, opName+": reshape indices for implicit axis")
+		}
+	}
+
+	// Compute batchSize (product of all dims except indexVectorAxis).
+	batchSize := 1
+	for i := range indicesShape.Rank() {
+		if i != indexVectorAxis || indexVectorAxis == indicesShape.Rank() {
+			batchSize *= indicesShape.Dimensions[i]
+		}
+	}
+
+	// Transpose indexVectorAxis to trailing position if needed.
+	effectiveRank := indicesShape.Rank()
+	if indexVectorAxis == indicesShape.Rank() {
+		effectiveRank = indicesShape.Rank() + 1
+	}
+	if indexVectorAxis != effectiveRank-1 {
+		perm := make([]int, effectiveRank)
+		pi := 0
+		for i := 0; i < effectiveRank; i++ {
+			if i != indexVectorAxis {
+				perm[pi] = i
+				pi++
+			}
+		}
+		perm[effectiveRank-1] = indexVectorAxis
+		idxTensor, err = f.ctx().Transpose(idxTensor, perm)
+		if err != nil {
+			return nil, 0, errors.Wrap(err, opName+": transposing index vector axis to trailing position")
+		}
+	}
+
+	return idxTensor, batchSize, nil
 }
 
 // ===========================================================================
@@ -538,50 +535,12 @@ func (f *Function) scatterImpl(
 	// General case: use scatterND.
 	// Reshape indices for scatterND.
 	indicesShape := indicesNode.shape
-	batchSize := 1
-	for i, d := range indicesShape.Dimensions {
-		if i != indexVectorAxis {
-			batchSize *= d
-		}
-	}
 	indexVectorSize := len(scatterAxesToOperandAxes)
 
-	idxTensor := indicesNode.tensor
-
-	// If indexVectorAxis == indicesShape.Rank(), add a trailing axis of size 1.
-	if indexVectorAxis == indicesShape.Rank() {
-		newDims := make([]int64, indicesShape.Rank()+1)
-		for i, d := range indicesShape.Dimensions {
-			newDims[i] = int64(d)
-		}
-		newDims[indicesShape.Rank()] = 1
-		idxTensor, err = f.ctx().Reshape(idxTensor, newDims)
-		if err != nil {
-			return nil, errors.Wrap(err, opName+": reshape indices for implicit axis")
-		}
-	}
-
-	// Transpose indexVectorAxis to trailing position if needed.
-	// When indexVectorAxis == indicesShape.Rank(), we already added a trailing axis above,
-	// so it's already in the trailing position.
-	effectiveRank := indicesShape.Rank()
-	if indexVectorAxis == indicesShape.Rank() {
-		effectiveRank = indicesShape.Rank() + 1
-	}
-	if indexVectorAxis != effectiveRank-1 {
-		perm := make([]int, effectiveRank)
-		pi := 0
-		for i := 0; i < effectiveRank; i++ {
-			if i != indexVectorAxis {
-				perm[pi] = i
-				pi++
-			}
-		}
-		perm[effectiveRank-1] = indexVectorAxis
-		idxTensor, err = f.ctx().Transpose(idxTensor, perm)
-		if err != nil {
-			return nil, errors.Wrap(err, opName+": transposing index vector axis to trailing position")
-		}
+	idxTensor, batchSize, err := f.normalizeIndexVectorAxis(
+		indicesNode.tensor, indicesShape, indexVectorAxis, opName)
+	if err != nil {
+		return nil, err
 	}
 
 	// indexVectorAxis is now in trailing position; reshape to [batchSize, indexVectorSize].

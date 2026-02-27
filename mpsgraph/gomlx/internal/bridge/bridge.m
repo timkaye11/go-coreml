@@ -88,6 +88,18 @@ static NSArray<NSNumber*>* shapeArray(int64_t* shape, int rank) {
     return arr;
 }
 
+// --- Helper: convert int scatter mode to MPSGraphScatterMode ---
+
+static bool toScatterMode(int mode, MPSGraphScatterMode* out) {
+    switch (mode) {
+        case 0: *out = MPSGraphScatterModeSet; return true;
+        case 1: *out = MPSGraphScatterModeAdd; return true;
+        case 2: *out = MPSGraphScatterModeMax; return true;
+        case 3: *out = MPSGraphScatterModeMin; return true;
+        default: return false;
+    }
+}
+
 // --- Helper: build NSArray<NSNumber*> from int* array ---
 
 static NSArray<NSNumber*>* intArray(int* values, int count) {
@@ -171,7 +183,9 @@ void mpsgraph_destroy_context(MPSGraphContextHandle handle) {
 
 const char* mpsgraph_device_name(MPSGraphContextHandle handle) {
     @autoreleasepool {
+        if (!handle) return strdup("unknown");
         MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        if (!ctx.device) return strdup("unknown");
         return strdup([ctx.device.name UTF8String]);
     }
 }
@@ -767,24 +781,25 @@ MPSGraphTensorHandle mpsgraph_gather_along_axis(MPSGraphContextHandle handle,
     }
 }
 
+// NOTE: The `data` parameter is accepted for API consistency with ScatterAlongAxis but is
+// not used by scatterNDWithUpdatesTensor — that API always scatters into a zero-initialized
+// tensor (for Add mode). This is correct for GoMLX's usage where the operand is always zeros
+// (autodiff scatter gradients). If non-zero operand support is needed in the general path,
+// an additional Add/Max/Min of the operand with the scatter result would be required.
 MPSGraphTensorHandle mpsgraph_scatter_nd(MPSGraphContextHandle handle,
     MPSGraphTensorHandle data, MPSGraphTensorHandle indices, MPSGraphTensorHandle updates,
     int64_t* shape, int rank, int mode, MPSGraphError* error) {
     @autoreleasepool {
         clearError(error);
         MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
-        MPSGraphTensor* d = (__bridge MPSGraphTensor*)data;
+        (void)data;  // See NOTE above.
         MPSGraphTensor* idx = (__bridge MPSGraphTensor*)indices;
         MPSGraphTensor* upd = (__bridge MPSGraphTensor*)updates;
         NSArray<NSNumber*>* shapeArr = shapeArray(shape, rank);
 
         MPSGraphScatterMode scatterMode;
-        switch (mode) {
-            case 0: scatterMode = MPSGraphScatterModeSet; break;
-            case 1: scatterMode = MPSGraphScatterModeAdd; break;
-            case 2: scatterMode = MPSGraphScatterModeMax; break;
-            case 3: scatterMode = MPSGraphScatterModeMin; break;
-            default: scatterMode = MPSGraphScatterModeSet; break;
+        if (!toScatterMode(mode, &scatterMode)) {
+            scatterMode = MPSGraphScatterModeSet;
         }
 
         MPSGraphTensor* result = [ctx.graph scatterNDWithUpdatesTensor:upd
@@ -890,43 +905,6 @@ MPSGraphTensorHandle mpsgraph_batch_norm_inference(MPSGraphContextHandle handle,
         }
         if (!result) {
             setError(error, 80, @"batch_norm_inference failed");
-            return NULL;
-        }
-        return (__bridge void*)result;
-    }
-}
-
-// ===========================================================================
-// Convolution
-// ===========================================================================
-
-MPSGraphTensorHandle mpsgraph_conv2d(MPSGraphContextHandle handle,
-    MPSGraphTensorHandle input, MPSGraphTensorHandle weights,
-    int64_t* strides, int64_t* dilations, int64_t* padBefore, int64_t* padAfter,
-    int groups, MPSGraphError* error) {
-    @autoreleasepool {
-        clearError(error);
-        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
-        MPSGraphTensor* x = (__bridge MPSGraphTensor*)input;
-        MPSGraphTensor* w = (__bridge MPSGraphTensor*)weights;
-
-        // Create convolution descriptor (NCHW layout assumed).
-        MPSGraphConvolution2DOpDescriptor* desc = [MPSGraphConvolution2DOpDescriptor
-            descriptorWithStrideInX:strides[1] strideInY:strides[0]
-                  dilationRateInX:dilations[1] dilationRateInY:dilations[0]
-                            groups:groups
-                     paddingLeft:padBefore[1] paddingRight:padAfter[1]
-                       paddingTop:padBefore[0] paddingBottom:padAfter[0]
-                      paddingStyle:MPSGraphPaddingStyleExplicit
-                        dataLayout:MPSGraphTensorNamedDataLayoutNCHW
-                     weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
-
-        MPSGraphTensor* result = [ctx.graph convolution2DWithSourceTensor:x
-                                                           weightsTensor:w
-                                                              descriptor:desc
-                                                                    name:nil];
-        if (!result) {
-            setError(error, 90, @"conv2d failed");
             return NULL;
         }
         return (__bridge void*)result;
@@ -1507,16 +1485,6 @@ MPSGraphTensorHandle mpsgraph_random_uniform(MPSGraphContextHandle handle,
     }
 }
 
-MPSGraphTensorHandle mpsgraph_random_philox_state(MPSGraphContextHandle handle,
-    MPSGraphTensorHandle seed, MPSGraphError* error) {
-    @autoreleasepool {
-        clearError(error);
-        // Placeholder — MPSGraph manages its own RNG state internally.
-        // For GoMLX compatibility, we pass state through but don't use it.
-        return seed;
-    }
-}
-
 // ===========================================================================
 // Pooling (ReduceWindow)
 // ===========================================================================
@@ -1664,14 +1632,9 @@ MPSGraphTensorHandle mpsgraph_scatter_along_axis(MPSGraphContextHandle handle,
         MPSGraphTensor* updates = (__bridge MPSGraphTensor*)updatesH;
 
         MPSGraphScatterMode scatterMode;
-        switch (mode) {
-            case 0: scatterMode = MPSGraphScatterModeSet; break;
-            case 1: scatterMode = MPSGraphScatterModeAdd; break;
-            case 2: scatterMode = MPSGraphScatterModeMax; break;
-            case 3: scatterMode = MPSGraphScatterModeMin; break;
-            default:
-                setError(error, 240, @"unknown scatter mode");
-                return NULL;
+        if (!toScatterMode(mode, &scatterMode)) {
+            setError(error, 240, @"unknown scatter mode");
+            return NULL;
         }
 
         MPSGraphTensor* result = [ctx.graph scatterAlongAxis:axis

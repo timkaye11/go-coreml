@@ -161,6 +161,7 @@ var backendCapabilities = backends.Capabilities{
 		dtypes.Uint8:   true,
 		dtypes.Uint16:   true,
 		dtypes.Uint32:   true,
+		dtypes.Uint64:   true,
 		dtypes.BFloat16: true,
 	},
 }

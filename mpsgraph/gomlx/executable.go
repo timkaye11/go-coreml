@@ -11,7 +11,6 @@ import (
 
 	"github.com/gomlx/go-coreml/mpsgraph/gomlx/internal/bridge"
 	"github.com/gomlx/gomlx/backends"
-	"github.com/gomlx/gomlx/pkg/core/dtypes"
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/pkg/errors"
 )
@@ -170,7 +169,7 @@ func (e *ExecutableWithCF) Execute(inputs []backends.Buffer, donate []bool, defa
 	// Step 1: Run the pre-CF graph to produce CF inputs and captured values.
 	var preOutputs []backends.Buffer
 	if e.preExec != nil {
-		preInputs := prepareBridgeInputs(inputs, e.inputShapes)
+		preInputs := prepareBridgeInputs(inputs)
 		preOutputShapes := make([]shapes.Shape, len(e.preGraphTargets))
 		for i, t := range e.preGraphTargets {
 			preOutputShapes[i] = t.shape
@@ -226,7 +225,7 @@ func (e *ExecutableWithCF) execWhile(cf *controlFlowStep, preOutputs []backends.
 	stateCount := len(cf.inputs)
 	state := make([]backends.Buffer, stateCount)
 	for i := range stateCount {
-		idx := indexOfNodeInTargets(e.preGraphTargets, cf.inputs[i])
+		idx := indexOfNode(e.preGraphTargets, cf.inputs[i])
 		if idx < 0 {
 			return nil, errors.Errorf("While: CF input %d not found in pre-graph targets", i)
 		}
@@ -287,7 +286,7 @@ func (e *ExecutableWithCF) execIf(cf *controlFlowStep, preOutputs []backends.Buf
 	id := cf.ifData
 
 	// Read the predicate.
-	predIdx := indexOfNodeInTargets(e.preGraphTargets, cf.inputs[0])
+	predIdx := indexOfNode(e.preGraphTargets, cf.inputs[0])
 	if predIdx < 0 {
 		return nil, errors.Errorf("If: predicate not found in pre-graph targets")
 	}
@@ -326,7 +325,7 @@ func (e *ExecutableWithCF) execSort(cf *controlFlowStep, preOutputs []backends.B
 	inputCount := len(cf.inputs)
 	inputBufs := make([]*gpuBuffer, inputCount)
 	for i := range inputCount {
-		idx := indexOfNodeInTargets(e.preGraphTargets, cf.inputs[i])
+		idx := indexOfNode(e.preGraphTargets, cf.inputs[i])
 		if idx < 0 {
 			return nil, errors.Errorf("Sort: input %d not found in pre-graph targets", i)
 		}
@@ -458,7 +457,7 @@ func (e *ExecutableWithCF) execCall(cf *controlFlowStep, preOutputs []backends.B
 	// Gather inputs from pre-graph outputs.
 	callInputs := make([]backends.Buffer, len(cf.inputs))
 	for i, input := range cf.inputs {
-		idx := indexOfNodeInTargets(e.preGraphTargets, input)
+		idx := indexOfNode(e.preGraphTargets, input)
 		if idx < 0 {
 			return nil, errors.Errorf("Call: input %d not found in pre-graph targets", i)
 		}
@@ -484,7 +483,7 @@ func (e *ExecutableWithCF) execCall(cf *controlFlowStep, preOutputs []backends.B
 func (e *ExecutableWithCF) gatherCapturedBuffers(fn *Function, preOutputs []backends.Buffer) []backends.Buffer {
 	captures := make([]backends.Buffer, len(fn.capturedParentNodes))
 	for i, captured := range fn.capturedParentNodes {
-		idx := indexOfNodeInTargets(e.preGraphTargets, captured)
+		idx := indexOfNode(e.preGraphTargets, captured)
 		if idx >= 0 {
 			captures[i] = preOutputs[idx]
 		}
@@ -492,22 +491,12 @@ func (e *ExecutableWithCF) gatherCapturedBuffers(fn *Function, preOutputs []back
 	return captures
 }
 
-// indexOfNodeInTargets returns the index of a node in the targets list.
-func indexOfNodeInTargets(targets []*graphNode, n *graphNode) int {
-	for i, t := range targets {
-		if t == n {
-			return i
-		}
-	}
-	return -1
-}
-
 // ===========================================================================
 // Helper functions for buffer operations
 // ===========================================================================
 
 // prepareBridgeInputs converts backends.Buffer to bridge.ExecInput.
-func prepareBridgeInputs(inputs []backends.Buffer, inputShapes []shapes.Shape) []bridge.ExecInput {
+func prepareBridgeInputs(inputs []backends.Buffer) []bridge.ExecInput {
 	execInputs := make([]bridge.ExecInput, len(inputs))
 	for i, input := range inputs {
 		buf := input.(*gpuBuffer)
@@ -585,9 +574,4 @@ func copyBytesToSlice(dst []byte, src unsafe.Pointer, n int) {
 func copyBytesFromSlice(dst unsafe.Pointer, src []byte, n int) {
 	dstSlice := unsafe.Slice((*byte)(dst), n)
 	copy(dstSlice, src)
-}
-
-// dtypeSizeForScalar returns the byte size of a scalar dtype for Sort comparisons.
-func dtypeSizeForScalar(dt dtypes.DType) int {
-	return int(dt.Size())
 }

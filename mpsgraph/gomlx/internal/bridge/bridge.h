@@ -197,21 +197,11 @@ MPSGraphTensorHandle mpsgraph_argmin(MPSGraphContextHandle ctx, MPSGraphTensorHa
 MPSGraphTensorHandle mpsgraph_argmax(MPSGraphContextHandle ctx, MPSGraphTensorHandle x,
     int axis, int outputDtype, MPSGraphError* error);
 
-// --- Convolution ---
-MPSGraphTensorHandle mpsgraph_conv2d(MPSGraphContextHandle ctx,
-    MPSGraphTensorHandle input, MPSGraphTensorHandle weights,
-    int64_t* strides, int64_t* dilations, int64_t* padBefore, int64_t* padAfter,
-    int groups, MPSGraphError* error);
-
 // --- Softmax ---
 MPSGraphTensorHandle mpsgraph_softmax(MPSGraphContextHandle ctx,
     MPSGraphTensorHandle x, int axis, MPSGraphError* error);
 
 // --- Random Number Generation ---
-// Fills output with random uniform bits using the Philox algorithm.
-// state is [3]uint64, returns updated state and random values.
-MPSGraphTensorHandle mpsgraph_random_philox_state(MPSGraphContextHandle ctx,
-    MPSGraphTensorHandle seed, MPSGraphError* error);
 MPSGraphTensorHandle mpsgraph_random_uniform(MPSGraphContextHandle ctx,
     int dtype, int64_t* shape, int rank, MPSGraphError* error);
 
