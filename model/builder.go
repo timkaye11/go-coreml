@@ -168,7 +168,7 @@ func (b *Builder) Identity(name string, x *Value) *Value {
 }
 
 // Const creates a constant tensor value.
-func (b *Builder) Const(name string, dtype DType, shape []int64, data interface{}) *Value {
+func (b *Builder) Const(name string, dtype DType, shape []int64, data any) *Value {
 	val := createValue(dtype, shape, data)
 	v := &Value{
 		name:     name,
@@ -183,7 +183,7 @@ func (b *Builder) Const(name string, dtype DType, shape []int64, data interface{
 }
 
 // createValue creates a MIL Value from Go data.
-func createValue(dtype DType, shape []int64, data interface{}) *milspec.Value {
+func createValue(dtype DType, shape []int64, data any) *milspec.Value {
 	tensorType := &milspec.TensorType{
 		DataType:   dtype,
 		Rank:       int64(len(shape)),
@@ -428,6 +428,9 @@ type Program = milspec.Program
 
 // Build constructs the final MIL Program.
 func (b *Builder) Build() *Program {
+	// Optimize: eliminate operations with rank > 5 for CoreML compatibility.
+	b.optimizeHighRankOps()
+
 	// Build function inputs
 	inputs := make([]*milspec.NamedValueType, len(b.inputs))
 	for i, v := range b.inputs {

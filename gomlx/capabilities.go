@@ -15,6 +15,13 @@ var Capabilities = backends.Capabilities{
 	// Functions indicates support for the new function/closure interface.
 	Functions: true,
 
+	// PreferConstantsForVariables enables embedding model weights as constants in the
+	// computation graph. This is critical for CoreML performance because:
+	// 1. Constants can be stored in blob files (weight.bin) and memory-mapped
+	// 2. Avoids passing hundreds of weight tensors as inputs per inference
+	// 3. Enables CoreML to optimize the model with known weight values
+	PreferConstantsForVariables: true,
+
 	Operations: map[backends.OpType]bool{
 		// Graph inputs (leaf nodes)
 		backends.OpTypeParameter: true,
@@ -112,11 +119,11 @@ var Capabilities = backends.Capabilities{
 	DTypes: map[dtypes.DType]bool{
 		dtypes.Float16: true,
 		dtypes.Float32: true,
-		dtypes.Float64: true,
+		dtypes.Float64: true, // Silently downcast to Float32 — CoreML doesn't natively support fp64.
 		dtypes.Int8:    true,
 		dtypes.Int16:   true,
 		dtypes.Int32:   true,
-		dtypes.Int64:   true,
+		dtypes.Int64:   true, // Silently downcast to Int32 — CoreML doesn't support int64 ops.
 		dtypes.Bool:    true,
 	},
 }

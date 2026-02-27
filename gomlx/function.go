@@ -6,6 +6,7 @@ package coreml
 
 import (
 	"fmt"
+	"math"
 	"slices"
 
 	"github.com/gomlx/go-coreml/model"
@@ -134,6 +135,11 @@ func (f *Function) Parameter(name string, shape shapes.Shape, sharding *backends
 	if dtype == dtypes.InvalidDType {
 		return nil, errors.Errorf("invalid shape %s for Parameter", shape)
 	}
+	// CoreML does not support float64 — downcast to float32.
+	if dtype == dtypes.Float64 {
+		shape = shapes.Make(dtypes.Float32, shape.Dimensions...)
+		dtype = dtypes.Float32
+	}
 	if supported, ok := Capabilities.DTypes[dtype]; !ok || !supported {
 		return nil, errors.Errorf("Parameter: data type (DType) %s not supported for backend %q, try using "+
 			"a different backend, or open an issue in github.com/gomlx/gomlx", dtype, f.builder.backend.Name())
@@ -177,8 +183,10 @@ func (f *Function) Parameter(name string, shape shapes.Shape, sharding *backends
 		// Note: We do NOT append to f.builder.inputs, inputNames, or inputShapes
 		// because closure parameters are not model-level inputs
 	} else {
-		// For the main function, create a proper model input
-		// Use sanitized name for CoreML compatibility
+		// For the main function, create a proper model input.
+		// gomlxDTypeToMIL already maps Int64→Int32 and Float64→Float32,
+		// so the I/O type matches what MLMultiArray supports.
+		// buffer.go handles the Int64↔Int32 conversion at the Go level.
 		milValue = f.builder.milBuilder.Input(sanitizedName, milDType, dims...)
 		node = f.builder.newNode(backends.OpTypeParameter, shape, milValue)
 		f.builder.inputs = append(f.builder.inputs, node)
@@ -220,22 +228,42 @@ func (f *Function) Constant(flat any, dims ...int) (backends.Value, error) {
 		)
 	}
 
-	// Convert to MIL dtype (note: Int64 maps to Int32 for CoreML compatibility)
+	// Convert to MIL dtype
 	milDType, err := gomlxDTypeToMIL(dtype)
 	if err != nil {
 		return nil, errors.Wrap(err, "Constant")
 	}
 
-	// If the GoMLX dtype is Int64 but MIL dtype is Int32, convert the data.
-	// This keeps the GoMLX shape as Int64 (for onnx-gomlx compatibility) while
-	// giving CoreML Int32 data (which it supports).
-	// Values that exceed Int32 range are clamped — this is safe for ML models
-	// where out-of-range Int64 constants are typically attention mask values
-	// (large negatives) where the exact magnitude doesn't matter.
 	milData := flat
-	if dtype == dtypes.Int64 && milDType == model.Int32 {
+	// CoreML does not support float64 — downcast to float32.
+	if dtype == dtypes.Float64 {
+		float64Data := flat.([]float64)
+		float32Data := make([]float32, len(float64Data))
+		for i, v := range float64Data {
+			float32Data[i] = float32(v)
+		}
+		milData = float32Data
+		milDType = model.Float32
+		shape = shapes.Make(dtypes.Float32, dims...)
+	}
+
+	// CoreML does not support int64 operations — downcast to int32.
+	// GoMLX shape stays Int64 for onnx-gomlx compatibility; buffer.go
+	// handles the Int64↔Int32 conversion at I/O boundaries.
+	if dtype == dtypes.Int64 {
 		int64Data := flat.([]int64)
-		milData = convertInt64ToInt32Clamped(int64Data)
+		int32Data := make([]int32, len(int64Data))
+		for i, v := range int64Data {
+			if v > math.MaxInt32 {
+				int32Data[i] = math.MaxInt32
+			} else if v < math.MinInt32 {
+				int32Data[i] = math.MinInt32
+			} else {
+				int32Data[i] = int32(v)
+			}
+		}
+		milData = int32Data
+		milDType = model.Int32
 	}
 
 	// Convert dimensions to int64
@@ -450,18 +478,16 @@ func (f *Function) addBinaryOp(
 	lhsNode, rhsNode := inputs[0], inputs[1]
 
 	// Handle dtype mismatch between Int32 and Int64 at the GoMLX level.
-	// Since CoreML maps Int64→Int32, both MIL values are Int32, but GoMLX shapes
-	// might differ. Unify to Int64 for shape inference (the actual MIL ops use Int32).
+	// CoreML maps Int64→Int32, so both MIL values are Int32, but GoMLX shapes
+	// may differ. Unify to Int64 for shape inference so onnx-gomlx sees consistent types.
 	lhsValue := lhsNode.milValue
 	rhsValue := rhsNode.milValue
 	lhsShape := lhsNode.shape
 	rhsShape := rhsNode.shape
 
 	if lhsShape.DType == dtypes.Int32 && rhsShape.DType == dtypes.Int64 {
-		// Promote LHS shape to Int64 for shape inference (MIL values are already both Int32)
 		lhsShape = shapes.Make(dtypes.Int64, lhsShape.Dimensions...)
 	} else if lhsShape.DType == dtypes.Int64 && rhsShape.DType == dtypes.Int32 {
-		// Promote RHS shape to Int64 for shape inference (MIL values are already both Int32)
 		rhsShape = shapes.Make(dtypes.Int64, rhsShape.Dimensions...)
 	}
 
@@ -506,18 +532,16 @@ func (f *Function) addComparisonOp(
 	lhsNode, rhsNode := inputs[0], inputs[1]
 
 	// Handle dtype mismatch between Int32 and Int64 at the GoMLX level.
-	// Since CoreML maps Int64→Int32, both MIL values are Int32, but GoMLX shapes
-	// might differ. Unify to Int64 for shape inference (the actual MIL ops use Int32).
+	// CoreML maps Int64→Int32, so both MIL values are Int32, but GoMLX shapes
+	// may differ. Unify to Int64 for shape inference so onnx-gomlx sees consistent types.
 	lhsValue := lhsNode.milValue
 	rhsValue := rhsNode.milValue
 	lhsShape := lhsNode.shape
 	rhsShape := rhsNode.shape
 
 	if lhsShape.DType == dtypes.Int32 && rhsShape.DType == dtypes.Int64 {
-		// Promote LHS shape to Int64 for shape inference (MIL values are already both Int32)
 		lhsShape = shapes.Make(dtypes.Int64, lhsShape.Dimensions...)
 	} else if lhsShape.DType == dtypes.Int64 && rhsShape.DType == dtypes.Int32 {
-		// Promote RHS shape to Int64 for shape inference (MIL values are already both Int32)
 		rhsShape = shapes.Make(dtypes.Int64, rhsShape.Dimensions...)
 	}
 
@@ -910,63 +934,6 @@ func (f *Function) Slice(x backends.Value, starts, limits, strides []int) (backe
 	return node, nil
 }
 
-// Dot implements backends.Function (matrix multiplication).
-func (f *Function) Dot(lhs, rhs backends.Value) (backends.Value, error) {
-	opType := backends.OpTypeDot
-	inputs, err := f.builder.checkOps(opType.String(), lhs, rhs)
-	if err != nil {
-		return nil, err
-	}
-	lhsNode, rhsNode := inputs[0], inputs[1]
-
-	// Dot is for 1D or 2D tensors - for 2D it's a matrix multiplication
-	// For 1D vectors, it's an inner product
-	lhsShape := lhsNode.shape
-	rhsShape := rhsNode.shape
-
-	var outputShape shapes.Shape
-	if lhsShape.Rank() == 1 && rhsShape.Rank() == 1 {
-		// Inner product: [N] dot [N] -> scalar
-		if lhsShape.Dimensions[0] != rhsShape.Dimensions[0] {
-			return nil, errors.Errorf("Dot: vector lengths must match, got %d and %d",
-				lhsShape.Dimensions[0], rhsShape.Dimensions[0])
-		}
-		outputShape = shapes.Make(lhsShape.DType)
-	} else if lhsShape.Rank() == 2 && rhsShape.Rank() == 2 {
-		// Matrix multiplication: [M, K] dot [K, N] -> [M, N]
-		if lhsShape.Dimensions[1] != rhsShape.Dimensions[0] {
-			return nil, errors.Errorf("Dot: matrix inner dimensions must match, got [%d, %d] and [%d, %d]",
-				lhsShape.Dimensions[0], lhsShape.Dimensions[1],
-				rhsShape.Dimensions[0], rhsShape.Dimensions[1])
-		}
-		outputShape = shapes.Make(lhsShape.DType, lhsShape.Dimensions[0], rhsShape.Dimensions[1])
-	} else if lhsShape.Rank() == 2 && rhsShape.Rank() == 1 {
-		// Matrix-vector: [M, K] dot [K] -> [M]
-		if lhsShape.Dimensions[1] != rhsShape.Dimensions[0] {
-			return nil, errors.Errorf("Dot: matrix column count must match vector length, got %d and %d",
-				lhsShape.Dimensions[1], rhsShape.Dimensions[0])
-		}
-		outputShape = shapes.Make(lhsShape.DType, lhsShape.Dimensions[0])
-	} else if lhsShape.Rank() == 1 && rhsShape.Rank() == 2 {
-		// Vector-matrix: [K] dot [K, N] -> [N]
-		if lhsShape.Dimensions[0] != rhsShape.Dimensions[0] {
-			return nil, errors.Errorf("Dot: vector length must match matrix row count, got %d and %d",
-				lhsShape.Dimensions[0], rhsShape.Dimensions[0])
-		}
-		outputShape = shapes.Make(lhsShape.DType, rhsShape.Dimensions[1])
-	} else {
-		return nil, errors.Errorf("Dot: only supports 1D and 2D tensors, got ranks %d and %d",
-			lhsShape.Rank(), rhsShape.Rank())
-	}
-
-	// Call the MIL operation (MatMul)
-	resultValue := f.builder.milBuilder.MatMul(lhsNode.milValue, rhsNode.milValue)
-
-	// Create a new node with the result
-	node := f.builder.newNode(opType, outputShape, resultValue, lhsNode, rhsNode)
-
-	return node, nil
-}
 
 // ArgMinMax implements backends.Function.
 func (f *Function) ArgMinMax(x backends.Value, axis int, outputDType dtypes.DType, isMin bool) (backends.Value, error) {
@@ -1529,15 +1496,32 @@ func (f *Function) ConvertDType(x backends.Value, dtype dtypes.DType) (backends.
 	}
 	operand := inputs[0]
 
+	// Remember the requested GoMLX dtype before any downcasting.
+	gomlxDType := dtype
+
+	// CoreML does not support float64 operations — downcast to float32.
+	if dtype == dtypes.Float64 {
+		dtype = dtypes.Float32
+	}
+	// CoreML does not support int64 operations — downcast to int32.
+	// GoMLX shape keeps Int64 so onnx-gomlx sees consistent types;
+	// buffer.go handles Int64↔Int32 at I/O boundaries.
+	if dtype == dtypes.Int64 {
+		dtype = dtypes.Int32
+	}
+
 	// Convert GoMLX dtype to CoreML dtype
 	milDType, err := gomlxDTypeToMIL(dtype)
 	if err != nil {
 		return nil, errors.Wrapf(err, "ConvertDType to %s", dtype)
 	}
 
-	// Output shape is the same as input, just with different dtype
+	// Output shape preserves the originally requested GoMLX dtype (Int64,
+	// Float64) so onnx-gomlx and callers see consistent types.
+	// The actual MIL operation uses the downcast dtype; the widening back
+	// to Int64/Float64 happens at the runtime I/O boundary.
 	outputShape := operand.shape.Clone()
-	outputShape.DType = dtype
+	outputShape.DType = gomlxDType
 
 	// Call the MIL Cast operation
 	resultValue := f.builder.milBuilder.Cast(operand.milValue, milDType)
@@ -1555,7 +1539,7 @@ func (f *Function) ConvertDType(x backends.Value, dtype dtypes.DType) (backends.
 // - Crosses all other axes
 //
 // The output shape is: [batch dims..., lhs cross dims..., rhs cross dims...]
-func (f *Function) DotGeneral(lhsOp backends.Value, lhsContractingAxes, lhsBatchAxes []int, rhsOp backends.Value, rhsContractingAxes, rhsBatchAxes []int) (backends.Value, error) {
+func (f *Function) DotGeneral(lhsOp backends.Value, lhsContractingAxes, lhsBatchAxes []int, rhsOp backends.Value, rhsContractingAxes, rhsBatchAxes []int, config backends.DotGeneralConfig) (backends.Value, error) {
 	opType := backends.OpTypeDotGeneral
 	inputs, err := f.builder.checkOps(opType.String(), lhsOp, rhsOp)
 	if err != nil {
