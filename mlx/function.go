@@ -10,7 +10,7 @@ import (
 	"runtime"
 	"unsafe"
 
-	"github.com/gomlx/go-coreml/mlx/gomlx/internal/bridge"
+	"github.com/gomlx/go-coreml/mlx/internal/bridge"
 	"github.com/gomlx/gomlx/backends"
 	"github.com/gomlx/gomlx/backends/notimplemented"
 	"github.com/gomlx/gomlx/backends/shapeinference"
@@ -953,6 +953,24 @@ func readScalarInt(arr *bridge.Array, dt dtypes.DType) int {
 	}
 }
 
+// newScalarSeed creates a scalar MLX array for a seed value in the given dtype,
+// avoiding int32 truncation for larger integer types.
+func newScalarSeed(val uint64, dt dtypes.DType) *bridge.Array {
+	switch dt {
+	case dtypes.Int64:
+		v := int64(val)
+		return bridge.NewArrayFromData(unsafe.Pointer(&v), nil, gomlxDTypeToMLX(dt))
+	case dtypes.Uint64:
+		v := val
+		return bridge.NewArrayFromData(unsafe.Pointer(&v), nil, gomlxDTypeToMLX(dt))
+	case dtypes.Uint32:
+		v := uint32(val)
+		return bridge.NewArrayFromData(unsafe.Pointer(&v), nil, gomlxDTypeToMLX(dt))
+	default:
+		return bridge.NewArrayScalarInt32(int32(val))
+	}
+}
+
 // dynamicIndexInfo holds the tape metadata for dynamic index nodes,
 // used to reconstruct start positions during tape replay.
 type dynamicIndexInfo struct {
@@ -1363,10 +1381,7 @@ func (f *Function) RNGBitGenerator(state backends.Value, shape shapes.Shape) (ne
 	r := bridge.RandomBits(shape.Dimensions, int(shape.DType.Size())*8, key, s)
 
 	newSeed := seed + 1
-	newSeedArr := bridge.NewArrayScalarInt32(int32(newSeed))
-	newStateArr := bridge.AsType(newSeedArr, gomlxDTypeToMLX(stateNode.shape.DType), s)
-	newSeedArr.Free()
-
+	newStateArr := newScalarSeed(newSeed, stateNode.shape.DType)
 	newStateReshaped := bridge.Reshape(newStateArr, stateNode.shape.Dimensions, s)
 	newStateArr.Free()
 
@@ -1377,16 +1392,13 @@ func (f *Function) RNGBitGenerator(state backends.Value, shape shapes.Shape) (ne
 	bits := int(shape.DType.Size()) * 8
 	stDims := append([]int{}, stateNode.shape.Dimensions...)
 	oDims := append([]int{}, shape.Dimensions...)
-	stDType := gomlxDTypeToMLX(stateNode.shape.DType)
 
 	newStateNode := f.record(stShape, newStateReshaped, func(arrays []*bridge.Array, s *bridge.Stream) *bridge.Array {
 		bridge.Eval(arrays[si])
 		sd := uint64(readScalarInt(arrays[si], stGomlxDType))
-		ns := bridge.NewArrayScalarInt32(int32(sd + 1))
-		na := bridge.AsType(ns, stDType, s)
+		ns := newScalarSeed(sd+1, stGomlxDType)
+		res := bridge.Reshape(ns, stDims, s)
 		ns.Free()
-		res := bridge.Reshape(na, stDims, s)
-		na.Free()
 		return res
 	})
 	valNode := f.record(outShape, r, func(arrays []*bridge.Array, s *bridge.Stream) *bridge.Array {

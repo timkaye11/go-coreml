@@ -1,4 +1,4 @@
-module github.com/gomlx/go-coreml/mlx/gomlx
+module github.com/gomlx/go-coreml/mlx
 
 go 1.25
 

@@ -644,3 +644,85 @@ func TestIdentity(t *testing.T) {
 		})
 	assertClose(t, "Identity", results[0], []float32{42, 43, 44}, 1e-5)
 }
+
+// TestMLPEndToEnd simulates a 2-layer MLP forward pass with ReLU activation,
+// exercising matmul, bias add, relu, softmax, and tape replay with multiple inputs.
+func TestMLPEndToEnd(t *testing.T) {
+	b := newBackend(t)
+	defer b.Finalize()
+
+	// Layer shapes: input [2,3], W1 [3,4], b1 [4], W2 [4,2], b2 [2]
+	xShape := shapes.Make(dtypes.Float32, 2, 3)
+	w1Shape := shapes.Make(dtypes.Float32, 3, 4)
+	b1Shape := shapes.Make(dtypes.Float32, 4)
+	w2Shape := shapes.Make(dtypes.Float32, 4, 2)
+	b2Shape := shapes.Make(dtypes.Float32, 2)
+
+	builder := b.Builder("MLP")
+	main := builder.Main()
+	fn := main.(backends.Function)
+
+	xParam, _ := fn.Parameter("x", xShape, nil)
+	w1Param, _ := fn.Parameter("w1", w1Shape, nil)
+	b1Param, _ := fn.Parameter("b1", b1Shape, nil)
+	w2Param, _ := fn.Parameter("w2", w2Shape, nil)
+	b2Param, _ := fn.Parameter("b2", b2Shape, nil)
+
+	// Layer 1: FusedDense with ReLU (matmul + bias + relu)
+	h, _ := fn.FusedDense(xParam, w1Param, b1Param, backends.ActivationRelu)
+
+	// Layer 2: FusedDense with no activation, then softmax
+	out, _ := fn.FusedDense(h, w2Param, b2Param, backends.ActivationNone)
+	out, _ = fn.FusedSoftmax(out, 1)
+
+	fn.Return([]backends.Value{out}, nil)
+	exec, err := builder.Compile()
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+	defer exec.Finalize()
+
+	// Weights (fixed for reproducibility)
+	w1Data := []float32{0.1, 0.2, -0.1, 0.3, -0.2, 0.1, 0.4, -0.3, 0.3, -0.1, 0.2, 0.1}
+	b1Data := []float32{0.01, -0.01, 0.02, -0.02}
+	w2Data := []float32{0.2, -0.1, -0.3, 0.4, 0.1, 0.2, -0.2, 0.3}
+	b2Data := []float32{0.0, 0.0}
+
+	w1Buf, _ := b.BufferFromFlatData(0, w1Data, w1Shape)
+	b1Buf, _ := b.BufferFromFlatData(0, b1Data, b1Shape)
+	w2Buf, _ := b.BufferFromFlatData(0, w2Data, w2Shape)
+	b2Buf, _ := b.BufferFromFlatData(0, b2Data, b2Shape)
+
+	// Run with two different inputs to verify tape replay.
+	for run, xData := range [][]float32{
+		{1, 2, 3, 4, 5, 6},
+		{0.5, -1, 2, 3, 0, -0.5},
+	} {
+		xBuf, _ := b.BufferFromFlatData(0, xData, xShape)
+		results, err := exec.Execute(
+			[]backends.Buffer{xBuf, w1Buf, b1Buf, w2Buf, b2Buf}, nil, 0)
+		if err != nil {
+			t.Fatalf("Run %d: Execute failed: %v", run, err)
+		}
+
+		outData := make([]float32, 4)
+		if err := b.BufferToFlatData(results[0], outData); err != nil {
+			t.Fatalf("Run %d: BufferToFlatData failed: %v", run, err)
+		}
+
+		// Verify softmax properties: each row sums to 1, all values in [0,1].
+		for row := 0; row < 2; row++ {
+			sum := float64(outData[row*2]) + float64(outData[row*2+1])
+			if math.Abs(sum-1.0) > 1e-5 {
+				t.Errorf("Run %d row %d: softmax sum = %f, want 1.0", run, row, sum)
+			}
+			for col := 0; col < 2; col++ {
+				v := outData[row*2+col]
+				if v < 0 || v > 1 {
+					t.Errorf("Run %d row %d col %d: softmax value %f out of [0,1]", run, row, col, v)
+				}
+			}
+		}
+		t.Logf("Run %d: MLP output = %v", run, outData)
+	}
+}
