@@ -182,8 +182,11 @@ func Copy(x *Array, s *Stream) *Array                                           
 func ArraySet(dst, src *Array)                                                                      {}
 func AsStrided(x *Array, shape []int, strides []int64, offset int, s *Stream) *Array               { return nil }
 
+type GoClosureFunc func(inputs []*Array) []*Array
+
 type Closure struct{}
 
-func NewClosure(inputs, outputs []*Array) *Closure                         { return nil }
+func NewClosureFromGoFunc(fn GoClosureFunc) *Closure                       { return nil }
+func CompileClosure(cl *Closure, shapeless bool) *Closure                  { return nil }
 func (c *Closure) Free()                                                    {}
 func ApplyClosure(cl *Closure, inputs []*Array) ([]*Array, error)          { return nil, errNoCGo }

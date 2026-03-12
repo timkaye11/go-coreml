@@ -54,10 +54,12 @@ func freeIntermediates(fn *Function, arrays []*bridge.Array, outputTapeIndices m
 }
 
 // Executable implements backends.Executable for the MLX backend.
-// Execute replays the recorded tape with actual input data.
+// It uses a compiled MLX closure for fused GPU execution.
 type Executable struct {
 	backend      *Backend
 	mainFn       *Function
+	compiled     *bridge.Closure // compiled closure for fused execution
+	rawClosure   *bridge.Closure // uncompiled closure (must be freed)
 	inputNames   []string
 	inputShapes  []shapes.Shape
 	outputShapes []shapes.Shape
@@ -66,7 +68,19 @@ type Executable struct {
 
 var _ backends.Executable = &Executable{}
 
-func (e *Executable) Finalize() {}
+func (e *Executable) Finalize() {
+	if e.compiled != nil {
+		e.compiled.Free()
+		e.compiled = nil
+	}
+	if e.rawClosure != nil {
+		e.rawClosure.Free()
+		e.rawClosure = nil
+	}
+	if e.mainFn != nil {
+		e.mainFn.finalize()
+	}
+}
 
 func (e *Executable) Inputs() (names []string, inputShapes []shapes.Shape) {
 	return e.inputNames, e.inputShapes
@@ -98,30 +112,25 @@ func (e *Executable) Execute(inputs []backends.Buffer, donate []bool, defaultDev
 		paramArrays[i] = buf.array
 	}
 
-	// Replay tape to build fresh computation graph.
-	s := e.backend.stream()
-	arrays := replayTape(e.mainFn, paramArrays, s)
+	// Use compiled closure for fused GPU execution.
+	outputArrays, err := bridge.ApplyClosure(e.compiled, paramArrays)
+	if err != nil {
+		return nil, errors.Wrap(err, "Execute: compiled closure apply")
+	}
 
 	// Evaluate output arrays.
-	outputTapeIndices := make(map[int]bool, len(e.mainFn.outputs))
-	outputArrays := make([]*bridge.Array, len(e.mainFn.outputs))
-	for i, out := range e.mainFn.outputs {
-		outputArrays[i] = arrays[out.tapeIdx]
-		outputTapeIndices[out.tapeIdx] = true
-	}
 	if err := bridge.Eval(outputArrays...); err != nil {
-		freeIntermediates(e.mainFn, arrays, outputTapeIndices)
+		for _, a := range outputArrays {
+			a.Free()
+		}
 		return nil, errors.Wrap(err, "Execute: eval")
 	}
 
 	// Wrap output arrays as mlxBuffers.
 	results := make([]backends.Buffer, len(e.outputShapes))
 	for i, out := range e.mainFn.outputs {
-		results[i] = newBufferFromArray(arrays[out.tapeIdx], out.shape)
+		results[i] = newBufferFromArray(outputArrays[i], out.shape)
 	}
-
-	// Free intermediate arrays that are no longer needed.
-	freeIntermediates(e.mainFn, arrays, outputTapeIndices)
 
 	return results, nil
 }
@@ -175,7 +184,11 @@ type ExecutableWithCF struct {
 
 var _ backends.Executable = &ExecutableWithCF{}
 
-func (e *ExecutableWithCF) Finalize() {}
+func (e *ExecutableWithCF) Finalize() {
+	if e.mainFn != nil {
+		e.mainFn.finalize()
+	}
+}
 
 func (e *ExecutableWithCF) Inputs() ([]string, []shapes.Shape) {
 	return e.inputNames, e.inputShapes

@@ -11,6 +11,7 @@ package bridge
 #cgo darwin LDFLAGS: -L${SRCDIR}/deps/lib -lmlxc -lmlx -lc++ -framework Metal -framework Foundation -framework Accelerate
 
 #include "mlx/c/mlx.h"
+#include "mlx/c/compile.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -29,11 +30,19 @@ static int mlx_stream_ctx_is_null(mlx_stream s) {
 static int mlx_vector_array_ctx_is_null(mlx_vector_array v) {
     return v.ctx == NULL;
 }
+
+// CGo trampoline: C function that forwards to Go callback via payload.
+extern int goClosureCallback(mlx_vector_array* res, const mlx_vector_array inputs, void* payload);
+
+static mlx_closure create_go_closure(void* payload) {
+    return mlx_closure_new_func_payload(goClosureCallback, payload, NULL);
+}
 */
 import "C"
 import (
 	"fmt"
 	"runtime"
+	"sync"
 	"unsafe"
 )
 
@@ -1177,35 +1186,86 @@ func ArraySet(dst, src *Array) {
 // Closure (for compiled function execution)
 // ===========================================================================
 
-// Closure wraps an mlx_closure that maps inputs to outputs.
-type Closure struct {
-	handle C.mlx_closure
+// GoClosureFunc is the Go function type that closures wrap.
+// It takes input arrays and returns output arrays.
+type GoClosureFunc func(inputs []*Array) []*Array
+
+// closureRegistry maps payload IDs to Go closure functions.
+var closureRegistry struct {
+	sync.Mutex
+	funcs   map[uintptr]GoClosureFunc
+	counter uintptr
 }
 
-// NewClosure creates a closure that maps input arrays to output arrays.
-// The function is defined by providing input placeholder arrays and the
-// output arrays that depend on them.
-func NewClosure(inputs, outputs []*Array) *Closure {
-	cl := &Closure{}
-	inVec := NewVectorArray(inputs)
-	defer inVec.Free()
-	outVec := NewVectorArray(outputs)
-	defer outVec.Free()
+func init() {
+	closureRegistry.funcs = make(map[uintptr]GoClosureFunc)
+}
 
-	// Create a closure from the traced computation.
-	// Use mlx_closure_new_func with a callback that replays the computation.
-	// Actually, MLX traces work differently — we need to use the compile API.
-	// For now, use a simpler approach: trace the computation by creating
-	// new inputs, replaying through the graph, and evaluating.
-	//
-	// The mlx closure API requires a C function pointer, which is complex with CGo.
-	// Instead, we'll use a Go-side approach: store the traced graph and replay.
-	cl.handle = C.mlx_closure_new()
+//export goClosureCallback
+func goClosureCallback(res *C.mlx_vector_array, inputs C.mlx_vector_array, payload unsafe.Pointer) C.int {
+	id := uintptr(payload)
+	closureRegistry.Lock()
+	fn, ok := closureRegistry.funcs[id]
+	closureRegistry.Unlock()
+	if !ok {
+		return 1 // error: callback not found
+	}
+
+	// Unpack input arrays from the vector.
+	inVec := &VectorArray{handle: inputs}
+	n := inVec.Size()
+	goInputs := make([]*Array, n)
+	for i := 0; i < n; i++ {
+		goInputs[i] = inVec.Get(i)
+	}
+
+	// Call the Go function.
+	goOutputs := fn(goInputs)
+
+	// Pack output arrays into the result vector.
+	outVec := NewVectorArray(goOutputs)
+	*res = outVec.handle
+
+	return 0
+}
+
+// Closure wraps an mlx_closure that maps inputs to outputs.
+type Closure struct {
+	handle     C.mlx_closure
+	registryID uintptr // non-zero if registered in closureRegistry
+}
+
+// NewClosureFromGoFunc creates an MLX closure backed by a Go function.
+func NewClosureFromGoFunc(fn GoClosureFunc) *Closure {
+	closureRegistry.Lock()
+	closureRegistry.counter++
+	id := closureRegistry.counter
+	closureRegistry.funcs[id] = fn
+	closureRegistry.Unlock()
+
+	cl := &Closure{
+		registryID: id,
+	}
+	cl.handle = C.create_go_closure(unsafe.Pointer(id))
 	return cl
 }
 
-// FreeClosure releases the closure.
-func (cl *Closure) FreeClosure() {
+// CompileClosure wraps a closure with mlx_compile for fused GPU execution.
+func CompileClosure(cl *Closure, shapeless bool) *Closure {
+	compiled := &Closure{}
+	rc := C.mlx_compile(&compiled.handle, cl.handle, C.bool(shapeless))
+	checkRC(rc, "mlx_compile")
+	return compiled
+}
+
+// Free releases the closure and unregisters from the registry if needed.
+func (cl *Closure) Free() {
+	if cl.registryID != 0 {
+		closureRegistry.Lock()
+		delete(closureRegistry.funcs, cl.registryID)
+		closureRegistry.Unlock()
+		cl.registryID = 0
+	}
 	C.mlx_closure_free(cl.handle)
 }
 

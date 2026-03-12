@@ -45,6 +45,10 @@ type Function struct {
 	tape         []func(arrays []*bridge.Array, s *bridge.Stream) *bridge.Array
 	constIndices []int // Tape indices of constants (must not be freed during replay cleanup)
 
+	// buildArrays tracks all MLX arrays created during graph building,
+	// so they can be freed when the function is finalized.
+	buildArrays []*bridge.Array
+
 	// controlFlowStep records a control flow operation (While/If/Sort/Call).
 	controlFlowStep *controlFlowStep
 }
@@ -149,7 +153,20 @@ func (f *Function) validateClosure(opName, closureName string, closure backends.
 func (f *Function) record(shape shapes.Shape, arr *bridge.Array, tapeFn func(arrays []*bridge.Array, s *bridge.Stream) *bridge.Array) *graphNode {
 	idx := len(f.tape)
 	f.tape = append(f.tape, tapeFn)
+	if arr != nil {
+		f.buildArrays = append(f.buildArrays, arr)
+	}
 	return &graphNode{array: arr, shape: shape, owner: f, tapeIdx: idx}
+}
+
+// finalize frees all build-time MLX arrays held by this function.
+func (f *Function) finalize() {
+	for _, arr := range f.buildArrays {
+		if arr != nil {
+			arr.Free()
+		}
+	}
+	f.buildArrays = nil
 }
 
 // makeScalarConst creates a scalar constant of the given dtype.
@@ -177,6 +194,7 @@ func (f *Function) Parameter(name string, shape shapes.Shape, sharding *backends
 	f.tape = append(f.tape, nil)
 	node := &graphNode{array: arr, shape: shape, name: name, owner: f, tapeIdx: idx}
 	f.params = append(f.params, node)
+	f.buildArrays = append(f.buildArrays, arr)
 	return node, nil
 }
 
@@ -861,6 +879,7 @@ func (f *Function) dotGeneralDecompose(
 	outShape shapes.Shape,
 ) (*graphNode, error) {
 	result := dotGeneralReplay(l.array, l.shape, lContract, lBatch, r.array, r.shape, rContract, rBatch, outShape, f.stream())
+	f.buildArrays = append(f.buildArrays, result)
 	return &graphNode{array: result, shape: outShape, owner: f}, nil
 }
 

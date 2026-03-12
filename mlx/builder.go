@@ -5,6 +5,7 @@
 package mlx
 
 import (
+	"github.com/gomlx/go-coreml/mlx/internal/bridge"
 	"github.com/gomlx/gomlx/backends"
 	"github.com/gomlx/gomlx/backends/notimplemented"
 	"github.com/gomlx/gomlx/pkg/core/shapes"
@@ -83,11 +84,38 @@ func (b *Builder) Compile() (backends.Executable, error) {
 }
 
 // compileSimple compiles a function without control flow into a single Executable.
+// It wraps the tape replay in an MLX compiled closure for fused GPU execution.
 func (b *Builder) compileSimple() (backends.Executable, error) {
 	inputNames, inputShapes := collectParamInfo(b.mainFn.params)
+	mainFn := b.mainFn
+	backend := b.backend
+
+	// Create a Go closure that replays the tape and returns output arrays.
+	// Note: we do NOT free intermediates here. mlx_compile traces this closure
+	// once and caches the fused graph. On cache hits, MLX reuses the cached
+	// graph and discards the lazy arrays we create, so freeing them is wasted
+	// work. MLX's internal refcounting keeps the trace graph alive as needed.
+	replayFn := func(inputs []*bridge.Array) []*bridge.Array {
+		s := backend.stream()
+		arrays := replayTape(mainFn, inputs, s)
+
+		outputs := make([]*bridge.Array, len(mainFn.outputs))
+		for i, out := range mainFn.outputs {
+			outputs[i] = arrays[out.tapeIdx]
+		}
+
+		return outputs
+	}
+
+	// Wrap as an MLX closure and compile it for fused execution.
+	rawClosure := bridge.NewClosureFromGoFunc(replayFn)
+	compiled := bridge.CompileClosure(rawClosure, false)
+
 	return &Executable{
 		backend:      b.backend,
 		mainFn:       b.mainFn,
+		compiled:     compiled,
+		rawClosure:   rawClosure,
 		inputNames:   inputNames,
 		inputShapes:  inputShapes,
 		outputShapes: collectOutputShapes(b.mainFn.outputs),
