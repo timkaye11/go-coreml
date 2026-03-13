@@ -7,7 +7,9 @@ package mlx
 import (
 	"math"
 	"testing"
+	"unsafe"
 
+	"github.com/gomlx/go-coreml/mlx/internal/bridge"
 	"github.com/gomlx/gomlx/backends"
 	"github.com/gomlx/gomlx/pkg/core/dtypes"
 	"github.com/gomlx/gomlx/pkg/core/shapes"
@@ -725,4 +727,737 @@ func TestMLPEndToEnd(t *testing.T) {
 		}
 		t.Logf("Run %d: MLP output = %v", run, outData)
 	}
+}
+
+// ===========================================================================
+// Autograd Transforms
+// ===========================================================================
+
+// TestValueAndGrad tests that mlx_value_and_grad computes correct gradients.
+// f(x) = x^2, f'(x) = 2x. For x=3.0, f(x)=9.0, f'(x)=6.0.
+func TestValueAndGrad(t *testing.T) {
+	b := newBackend(t)
+	defer b.Finalize()
+
+	// Create a closure that computes x^2 (sum to get scalar loss).
+	squareFn := bridge.NewClosureFromGoFunc(func(inputs []*bridge.Array) []*bridge.Array {
+		s := b.stream()
+		sq := bridge.Multiply(inputs[0], inputs[0], s)
+		// Sum to scalar (value_and_grad requires scalar output).
+		summed := bridge.Sum(sq, []int{0}, false, s)
+		return []*bridge.Array{summed}
+	})
+	defer squareFn.Free()
+
+	// Create value_and_grad w.r.t. argument 0.
+	vg := bridge.ValueAndGrad(squareFn, []int{0})
+	defer vg.Free()
+
+	// Apply with x = [3.0].
+	x := bridge.NewArrayFromData(nil, []int{1}, bridge.DTypeFloat32)
+	// Create from flat data.
+	xData := []float32{3.0}
+	x = bridge.NewArrayFromData(unsafe.Pointer(&xData[0]), []int{1}, bridge.DTypeFloat32)
+
+	values, grads, err := vg.Apply([]*bridge.Array{x})
+	if err != nil {
+		t.Fatalf("ValueAndGrad.Apply failed: %v", err)
+	}
+	if err := bridge.Eval(append(values, grads...)...); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+
+	// Check value: x^2 = 9.0.
+	valPtr := values[0].DataPtr()
+	val := *(*float32)(valPtr)
+	if math.Abs(float64(val)-9.0) > 0.001 {
+		t.Errorf("value: expected 9.0, got %f", val)
+	}
+
+	// Check gradient: 2*x = 6.0.
+	gradPtr := grads[0].DataPtr()
+	grad := *(*float32)(gradPtr)
+	if math.Abs(float64(grad)-6.0) > 0.001 {
+		t.Errorf("gradient: expected 6.0, got %f", grad)
+	}
+
+	t.Logf("f(3.0) = %f, f'(3.0) = %f", val, grad)
+
+	for _, a := range values { a.Free() }
+	for _, a := range grads { a.Free() }
+	x.Free()
+}
+
+// TestVJP tests that mlx_vjp (reverse-mode autodiff) works correctly.
+// f(x) = x^2, VJP with cotangent=1 gives gradient = 2*x.
+func TestVJP(t *testing.T) {
+	b := newBackend(t)
+	defer b.Finalize()
+
+	squareFn := bridge.NewClosureFromGoFunc(func(inputs []*bridge.Array) []*bridge.Array {
+		s := b.stream()
+		sq := bridge.Multiply(inputs[0], inputs[0], s)
+		return []*bridge.Array{sq}
+	})
+	defer squareFn.Free()
+
+	// x = [3.0]
+	xData := []float32{3.0}
+	x := bridge.NewArrayFromData(unsafe.Pointer(&xData[0]), []int{1}, bridge.DTypeFloat32)
+
+	// cotangent = [1.0] (seed for backward pass)
+	cotData := []float32{1.0}
+	cot := bridge.NewArrayFromData(unsafe.Pointer(&cotData[0]), []int{1}, bridge.DTypeFloat32)
+
+	outputs, vjps, err := bridge.VJP(squareFn, []*bridge.Array{x}, []*bridge.Array{cot})
+	if err != nil {
+		t.Fatalf("VJP failed: %v", err)
+	}
+	if err := bridge.Eval(append(outputs, vjps...)...); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+
+	// Output: x^2 = 9.0.
+	outVal := *(*float32)(outputs[0].DataPtr())
+	if math.Abs(float64(outVal)-9.0) > 0.001 {
+		t.Errorf("output: expected 9.0, got %f", outVal)
+	}
+
+	// VJP: d(x^2)/dx * cotangent = 2*3 * 1 = 6.0.
+	vjpVal := *(*float32)(vjps[0].DataPtr())
+	if math.Abs(float64(vjpVal)-6.0) > 0.001 {
+		t.Errorf("vjp: expected 6.0, got %f", vjpVal)
+	}
+
+	t.Logf("f(3.0) = %f, vjp = %f", outVal, vjpVal)
+
+	for _, a := range outputs { a.Free() }
+	for _, a := range vjps { a.Free() }
+	x.Free()
+	cot.Free()
+}
+
+// TestJVP tests that mlx_jvp (forward-mode autodiff) works correctly.
+// f(x) = x^2, JVP with tangent=1 gives directional derivative = 2*x.
+func TestJVP(t *testing.T) {
+	b := newBackend(t)
+	defer b.Finalize()
+
+	squareFn := bridge.NewClosureFromGoFunc(func(inputs []*bridge.Array) []*bridge.Array {
+		s := b.stream()
+		sq := bridge.Multiply(inputs[0], inputs[0], s)
+		return []*bridge.Array{sq}
+	})
+	defer squareFn.Free()
+
+	// x = [3.0]
+	xData := []float32{3.0}
+	x := bridge.NewArrayFromData(unsafe.Pointer(&xData[0]), []int{1}, bridge.DTypeFloat32)
+
+	// tangent = [1.0]
+	tanData := []float32{1.0}
+	tan := bridge.NewArrayFromData(unsafe.Pointer(&tanData[0]), []int{1}, bridge.DTypeFloat32)
+
+	outputs, jvps, err := bridge.JVP(squareFn, []*bridge.Array{x}, []*bridge.Array{tan})
+	if err != nil {
+		t.Fatalf("JVP failed: %v", err)
+	}
+	if err := bridge.Eval(append(outputs, jvps...)...); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+
+	// Output: x^2 = 9.0.
+	outVal := *(*float32)(outputs[0].DataPtr())
+	if math.Abs(float64(outVal)-9.0) > 0.001 {
+		t.Errorf("output: expected 9.0, got %f", outVal)
+	}
+
+	// JVP: d(x^2)/dx * tangent = 2*3 * 1 = 6.0.
+	jvpVal := *(*float32)(jvps[0].DataPtr())
+	if math.Abs(float64(jvpVal)-6.0) > 0.001 {
+		t.Errorf("jvp: expected 6.0, got %f", jvpVal)
+	}
+
+	t.Logf("f(3.0) = %f, jvp = %f", outVal, jvpVal)
+
+	for _, a := range outputs { a.Free() }
+	for _, a := range jvps { a.Free() }
+	x.Free()
+	tan.Free()
+}
+
+// TestValueAndGradMultiParam tests value_and_grad with multiple parameters.
+// f(x, y) = sum(x * y), df/dx = y, df/dy = x.
+func TestValueAndGradMultiParam(t *testing.T) {
+	b := newBackend(t)
+	defer b.Finalize()
+
+	dotFn := bridge.NewClosureFromGoFunc(func(inputs []*bridge.Array) []*bridge.Array {
+		s := b.stream()
+		prod := bridge.Multiply(inputs[0], inputs[1], s)
+		summed := bridge.Sum(prod, []int{0}, false, s)
+		return []*bridge.Array{summed}
+	})
+	defer dotFn.Free()
+
+	// Differentiate w.r.t. both arguments.
+	vg := bridge.ValueAndGrad(dotFn, []int{0, 1})
+	defer vg.Free()
+
+	// x = [2.0, 3.0], y = [4.0, 5.0]
+	xData := []float32{2.0, 3.0}
+	yData := []float32{4.0, 5.0}
+	x := bridge.NewArrayFromData(unsafe.Pointer(&xData[0]), []int{2}, bridge.DTypeFloat32)
+	y := bridge.NewArrayFromData(unsafe.Pointer(&yData[0]), []int{2}, bridge.DTypeFloat32)
+
+	values, grads, err := vg.Apply([]*bridge.Array{x, y})
+	if err != nil {
+		t.Fatalf("ValueAndGrad.Apply failed: %v", err)
+	}
+	if err := bridge.Eval(append(values, grads...)...); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+
+	// Value: sum(x*y) = 2*4 + 3*5 = 23.0.
+	val := *(*float32)(values[0].DataPtr())
+	if math.Abs(float64(val)-23.0) > 0.001 {
+		t.Errorf("value: expected 23.0, got %f", val)
+	}
+
+	// Grad w.r.t. x = y = [4.0, 5.0].
+	gradX0 := *(*float32)(grads[0].DataPtr())
+	gradX := make([]float32, 2)
+	gradX[0] = gradX0
+	gradXArr := grads[0]
+	size := gradXArr.Size()
+	if size != 2 {
+		t.Fatalf("grad x size: expected 2, got %d", size)
+	}
+
+	// Grad w.r.t. y = x = [2.0, 3.0].
+	gradYArr := grads[1]
+	sizeY := gradYArr.Size()
+	if sizeY != 2 {
+		t.Fatalf("grad y size: expected 2, got %d", sizeY)
+	}
+
+	t.Logf("f(x,y) = %f, grad_x size = %d, grad_y size = %d", val, size, sizeY)
+
+	for _, a := range values { a.Free() }
+	for _, a := range grads { a.Free() }
+	x.Free()
+	y.Free()
+}
+
+// ===========================================================================
+// Memory Profiling Tests
+// ===========================================================================
+
+func TestMemoryProfiling(t *testing.T) {
+	b := newBackend(t)
+	defer b.Finalize()
+
+	bridge.ResetPeakMemory()
+
+	// Allocate a buffer to force some memory usage.
+	data := make([]float32, 1024)
+	shape := shapes.Make(dtypes.Float32, 1024)
+	buf, err := b.BufferFromFlatData(0, data, shape)
+	if err != nil {
+		t.Fatalf("BufferFromFlatData failed: %v", err)
+	}
+	_ = buf
+
+	peak := bridge.GetPeakMemory()
+	cache := bridge.GetCacheMemory()
+	active := bridge.GetActiveMemory()
+
+	t.Logf("Peak: %d bytes, Cache: %d bytes, Active: %d bytes", peak, cache, active)
+
+	// SetWiredLimit should return a value.
+	prev := bridge.SetWiredLimit(1 << 30) // 1GB
+	t.Logf("Previous wired limit: %d", prev)
+}
+
+// ===========================================================================
+// Cumulative Ops Tests
+// ===========================================================================
+
+func TestCumSum(t *testing.T) {
+	s := bridge.DefaultGPUStream()
+
+	data := []float32{1, 2, 3, 4}
+	x := bridge.NewArrayFromData(unsafe.Pointer(&data[0]), []int{4}, bridge.DTypeFloat32)
+
+	result := bridge.CumSum(x, 0, false, true, s)
+	if err := bridge.Eval(result); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+
+	out := make([]float32, 4)
+	ptr := result.DataPtr()
+	copy(out, unsafe.Slice((*float32)(ptr), 4))
+
+	expected := []float32{1, 3, 6, 10}
+	for i, v := range out {
+		if math.Abs(float64(v)-float64(expected[i])) > 0.001 {
+			t.Errorf("cumsum[%d]: expected %f, got %f", i, expected[i], v)
+		}
+	}
+	t.Logf("CumSum: %v", out)
+	result.Free()
+	x.Free()
+}
+
+func TestCumProd(t *testing.T) {
+	s := bridge.DefaultGPUStream()
+
+	data := []float32{1, 2, 3, 4}
+	x := bridge.NewArrayFromData(unsafe.Pointer(&data[0]), []int{4}, bridge.DTypeFloat32)
+
+	result := bridge.CumProd(x, 0, false, true, s)
+	if err := bridge.Eval(result); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+
+	out := make([]float32, 4)
+	copy(out, unsafe.Slice((*float32)(result.DataPtr()), 4))
+
+	expected := []float32{1, 2, 6, 24}
+	for i, v := range out {
+		if math.Abs(float64(v)-float64(expected[i])) > 0.001 {
+			t.Errorf("cumprod[%d]: expected %f, got %f", i, expected[i], v)
+		}
+	}
+	t.Logf("CumProd: %v", out)
+	result.Free()
+	x.Free()
+}
+
+// ===========================================================================
+// Statistical Ops Tests
+// ===========================================================================
+
+func TestMean(t *testing.T) {
+	s := bridge.DefaultGPUStream()
+
+	data := []float32{1, 2, 3, 4, 5, 6}
+	x := bridge.NewArrayFromData(unsafe.Pointer(&data[0]), []int{2, 3}, bridge.DTypeFloat32)
+
+	// Mean over all elements.
+	result := bridge.Mean(x, false, s)
+	if err := bridge.Eval(result); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+	val := *(*float32)(result.DataPtr())
+	if math.Abs(float64(val)-3.5) > 0.001 {
+		t.Errorf("mean: expected 3.5, got %f", val)
+	}
+	t.Logf("Mean(all): %f", val)
+
+	// Mean along axis 1.
+	result2 := bridge.MeanAxis(x, 1, false, s)
+	if err := bridge.Eval(result2); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+	out := make([]float32, 2)
+	copy(out, unsafe.Slice((*float32)(result2.DataPtr()), 2))
+	if math.Abs(float64(out[0])-2.0) > 0.001 || math.Abs(float64(out[1])-5.0) > 0.001 {
+		t.Errorf("mean(axis=1): expected [2.0, 5.0], got %v", out)
+	}
+	t.Logf("Mean(axis=1): %v", out)
+
+	result.Free()
+	result2.Free()
+	x.Free()
+}
+
+func TestVarianceAndStd(t *testing.T) {
+	s := bridge.DefaultGPUStream()
+
+	data := []float32{2, 4, 4, 4, 5, 5, 7, 9}
+	x := bridge.NewArrayFromData(unsafe.Pointer(&data[0]), []int{8}, bridge.DTypeFloat32)
+
+	// Population variance (ddof=0).
+	vResult := bridge.Variance(x, false, 0, s)
+	if err := bridge.Eval(vResult); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+	variance := *(*float32)(vResult.DataPtr())
+	if math.Abs(float64(variance)-4.0) > 0.01 {
+		t.Errorf("variance: expected 4.0, got %f", variance)
+	}
+
+	// Std dev.
+	sResult := bridge.StdDev(x, false, 0, s)
+	if err := bridge.Eval(sResult); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+	stddev := *(*float32)(sResult.DataPtr())
+	if math.Abs(float64(stddev)-2.0) > 0.01 {
+		t.Errorf("std: expected 2.0, got %f", stddev)
+	}
+	t.Logf("Var: %f, Std: %f", variance, stddev)
+
+	vResult.Free()
+	sResult.Free()
+	x.Free()
+}
+
+func TestLogSumExp(t *testing.T) {
+	s := bridge.DefaultGPUStream()
+
+	data := []float32{1, 2, 3}
+	x := bridge.NewArrayFromData(unsafe.Pointer(&data[0]), []int{3}, bridge.DTypeFloat32)
+
+	result := bridge.LogSumExp(x, false, s)
+	if err := bridge.Eval(result); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+	val := *(*float32)(result.DataPtr())
+	// log(e^1 + e^2 + e^3) ≈ 3.4076
+	expected := math.Log(math.Exp(1) + math.Exp(2) + math.Exp(3))
+	if math.Abs(float64(val)-expected) > 0.01 {
+		t.Errorf("logsumexp: expected %f, got %f", expected, val)
+	}
+	t.Logf("LogSumExp: %f", val)
+	result.Free()
+	x.Free()
+}
+
+// ===========================================================================
+// Array Manipulation Tests
+// ===========================================================================
+
+func TestTopK(t *testing.T) {
+	s := bridge.DefaultGPUStream()
+
+	data := []float32{3, 1, 4, 1, 5, 9, 2, 6}
+	x := bridge.NewArrayFromData(unsafe.Pointer(&data[0]), []int{8}, bridge.DTypeFloat32)
+
+	result := bridge.TopK(x, 3, s)
+	if err := bridge.Eval(result); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+	if result.Size() != 3 {
+		t.Errorf("topk size: expected 3, got %d", result.Size())
+	}
+	out := make([]float32, 3)
+	copy(out, unsafe.Slice((*float32)(result.DataPtr()), 3))
+	t.Logf("TopK(3): %v", out)
+
+	result.Free()
+	x.Free()
+}
+
+func TestFlatten(t *testing.T) {
+	s := bridge.DefaultGPUStream()
+
+	data := make([]float32, 24)
+	for i := range data {
+		data[i] = float32(i)
+	}
+	x := bridge.NewArrayFromData(unsafe.Pointer(&data[0]), []int{2, 3, 4}, bridge.DTypeFloat32)
+
+	result := bridge.Flatten(x, 1, 2, s)
+	if err := bridge.Eval(result); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+	shape := result.Shape()
+	if len(shape) != 2 || shape[0] != 2 || shape[1] != 12 {
+		t.Errorf("flatten shape: expected [2, 12], got %v", shape)
+	}
+	t.Logf("Flatten: shape=%v", shape)
+	result.Free()
+	x.Free()
+}
+
+func TestSplit(t *testing.T) {
+	s := bridge.DefaultGPUStream()
+
+	data := make([]float32, 12)
+	for i := range data {
+		data[i] = float32(i)
+	}
+	x := bridge.NewArrayFromData(unsafe.Pointer(&data[0]), []int{12}, bridge.DTypeFloat32)
+
+	result := bridge.Split(x, 3, 0, s)
+	defer result.Free()
+	if result.Size() != 3 {
+		t.Errorf("split: expected 3 parts, got %d", result.Size())
+	}
+	for i := 0; i < result.Size(); i++ {
+		part := result.Get(i)
+		if part.Size() != 4 {
+			t.Errorf("split part %d: expected 4 elements, got %d", i, part.Size())
+		}
+		part.Free()
+	}
+	t.Logf("Split into %d parts", result.Size())
+	x.Free()
+}
+
+func TestLinspace(t *testing.T) {
+	s := bridge.DefaultGPUStream()
+
+	result := bridge.Linspace(0, 1, 5, bridge.DTypeFloat32, s)
+	if err := bridge.Eval(result); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+	out := make([]float32, 5)
+	copy(out, unsafe.Slice((*float32)(result.DataPtr()), 5))
+	expected := []float32{0, 0.25, 0.5, 0.75, 1.0}
+	for i, v := range out {
+		if math.Abs(float64(v)-float64(expected[i])) > 0.001 {
+			t.Errorf("linspace[%d]: expected %f, got %f", i, expected[i], v)
+		}
+	}
+	t.Logf("Linspace: %v", out)
+	result.Free()
+}
+
+// ===========================================================================
+// Linear Algebra Tests
+// ===========================================================================
+
+func TestLinalgInv(t *testing.T) {
+	s := bridge.DefaultCPUStream() // linalg ops require CPU stream
+
+	// 2x2 identity matrix — its inverse is itself.
+	data := []float32{1, 0, 0, 1}
+	x := bridge.NewArrayFromData(unsafe.Pointer(&data[0]), []int{2, 2}, bridge.DTypeFloat32)
+
+	inv := bridge.LinalgInv(x, s)
+	if err := bridge.Eval(inv); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+	out := make([]float32, 4)
+	copy(out, unsafe.Slice((*float32)(inv.DataPtr()), 4))
+	for i, v := range out {
+		if math.Abs(float64(v)-float64(data[i])) > 0.001 {
+			t.Errorf("inv[%d]: expected %f, got %f", i, data[i], v)
+		}
+	}
+	t.Logf("Inv(I) = %v", out)
+	inv.Free()
+	x.Free()
+}
+
+func TestLinalgSolve(t *testing.T) {
+	s := bridge.DefaultCPUStream() // linalg ops require CPU stream
+
+	// Solve Ax = b where A = [[2,1],[1,3]], b = [5,7] → x = [1.6, 1.8]
+	aData := []float32{2, 1, 1, 3}
+	bData := []float32{5, 7}
+	a := bridge.NewArrayFromData(unsafe.Pointer(&aData[0]), []int{2, 2}, bridge.DTypeFloat32)
+	bArr := bridge.NewArrayFromData(unsafe.Pointer(&bData[0]), []int{2}, bridge.DTypeFloat32)
+
+	result := bridge.LinalgSolve(a, bArr, s)
+	if err := bridge.Eval(result); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+	out := make([]float32, 2)
+	copy(out, unsafe.Slice((*float32)(result.DataPtr()), 2))
+	if math.Abs(float64(out[0])-1.6) > 0.01 || math.Abs(float64(out[1])-1.8) > 0.01 {
+		t.Errorf("solve: expected [1.6, 1.8], got %v", out)
+	}
+	t.Logf("Solve: %v", out)
+	result.Free()
+	a.Free()
+	bArr.Free()
+}
+
+func TestLinalgQR(t *testing.T) {
+	s := bridge.DefaultCPUStream() // linalg ops require CPU stream
+
+	data := []float32{1, 2, 3, 4}
+	x := bridge.NewArrayFromData(unsafe.Pointer(&data[0]), []int{2, 2}, bridge.DTypeFloat32)
+
+	q, r := bridge.LinalgQR(x, s)
+	if err := bridge.Eval(q, r); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+	t.Logf("QR: Q shape=%v, R shape=%v", q.Shape(), r.Shape())
+	if q.NDim() != 2 || r.NDim() != 2 {
+		t.Errorf("QR: expected 2D results, got Q=%dD, R=%dD", q.NDim(), r.NDim())
+	}
+	q.Free()
+	r.Free()
+	x.Free()
+}
+
+func TestLinalgNorm(t *testing.T) {
+	s := bridge.DefaultGPUStream() // norm works on GPU
+
+	data := []float32{3, 4}
+	x := bridge.NewArrayFromData(unsafe.Pointer(&data[0]), []int{2}, bridge.DTypeFloat32)
+
+	// L2 norm of [3,4] = 5.
+	result := bridge.LinalgNormL2(x, []int{0}, false, s)
+	if err := bridge.Eval(result); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+	val := *(*float32)(result.DataPtr())
+	if math.Abs(float64(val)-5.0) > 0.01 {
+		t.Errorf("norm: expected 5.0, got %f", val)
+	}
+	t.Logf("L2 norm([3,4]) = %f", val)
+	result.Free()
+	x.Free()
+}
+
+// ===========================================================================
+// SafeTensors IO Tests
+// ===========================================================================
+
+func TestSafeTensorsIO(t *testing.T) {
+	s := bridge.DefaultCPUStream() // IO ops require CPU stream
+
+	// Create test data.
+	data := []float32{1, 2, 3, 4, 5, 6}
+	arr := bridge.NewArrayFromData(unsafe.Pointer(&data[0]), []int{2, 3}, bridge.DTypeFloat32)
+	if err := bridge.Eval(arr); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+
+	// Build maps.
+	arrays := bridge.NewMapStringToArray()
+	arrays.Insert("weight", arr)
+
+	metadata := bridge.NewMapStringToString()
+	metadata.Insert("format", "pt")
+
+	// Save.
+	tmpPath := t.TempDir() + "/test.safetensors"
+	if err := bridge.SaveSafeTensors(tmpPath, arrays, metadata); err != nil {
+		t.Fatalf("SaveSafeTensors failed: %v", err)
+	}
+
+	// Load.
+	loadedArrays, loadedMeta, err := bridge.LoadSafeTensors(tmpPath, s)
+	if err != nil {
+		t.Fatalf("LoadSafeTensors failed: %v", err)
+	}
+
+	// Verify arrays.
+	w := loadedArrays.Get("weight")
+	if w == nil {
+		t.Fatal("loaded 'weight' is nil")
+	}
+	if err := bridge.Eval(w); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+	shape := w.Shape()
+	if len(shape) != 2 || shape[0] != 2 || shape[1] != 3 {
+		t.Errorf("loaded weight shape: expected [2,3], got %v", shape)
+	}
+	out := make([]float32, 6)
+	copy(out, unsafe.Slice((*float32)(w.DataPtr()), 6))
+	for i, v := range out {
+		if v != data[i] {
+			t.Errorf("loaded weight[%d]: expected %f, got %f", i, data[i], v)
+		}
+	}
+
+	// Verify metadata.
+	format, ok := loadedMeta.Get("format")
+	if !ok || format != "pt" {
+		t.Errorf("metadata 'format': expected 'pt', got '%s' (ok=%v)", format, ok)
+	}
+
+	t.Logf("SafeTensors roundtrip OK: shape=%v, metadata format=%s", shape, format)
+
+	arr.Free()
+	w.Free()
+	arrays.Free()
+	metadata.Free()
+	loadedArrays.Free()
+	loadedMeta.Free()
+}
+
+// ===========================================================================
+// Advanced RNG Tests
+// ===========================================================================
+
+func TestRandomBernoulli(t *testing.T) {
+	s := bridge.DefaultGPUStream()
+
+	pData := []float32{0.5}
+	p := bridge.NewArrayFromData(unsafe.Pointer(&pData[0]), []int{1}, bridge.DTypeFloat32)
+	key := bridge.RandomKey(42)
+
+	result := bridge.RandomBernoulli(p, []int{100}, key, s)
+	if err := bridge.Eval(result); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+	if result.Size() != 100 {
+		t.Errorf("bernoulli size: expected 100, got %d", result.Size())
+	}
+	t.Logf("RandomBernoulli: shape=%v", result.Shape())
+	result.Free()
+	p.Free()
+	key.Free()
+}
+
+func TestRandomRandInt(t *testing.T) {
+	s := bridge.DefaultGPUStream()
+
+	low := bridge.NewArrayScalarInt32(0)
+	high := bridge.NewArrayScalarInt32(10)
+	key := bridge.RandomKey(42)
+
+	result := bridge.RandomRandInt(low, high, []int{5}, bridge.DTypeInt32, key, s)
+	if err := bridge.Eval(result); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+	if result.Size() != 5 {
+		t.Errorf("randint size: expected 5, got %d", result.Size())
+	}
+	out := make([]int32, 5)
+	copy(out, unsafe.Slice((*int32)(result.DataPtr()), 5))
+	for i, v := range out {
+		if v < 0 || v >= 10 {
+			t.Errorf("randint[%d]: %d not in [0, 10)", i, v)
+		}
+	}
+	t.Logf("RandomRandInt: %v", out)
+	result.Free()
+	low.Free()
+	high.Free()
+	key.Free()
+}
+
+func TestRandomSeed(t *testing.T) {
+	// Just verify it doesn't panic.
+	bridge.RandomSeed(12345)
+	t.Log("RandomSeed(12345) OK")
+}
+
+// ===========================================================================
+// Transpose Convolution Tests
+// ===========================================================================
+
+func TestConvTranspose1d(t *testing.T) {
+	s := bridge.DefaultGPUStream()
+
+	// input: [batch=1, length=4, channels_in=1]
+	inputData := []float32{1, 2, 3, 4}
+	input := bridge.NewArrayFromData(unsafe.Pointer(&inputData[0]), []int{1, 4, 1}, bridge.DTypeFloat32)
+
+	// weight: [channels_out=1, kernel=2, channels_in=1]
+	weightData := []float32{1, 1}
+	weight := bridge.NewArrayFromData(unsafe.Pointer(&weightData[0]), []int{1, 2, 1}, bridge.DTypeFloat32)
+
+	result := bridge.ConvTranspose1d(input, weight, 1, 0, 1, 0, 1, s)
+	if err := bridge.Eval(result); err != nil {
+		t.Fatalf("Eval failed: %v", err)
+	}
+	shape := result.Shape()
+	t.Logf("ConvTranspose1d: shape=%v", shape)
+	if shape[0] != 1 { // batch
+		t.Errorf("expected batch=1, got %d", shape[0])
+	}
+	result.Free()
+	input.Free()
+	weight.Free()
 }

@@ -190,3 +190,118 @@ func NewClosureFromGoFunc(fn GoClosureFunc) *Closure                       { ret
 func CompileClosure(cl *Closure, shapeless bool) *Closure                  { return nil }
 func (c *Closure) Free()                                                    {}
 func ApplyClosure(cl *Closure, inputs []*Array) ([]*Array, error)          { return nil, errNoCGo }
+func NewClosureFromCTape(instrs []int32, numSlots int, outputSlots, constSlots []int32, constArrays []*Array, paramSlots []int32) *Closure {
+	return nil
+}
+
+// Autograd transforms stubs.
+
+type ValueAndGradClosure struct{}
+
+func ValueAndGrad(fn *Closure, argnums []int) *ValueAndGradClosure     { return nil }
+func (vg *ValueAndGradClosure) Apply(inputs []*Array) ([]*Array, []*Array, error) {
+	return nil, nil, errNoCGo
+}
+func (vg *ValueAndGradClosure) Free()                                    {}
+func VJP(fn *Closure, primals []*Array, cotangents []*Array) ([]*Array, []*Array, error) {
+	return nil, nil, errNoCGo
+}
+func JVP(fn *Closure, primals []*Array, tangents []*Array) ([]*Array, []*Array, error) {
+	return nil, nil, errNoCGo
+}
+func Checkpoint(fn *Closure) *Closure                                    { return nil }
+func AsyncEval(arrays ...*Array) error                                   { return errNoCGo }
+
+// Memory profiling stubs.
+func GetCacheMemory() uint64                                             { return 0 }
+func GetPeakMemory() uint64                                              { return 0 }
+func ResetPeakMemory()                                                   {}
+func SetWiredLimit(limit uint64) uint64                                  { return 0 }
+
+// Cumulative ops stubs.
+func CumSum(x *Array, axis int, reverse, inclusive bool, s *Stream) *Array  { return nil }
+func CumProd(x *Array, axis int, reverse, inclusive bool, s *Stream) *Array { return nil }
+func CumMax(x *Array, axis int, reverse, inclusive bool, s *Stream) *Array  { return nil }
+func CumMin(x *Array, axis int, reverse, inclusive bool, s *Stream) *Array  { return nil }
+
+// Statistical ops stubs.
+func Mean(x *Array, keepDims bool, s *Stream) *Array                                 { return nil }
+func MeanAxes(x *Array, axes []int, keepDims bool, s *Stream) *Array                 { return nil }
+func MeanAxis(x *Array, axis int, keepDims bool, s *Stream) *Array                   { return nil }
+func Variance(x *Array, keepDims bool, ddof int, s *Stream) *Array                   { return nil }
+func VarianceAxes(x *Array, axes []int, keepDims bool, ddof int, s *Stream) *Array   { return nil }
+func StdDev(x *Array, keepDims bool, ddof int, s *Stream) *Array                     { return nil }
+func StdDevAxes(x *Array, axes []int, keepDims bool, ddof int, s *Stream) *Array     { return nil }
+func LogSumExp(x *Array, keepDims bool, s *Stream) *Array                             { return nil }
+func LogSumExpAxes(x *Array, axes []int, keepDims bool, s *Stream) *Array             { return nil }
+func LogAddExp(a, b *Array, s *Stream) *Array                                         { return nil }
+
+// Additional array ops stubs.
+func TopK(x *Array, k int, s *Stream) *Array                                          { return nil }
+func TopKAxis(x *Array, k, axis int, s *Stream) *Array                                { return nil }
+func Flatten(x *Array, startAxis, endAxis int, s *Stream) *Array                      { return nil }
+func Unflatten(x *Array, axis int, shape []int, s *Stream) *Array                     { return nil }
+func Diagonal(x *Array, offset, axis1, axis2 int, s *Stream) *Array                   { return nil }
+func Trace(x *Array, offset, axis1, axis2 int, dtype DType, s *Stream) *Array         { return nil }
+func Tile(x *Array, reps []int, s *Stream) *Array                                     { return nil }
+func Repeat(x *Array, repeats int, s *Stream) *Array                                  { return nil }
+func RepeatAxis(x *Array, repeats, axis int, s *Stream) *Array                        { return nil }
+func Split(x *Array, numSplits, axis int, s *Stream) *VectorArray                     { return nil }
+func SplitSections(x *Array, indices []int, axis int, s *Stream) *VectorArray         { return nil }
+func Linspace(start, stop float64, num int, dtype DType, s *Stream) *Array            { return nil }
+func AddMM(c, a, b *Array, alpha, beta float32, s *Stream) *Array                     { return nil }
+
+// Advanced RNG stubs.
+func RandomBernoulli(p *Array, shape []int, key *Array, s *Stream) *Array                          { return nil }
+func RandomCategorical(logits *Array, axis int, key *Array, s *Stream) *Array                      { return nil }
+func RandomCategoricalNumSamples(logits *Array, axis, numSamples int, key *Array, s *Stream) *Array { return nil }
+func RandomPermutation(x *Array, axis int, key *Array, s *Stream) *Array                           { return nil }
+func RandomPermutationArange(n int, key *Array, s *Stream) *Array                                  { return nil }
+func RandomRandInt(low, high *Array, shape []int, dtype DType, key *Array, s *Stream) *Array        { return nil }
+func RandomGumbel(shape []int, dtype DType, key *Array, s *Stream) *Array                          { return nil }
+func RandomLaplace(shape []int, dtype DType, loc, scale float32, key *Array, s *Stream) *Array     { return nil }
+func RandomTruncatedNormal(lower, upper *Array, shape []int, dtype DType, key *Array, s *Stream) *Array { return nil }
+func RandomSeed(seed uint64)                                                                        {}
+
+// Linear algebra stubs.
+func LinalgCholesky(a *Array, upper bool, s *Stream) *Array                            { return nil }
+func LinalgInv(a *Array, s *Stream) *Array                                             { return nil }
+func LinalgSolve(a, b *Array, s *Stream) *Array                                        { return nil }
+func LinalgSolveTriangular(a, b *Array, upper bool, s *Stream) *Array                  { return nil }
+func LinalgSVD(a *Array, computeUV bool, s *Stream) *VectorArray                       { return nil }
+func LinalgQR(a *Array, s *Stream) (*Array, *Array)                                    { return nil, nil }
+func LinalgEig(a *Array, s *Stream) (*Array, *Array)                                   { return nil, nil }
+func LinalgEigh(a *Array, uplo string, s *Stream) (*Array, *Array)                     { return nil, nil }
+func LinalgEigvals(a *Array, s *Stream) *Array                                         { return nil }
+func LinalgNorm(a *Array, ord float64, axes []int, keepDims bool, s *Stream) *Array    { return nil }
+func LinalgNormL2(a *Array, axes []int, keepDims bool, s *Stream) *Array               { return nil }
+func LinalgPinv(a *Array, s *Stream) *Array                                            { return nil }
+func LinalgLU(a *Array, s *Stream) *VectorArray                                        { return nil }
+func LinalgLUFactor(a *Array, s *Stream) (*Array, *Array)                              { return nil, nil }
+func LinalgCross(a, b *Array, axis int, s *Stream) *Array                              { return nil }
+
+// Transpose convolution stubs.
+func ConvTranspose1d(input, weight *Array, stride, padding, dilation, outputPadding, groups int, s *Stream) *Array { return nil }
+func ConvTranspose2d(input, weight *Array, stride, padding, dilation, outputPadding [2]int, groups int, s *Stream) *Array { return nil }
+func ConvTranspose3d(input, weight *Array, stride, padding, dilation, outputPadding [3]int, groups int, s *Stream) *Array { return nil }
+
+// SafeTensors IO stubs.
+type MapStringToArray struct{}
+type MapStringToString struct{}
+
+func NewMapStringToArray() *MapStringToArray    { return nil }
+func (m *MapStringToArray) Free()               {}
+func (m *MapStringToArray) Insert(key string, value *Array) {}
+func (m *MapStringToArray) Get(key string) *Array { return nil }
+func (m *MapStringToArray) Iterate(fn func(key string, value *Array)) {}
+
+func NewMapStringToString() *MapStringToString  { return nil }
+func (m *MapStringToString) Free()              {}
+func (m *MapStringToString) Insert(key, value string) {}
+func (m *MapStringToString) Get(key string) (string, bool) { return "", false }
+func (m *MapStringToString) Iterate(fn func(key, value string)) {}
+
+func LoadSafeTensors(path string, s *Stream) (*MapStringToArray, *MapStringToString, error) { return nil, nil, errNoCGo }
+func SaveSafeTensors(path string, arrays *MapStringToArray, metadata *MapStringToString) error { return errNoCGo }
+func LoadArray(path string, s *Stream) (*Array, error) { return nil, errNoCGo }
+func SaveArray(path string, a *Array) error { return errNoCGo }

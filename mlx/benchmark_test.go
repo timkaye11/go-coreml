@@ -12,6 +12,16 @@ import (
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 )
 
+// freeOutputs releases output buffers immediately to avoid GC/finalizer pressure.
+func freeOutputs(outputs []backends.Buffer) {
+	for _, buf := range outputs {
+		if b, ok := buf.(*mlxBuffer); ok && b.array != nil {
+			b.array.Free()
+			b.array = nil
+		}
+	}
+}
+
 // BenchmarkMatMulCompilation benchmarks matrix multiplication compilation time.
 func BenchmarkMatMulCompilation(b *testing.B) {
 	sizes := []struct {
@@ -146,7 +156,7 @@ func BenchmarkMatMulExecution(b *testing.B) {
 				if err != nil {
 					b.Fatalf("Execute() failed: %v", err)
 				}
-				_ = outputs
+				freeOutputs(outputs)
 			}
 		})
 	}
@@ -212,7 +222,7 @@ func BenchmarkUnaryOps(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Execute() failed: %v", err)
 		}
-		_ = outputs
+		freeOutputs(outputs)
 	}
 }
 
@@ -288,7 +298,7 @@ func BenchmarkBinaryOps(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Execute() failed: %v", err)
 		}
-		_ = outputs
+		freeOutputs(outputs)
 	}
 }
 
@@ -342,7 +352,7 @@ func BenchmarkReduceOps(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Execute() failed: %v", err)
 		}
-		_ = outputs
+		freeOutputs(outputs)
 	}
 }
 
@@ -421,7 +431,7 @@ func BenchmarkMLPForward(b *testing.B) {
 				if err != nil {
 					b.Fatalf("Execute() failed: %v", err)
 				}
-				_ = outputs
+				freeOutputs(outputs)
 			}
 		})
 	}

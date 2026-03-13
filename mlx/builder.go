@@ -90,6 +90,25 @@ func (b *Builder) compileSimple() (backends.Executable, error) {
 	mainFn := b.mainFn
 	backend := b.backend
 
+	// If the tape is fully C-interpretable, use the pure-C interpreter path
+	// to eliminate CGo boundary crossings during steady-state execution.
+	if !mainFn.hasGoCallback && len(mainFn.instrs) > 0 {
+		instrs, numSlots, outputSlots, constSlots, constArrays, paramSlots := mainFn.serializeTape()
+		rawClosure := bridge.NewClosureFromCTape(instrs, numSlots, outputSlots, constSlots, constArrays, paramSlots)
+		compiled := bridge.CompileClosure(rawClosure, false)
+
+		return &Executable{
+			backend:      b.backend,
+			mainFn:       b.mainFn,
+			compiled:     compiled,
+			rawClosure:   rawClosure,
+			inputNames:   inputNames,
+			inputShapes:  inputShapes,
+			outputShapes: collectOutputShapes(b.mainFn.outputs),
+		}, nil
+	}
+
+	// Fallback: Go closure path (for ops that require Go callbacks).
 	// Create a Go closure that replays the tape and returns output arrays.
 	// Note: we do NOT free intermediates here. mlx_compile traces this closure
 	// once and caches the fused graph. On cache hits, MLX reuses the cached
