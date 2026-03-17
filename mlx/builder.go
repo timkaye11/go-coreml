@@ -95,13 +95,15 @@ func (b *Builder) compileSimple() (backends.Executable, error) {
 	if !mainFn.hasGoCallback && len(mainFn.instrs) > 0 {
 		instrs, numSlots, outputSlots, constSlots, constArrays, paramSlots := mainFn.serializeTape()
 		rawClosure := bridge.NewClosureFromCTape(instrs, numSlots, outputSlots, constSlots, constArrays, paramSlots)
-		compiled := bridge.CompileClosure(rawClosure, false)
-
+		// Skip mlx_compile: the C tape interpreter already handles memory correctly
+		// (frees intermediate slots, keeps output slots). mlx_compile adds graph fusion
+		// but its internal cache leaks ~1.8 MB/step by retaining refs to input arrays.
+		// The C tape interpreter is fast enough (~106ms/step) for training.
 		return &Executable{
 			backend:      b.backend,
 			mainFn:       b.mainFn,
-			compiled:     compiled,
-			rawClosure:   rawClosure,
+			compiled:     rawClosure,
+			rawClosure:   nil, // rawClosure IS the compiled closure now
 			inputNames:   inputNames,
 			inputShapes:  inputShapes,
 			outputShapes: collectOutputShapes(b.mainFn.outputs),
@@ -110,10 +112,16 @@ func (b *Builder) compileSimple() (backends.Executable, error) {
 
 	// Fallback: Go closure path (for ops that require Go callbacks).
 	// Create a Go closure that replays the tape and returns output arrays.
-	// Note: we do NOT free intermediates here. mlx_compile traces this closure
-	// once and caches the fused graph. On cache hits, MLX reuses the cached
-	// graph and discards the lazy arrays we create, so freeing them is wasted
-	// work. MLX's internal refcounting keeps the trace graph alive as needed.
+	//
+	// When compiled (mlx_compile): intermediates are NOT freed because mlx_compile
+	// traces this closure once and caches the fused graph. On cache hits, MLX
+	// reuses the cached graph and discards the lazy arrays we create.
+	//
+	// When NOT compiled (hasGoCallback=true): intermediates MUST be freed because
+	// the raw closure is called every step. bridge.Array has no GC finalizer,
+	// so without explicit Free(), intermediate MLX arrays leak permanently.
+	needsFreeIntermediates := mainFn.hasGoCallback
+
 	replayFn := func(inputs []*bridge.Array) []*bridge.Array {
 		s := backend.stream()
 		arrays := replayTape(mainFn, inputs, s)
@@ -123,12 +131,33 @@ func (b *Builder) compileSimple() (backends.Executable, error) {
 			outputs[i] = arrays[out.tapeIdx]
 		}
 
+		// Free intermediate arrays (NOT outputs — outputs are still lazy and
+		// need to survive until bridge.Eval is called by the executor).
+		// Outputs will be freed by goClosureCallback after NewVectorArray retains them.
+		if needsFreeIntermediates {
+			outputIndices := make(map[int]bool, len(mainFn.outputs))
+			for _, out := range mainFn.outputs {
+				outputIndices[out.tapeIdx] = true
+			}
+			freeIntermediates(mainFn, arrays, outputIndices)
+		}
+
 		return outputs
 	}
 
-	// Wrap as an MLX closure and compile it for fused execution.
+	// Wrap as an MLX closure.
 	rawClosure := bridge.NewClosureFromGoFunc(replayFn)
-	compiled := bridge.CompileClosure(rawClosure, false)
+
+	// Only compile if there are no Go callbacks. mlx_compile traces the closure
+	// with symbolic arrays, but Go callbacks (e.g. RNG) try to Eval and read
+	// real data during the trace, causing a SIGSEGV.
+	var compiled *bridge.Closure
+	if !mainFn.hasGoCallback {
+		compiled = bridge.CompileClosure(rawClosure, false)
+	} else {
+		compiled = rawClosure
+		rawClosure = nil // avoid double-free
+	}
 
 	return &Executable{
 		backend:      b.backend,

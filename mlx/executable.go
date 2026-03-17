@@ -244,19 +244,26 @@ func (e *ExecutableWithCF) Execute(inputs []backends.Buffer, donate []bool, defa
 		return nil, err
 	}
 
-	// Assemble final outputs.
+	// Assemble final outputs and track which tape indices are used as outputs.
+	outputTapeIndices := make(map[int]bool)
 	results := make([]backends.Buffer, len(e.outputMapping))
 	for i, src := range e.outputMapping {
 		if src.fromCF {
 			results[i] = cfResults[src.cfIndex]
 		} else {
 			preArr := arrays[src.preNode.tapeIdx]
+			outputTapeIndices[src.preNode.tapeIdx] = true
 			if evalErr := bridge.Eval(preArr); evalErr != nil {
 				return nil, errors.Wrap(evalErr, "ExecuteWithCF: eval pre-CF output")
 			}
 			results[i] = newBufferFromArray(preArr, src.preNode.shape)
 		}
 	}
+
+	// Free intermediate arrays from tape replay that are not used as outputs.
+	// Without this, all intermediate arrays from replayTape leak every step
+	// (~1.8 MB/step for a 1-layer model with VJP gradients).
+	freeIntermediates(e.mainFn, arrays, outputTapeIndices)
 
 	return results, nil
 }

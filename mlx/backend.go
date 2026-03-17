@@ -7,7 +7,22 @@
 // for automatic differentiation, JIT compilation, and unified memory.
 package mlx
 
+/*
+#include <sys/sysctl.h>
+#include <stdint.h>
+
+static uint64_t get_physical_memory() {
+    int mib[2] = {CTL_HW, HW_MEMSIZE};
+    uint64_t mem = 0;
+    size_t len = sizeof(mem);
+    sysctl(mib, 2, &mem, &len, NULL, 0);
+    return mem;
+}
+*/
+import "C"
+
 import (
+	"fmt"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -36,6 +51,17 @@ type Backend struct {
 // Verify interface compliance.
 var _ backends.Backend = &Backend{}
 
+// DefaultMemoryLimitFraction is the fraction of system memory MLX is allowed to use.
+// This must be below ~0.70 (0.95 * recommendedMaxWorkingSetSize / totalMem) to actually
+// affect MLX's internal gc_limit. Values above the hardware-clamped threshold are no-ops.
+// On a 24GB M4 Pro: 0.55 * 24 = 13.2 GB, safely below the 16.87 GB hardware clamp.
+const DefaultMemoryLimitFraction = 0.55
+
+// DefaultCacheLimitFraction is the fraction of the memory limit used for MLX's cache.
+// Lower values force more aggressive buffer release after each operation.
+// On a 24GB M4 Pro: 0.25 * 13.2 GB = 3.3 GB cache limit.
+const DefaultCacheLimitFraction = 0.25
+
 // New creates a new MLX backend.
 func New(config string) (backends.Backend, error) {
 	if !bridge.MetalIsAvailable() {
@@ -45,7 +71,52 @@ func New(config string) (backends.Backend, error) {
 		gpuStream: bridge.DefaultGPUStream(),
 		cpuStream: bridge.DefaultCPUStream(),
 	}
+
+	// Set memory limits to prevent unbounded memory growth that can crash the kernel.
+	// Without limits, MLX will consume all available unified memory, causing the
+	// macOS watchdog to trigger a kernel panic when swap is exhausted.
+	totalMem := systemMemoryBytes()
+	if totalMem > 0 {
+		memLimit := uint64(float64(totalMem) * DefaultMemoryLimitFraction)
+		cacheLimit := uint64(float64(memLimit) * DefaultCacheLimitFraction)
+		bridge.SetMemoryLimit(memLimit)
+		bridge.SetCacheLimit(cacheLimit)
+		fmt.Printf("  MLX memory limit: %.1f GB (cache: %.1f GB) of %.1f GB total\n",
+			float64(memLimit)/(1<<30), float64(cacheLimit)/(1<<30), float64(totalMem)/(1<<30))
+	}
+
 	return b, nil
+}
+
+// ClearCache frees cached GPU memory. Call periodically during long training runs
+// to prevent memory accumulation.
+func (b *Backend) ClearCache() {
+	bridge.ClearCache()
+}
+
+// GetActiveMemory returns current GPU memory allocation in bytes.
+func (b *Backend) GetActiveMemory() uint64 {
+	return bridge.GetActiveMemory()
+}
+
+// GetCacheMemory returns current GPU cache memory in bytes.
+func (b *Backend) GetCacheMemory() uint64 {
+	return bridge.GetCacheMemory()
+}
+
+// GetPeakMemory returns peak GPU memory usage since last reset.
+func (b *Backend) GetPeakMemory() uint64 {
+	return bridge.GetPeakMemory()
+}
+
+// ResetPeakMemory resets the peak memory counter.
+func (b *Backend) ResetPeakMemory() {
+	bridge.ResetPeakMemory()
+}
+
+// SystemMemoryBytes returns total physical memory in bytes.
+func (b *Backend) SystemMemoryBytes() uint64 {
+	return systemMemoryBytes()
 }
 
 // Name returns the backend name.
@@ -189,6 +260,11 @@ func (b *Backend) BufferData(buffer backends.Buffer) (flat any, err error) {
 // BufferCopyToDevice copies buffer to another device (not supported with single device).
 func (b *Backend) BufferCopyToDevice(source backends.Buffer, deviceNum backends.DeviceNum) (backends.Buffer, error) {
 	return nil, errors.New("BufferCopyToDevice: only one device supported")
+}
+
+// systemMemoryBytes returns total physical memory in bytes via sysctl.
+func systemMemoryBytes() uint64 {
+	return uint64(C.get_physical_memory())
 }
 
 // bufferToFlatSlice creates a Go slice backed by the MLX array's unified memory.

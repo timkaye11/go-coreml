@@ -38,6 +38,9 @@ static mlx_closure create_go_closure(void* payload) {
     return mlx_closure_new_func_payload(goClosureCallback, payload, NULL);
 }
 
+// Forward declaration: error buffer defined later in this file.
+static char _mlx_last_error[2048];
+
 // =========================================================================
 // C Tape Interpreter — replays a serialized instruction stream in pure C,
 // eliminating CGo boundary crossings during steady-state execution.
@@ -117,6 +120,7 @@ static inline const int32_t* read_ints(const int32_t* ip, int n, const int32_t**
 // The C tape interpreter. Called by MLX's compiled closure mechanism.
 static int c_replay_tape(mlx_vector_array* res, const mlx_vector_array inputs, void* payload) {
     tape_payload* p = (tape_payload*)payload;
+    size_t num_inputs = mlx_vector_array_size(inputs);
     mlx_stream stream = mlx_default_gpu_stream_new();
 
     // Allocate slot array.
@@ -124,7 +128,6 @@ static int c_replay_tape(mlx_vector_array* res, const mlx_vector_array inputs, v
     if (!slots) return 1;
 
     // Fill parameter slots from inputs.
-    size_t num_inputs = mlx_vector_array_size(inputs);
     for (int32_t i = 0; i < p->num_params && i < (int32_t)num_inputs; i++) {
         mlx_vector_array_get(&slots[p->param_slots[i]], inputs, i);
     }
@@ -282,10 +285,16 @@ static int c_replay_tape(mlx_vector_array* res, const mlx_vector_array inputs, v
         // params: [naxes, axes..., keepdims]
         case OP_REDUCE_SUM: {
             int32_t naxes = params[0];
-            int axes[naxes];
+            int axes[naxes > 0 ? naxes : 1];
             for (int i = 0; i < naxes; i++) axes[i] = params[1+i];
             bool kd = params[1+naxes];
-            mlx_sum_axes(&result, slots[in_slots[0]], axes, naxes, kd, stream);
+            int rc;
+            if (naxes == 0) {
+                // Reduce all axes: use mlx_sum (no axes arg)
+                rc = mlx_sum(&result, slots[in_slots[0]], kd, stream);
+            } else {
+                rc = mlx_sum_axes(&result, slots[in_slots[0]], axes, naxes, kd, stream);
+            }
             break;
         }
         case OP_REDUCE_MAX: {
@@ -529,6 +538,8 @@ static int c_replay_tape(mlx_vector_array* res, const mlx_vector_array inputs, v
 
         default:
             // Unknown opcode — clean up and fail.
+            fprintf(stderr, "[MLX C-TAPE ERROR] Unknown opcode %d at instruction offset %ld (out_slot=%d, num_in=%d)\n",
+                    opcode, (long)(ip - p->instrs - 4), out_slot, num_in);
             for (int32_t i = 0; i < p->num_slots; i++) {
                 if (slots[i].ctx != NULL) mlx_array_free(slots[i]);
             }
@@ -548,18 +559,12 @@ static int c_replay_tape(mlx_vector_array* res, const mlx_vector_array inputs, v
     *res = mlx_vector_array_new_data(out_arrs, p->num_outputs);
     free(out_arrs);
 
-    // Free non-output, non-param, non-const slots.
-    // Actually, MLX manages refcounts. The output arrays are in the result vector.
-    // We just free our slot copies for non-outputs.
-    // For params: they were gotten from the input vector, so they have a refcount bump.
-    // We should free all slots that are NOT outputs.
+    // Free ALL slot handles. The result vector already retained its own references
+    // to output arrays (via mlx_vector_array_new_data which calls mlx_retain).
+    // Without freeing output slot handles here, their refcounts would be permanently
+    // +1 too high, causing a per-step leak (~0.75 MB/step for hidden-state-sized arrays).
     for (int32_t i = 0; i < p->num_slots; i++) {
-        if (slots[i].ctx == NULL) continue;
-        bool is_output = false;
-        for (int32_t j = 0; j < p->num_outputs; j++) {
-            if (p->output_slots[j] == i) { is_output = true; break; }
-        }
-        if (!is_output) {
+        if (slots[i].ctx != NULL) {
             mlx_array_free(slots[i]);
         }
     }
@@ -571,6 +576,22 @@ static int c_replay_tape(mlx_vector_array* res, const mlx_vector_array inputs, v
 
 static mlx_closure create_tape_closure(tape_payload* p) {
     return mlx_closure_new_func_payload(c_replay_tape, p, tape_payload_free);
+}
+
+// Custom error handler that stores the message instead of calling exit().
+// (_mlx_last_error declared above, near the tape interpreter.)
+static void _mlx_go_error_handler(const char* msg, void* data) {
+    strncpy(_mlx_last_error, msg, sizeof(_mlx_last_error) - 1);
+    _mlx_last_error[sizeof(_mlx_last_error) - 1] = '\0';
+}
+static void _mlx_install_error_handler(void) {
+    mlx_set_error_handler(_mlx_go_error_handler, NULL, NULL);
+}
+static const char* _mlx_get_last_error(void) {
+    return _mlx_last_error;
+}
+static void _mlx_clear_last_error(void) {
+    _mlx_last_error[0] = '\0';
 }
 */
 import "C"
@@ -616,17 +637,25 @@ const (
 	ScatterModeMin = 2
 )
 
+func init() {
+	C._mlx_install_error_handler()
+}
+
 // checkRC checks an mlx-c return code and panics on error.
 func checkRC(rc C.int, op string) {
 	if rc != 0 {
-		panic(fmt.Sprintf("mlx: %s failed with rc=%d", op, rc))
+		msg := C.GoString(C._mlx_get_last_error())
+		C._mlx_clear_last_error()
+		panic(fmt.Sprintf("mlx: %s: %s", op, msg))
 	}
 }
 
 // checkRCErr checks an mlx-c return code and returns an error.
 func checkRCErr(rc C.int, op string) error {
 	if rc != 0 {
-		return fmt.Errorf("mlx: %s failed with rc=%d", op, rc)
+		msg := C.GoString(C._mlx_get_last_error())
+		C._mlx_clear_last_error()
+		return fmt.Errorf("mlx: %s: %s", op, msg)
 	}
 	return nil
 }
@@ -698,7 +727,9 @@ func NewArrayScalarBool(val bool) *Array {
 func (a *Array) Free() {
 	if a.valid() {
 		C.mlx_array_free(a.handle)
-		a.handle = C.mlx_array_new() // reset to empty
+		// Use a zero-value handle instead of mlx_array_new() to avoid
+		// allocating a new empty mlx_array that would leak (no GC finalizer).
+		a.handle = C.mlx_array{}
 	}
 }
 
@@ -804,7 +835,7 @@ func NewVectorArray(arrays []*Array) *VectorArray {
 func (v *VectorArray) Free() {
 	if v.valid() {
 		C.mlx_vector_array_free(v.handle)
-		v.handle = C.mlx_vector_array_new()
+		v.handle = C.mlx_vector_array{} // zero-value instead of allocating new empty
 	}
 }
 
@@ -852,7 +883,7 @@ func DefaultCPUStream() *Stream {
 func (s *Stream) Free() {
 	if s.valid() {
 		C.mlx_stream_free(s.handle)
-		s.handle = C.mlx_stream_new()
+		s.handle = C.mlx_stream{} // zero-value instead of allocating new empty
 	}
 }
 
@@ -1092,7 +1123,11 @@ func BroadcastTo(x *Array, shape []int, s *Stream) *Array {
 	for i, d := range shape {
 		cShape[i] = C.int(d)
 	}
-	rc := C.mlx_broadcast_to(&r.handle, x.handle, &cShape[0], C.size_t(len(shape)), s.handle)
+	var shapePtr *C.int
+	if len(cShape) > 0 {
+		shapePtr = &cShape[0]
+	}
+	rc := C.mlx_broadcast_to(&r.handle, x.handle, shapePtr, C.size_t(len(shape)), s.handle)
 	checkRC(rc, "mlx_broadcast_to")
 	return r
 }
@@ -1757,9 +1792,22 @@ func goClosureCallback(res *C.mlx_vector_array, inputs C.mlx_vector_array, paylo
 	// Call the Go function.
 	goOutputs := fn(goInputs)
 
+	// Free input handles created by Get() — they incremented refcounts
+	// that would never be decremented since bridge.Array has no GC finalizer.
+	for _, a := range goInputs {
+		a.Free()
+	}
+
 	// Pack output arrays into the result vector.
+	// NewVectorArray retains each output (+1 refcount).
 	outVec := NewVectorArray(goOutputs)
 	*res = outVec.handle
+
+	// Free the Go-side output handles. The result vector already retained them.
+	// Without this, each output leaks one C handle refcount per step.
+	for _, a := range goOutputs {
+		a.Free()
+	}
 
 	return 0
 }

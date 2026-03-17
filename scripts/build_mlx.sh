@@ -2,7 +2,7 @@
 # Builds mlx + mlx-c as static libraries for CGo linking.
 #
 # Prerequisites: Xcode, CMake (3.24+), C++17 compiler
-# Output: mlx/gomlx/internal/bridge/deps/{include,lib}
+# Output: mlx/internal/bridge/deps/{include,lib}
 #
 # Usage:
 #   ./scripts/build_mlx.sh              # Build with default version
@@ -26,7 +26,7 @@ if ! xcrun --find metal &>/dev/null; then
 fi
 echo "=== Metal compiler: $(xcrun --find metal) ==="
 BUILD_DIR="/tmp/mlx-c-build-$$"
-DEST_DIR="$REPO_ROOT/mlx/gomlx/internal/bridge/deps"
+DEST_DIR="$REPO_ROOT/mlx/internal/bridge/deps"
 
 echo "=== Building mlx-c ${MLX_C_VERSION} ==="
 echo "Build dir: $BUILD_DIR"
@@ -49,7 +49,8 @@ cmake -B build \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_INSTALL_PREFIX="$DEST_DIR" \
     -DMLX_C_BUILD_EXAMPLES=OFF \
-    -DMLX_C_BUILD_TESTS=OFF
+    -DMLX_C_BUILD_TESTS=OFF \
+    -DMLX_METAL_PATH="$DEST_DIR/lib"
 
 echo "=== Building (this may take a few minutes) ==="
 cmake --build build --parallel "$(sysctl -n hw.ncpu)"

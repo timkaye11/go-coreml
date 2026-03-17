@@ -288,9 +288,16 @@ func (f *Function) emitInstr(opcode int32, outSlot int32, inputs []int32, params
 	})
 }
 
-// nextTempSlot allocates a temporary slot beyond the tape range for compound ops.
+// tempSlotBase is a sentinel offset used for temp slots during graph building.
+// Temp slots are stored as tempSlotBase+N during building, then remapped to
+// len(f.tape)+N during serialization by serializeTape().
+const tempSlotBase = 1 << 20 // 1M — well above any realistic tape length
+
+// nextTempSlot allocates a temporary slot for compound C tape ops.
+// Returns a sentinel index (tempSlotBase + N) that gets remapped to the correct
+// range [len(f.tape), len(f.tape)+tempSlotCount) during serializeTape().
 func (f *Function) nextTempSlot() int32 {
-	slot := int32(len(f.tape)) + int32(f.tempSlotCount)
+	slot := int32(tempSlotBase) + int32(f.tempSlotCount)
 	f.tempSlotCount++
 	return slot
 }
@@ -931,6 +938,14 @@ func (f *Function) Pad(x, fillValue backends.Value, axesConfig ...backends.PadAx
 
 // reduceOp is a helper for reduction operations with tape recording.
 func (f *Function) reduceOp(fn func(*bridge.Array, []int, bool, *bridge.Stream) *bridge.Array, x *graphNode, axes []int, opcodes ...int32) *graphNode {
+	// Empty axes means "reduce all dimensions" in GoMLX convention.
+	// MLX interprets empty axes as no-op, so expand to all axes explicitly.
+	if len(axes) == 0 {
+		axes = make([]int, x.shape.Rank())
+		for i := range axes {
+			axes[i] = i
+		}
+	}
 	r := fn(x.array, axes, false, f.stream())
 	outShape, _ := shapeinference.ReduceOp(x.shape, axes)
 	xi := x.tapeIdx
@@ -1067,26 +1082,111 @@ func (f *Function) DotGeneral(lhs backends.Value, lhsContractingAxes, lhsBatchAx
 		return node, nil
 	}
 
-	// General case: decompose via transpose + reshape + batched matmul.
-	// This is complex — mark as Go callback for fallback.
-	f.markGoCallback()
-	// Capture all parameters for tape replay.
-	lShape, rShape := l.shape, r.shape
-	lContract := append([]int{}, lhsContractingAxes...)
-	lBatch := append([]int{}, lhsBatchAxes...)
-	rContract := append([]int{}, rhsContractingAxes...)
-	rBatch := append([]int{}, rhsBatchAxes...)
+	// General case: decompose via transpose + reshape + matmul + reshape.
+	// Emit as C tape instructions to avoid Go callback path (which leaked
+	// intermediate arrays — bridge.Array has no GC finalizer).
+	lCross := crossAxes(l.shape.Rank(), lhsContractingAxes, lhsBatchAxes)
+	rCross := crossAxes(r.shape.Rank(), rhsContractingAxes, rhsBatchAxes)
 
-	result, err := f.dotGeneralDecompose(l, lhsContractingAxes, lhsBatchAxes, r, rhsContractingAxes, rhsBatchAxes, outShape)
-	if err != nil {
-		return nil, err
+	// Compute permutations: [batch..., cross..., contract...] for LHS,
+	// [batch..., contract..., cross...] for RHS.
+	lPerm := append(append(append([]int{}, lhsBatchAxes...), lCross...), lhsContractingAxes...)
+	rPerm := append(append(append([]int{}, rhsBatchAxes...), rhsContractingAxes...), rCross...)
+
+	// Compute dimension sizes.
+	batchSize := 1
+	for _, ax := range lhsBatchAxes {
+		batchSize *= l.shape.Dimensions[ax]
 	}
-	// Override the tape entry with one that replays the decomposition.
-	result.tapeIdx = len(f.tape)
-	f.tape = append(f.tape, func(arrays []*bridge.Array, s *bridge.Stream) *bridge.Array {
-		return dotGeneralReplay(arrays[li], lShape, lContract, lBatch, arrays[ri], rShape, rContract, rBatch, outShape, s)
+	lCrossSize := 1
+	for _, ax := range lCross {
+		lCrossSize *= l.shape.Dimensions[ax]
+	}
+	contractSize := 1
+	for _, ax := range lhsContractingAxes {
+		contractSize *= l.shape.Dimensions[ax]
+	}
+	rCrossSize := 1
+	for _, ax := range rCross {
+		rCrossSize *= r.shape.Dimensions[ax]
+	}
+
+	// Build-time: compute the result using bridge ops.
+	s := f.stream()
+	lT := bridge.Transpose(l.array, lPerm, s)
+	rT := bridge.Transpose(r.array, rPerm, s)
+	var lR, rR *bridge.Array
+	if batchSize > 1 {
+		lR = bridge.Reshape(lT, []int{batchSize, lCrossSize, contractSize}, s)
+		rR = bridge.Reshape(rT, []int{batchSize, contractSize, rCrossSize}, s)
+	} else {
+		lR = bridge.Reshape(lT, []int{lCrossSize, contractSize}, s)
+		rR = bridge.Reshape(rT, []int{contractSize, rCrossSize}, s)
+	}
+	mm := bridge.MatMul(lR, rR, s)
+	result := bridge.Reshape(mm, outShape.Dimensions, s)
+	f.buildArrays = append(f.buildArrays, lT, rT, lR, rR, mm, result)
+
+	// Emit C tape instructions: transpose → reshape → matmul → reshape.
+	// Use temp slots for intermediates.
+	tLT := f.nextTempSlot()
+	tRT := f.nextTempSlot()
+	tLR := f.nextTempSlot()
+	tRR := f.nextTempSlot()
+	tMM := f.nextTempSlot()
+
+	// LHS transpose — params format: [ndim, perm...]
+	lPermParams := []int32{int32(len(lPerm))}
+	for _, p := range lPerm {
+		lPermParams = append(lPermParams, int32(p))
+	}
+	f.emitInstr(opTranspose, tLT, []int32{int32(li)}, lPermParams...)
+
+	// RHS transpose — params format: [ndim, perm...]
+	rPermParams := []int32{int32(len(rPerm))}
+	for _, p := range rPerm {
+		rPermParams = append(rPermParams, int32(p))
+	}
+	f.emitInstr(opTranspose, tRT, []int32{int32(ri)}, rPermParams...)
+
+	// LHS reshape — params format: [ndim, dims...]
+	if batchSize > 1 {
+		f.emitInstr(opReshape, tLR, []int32{tLT}, int32(3), int32(batchSize), int32(lCrossSize), int32(contractSize))
+	} else {
+		f.emitInstr(opReshape, tLR, []int32{tLT}, int32(2), int32(lCrossSize), int32(contractSize))
+	}
+
+	// RHS reshape — params format: [ndim, dims...]
+	if batchSize > 1 {
+		f.emitInstr(opReshape, tRR, []int32{tRT}, int32(3), int32(batchSize), int32(contractSize), int32(rCrossSize))
+	} else {
+		f.emitInstr(opReshape, tRR, []int32{tRT}, int32(2), int32(contractSize), int32(rCrossSize))
+	}
+
+	// Free transpose temps (no longer needed after reshape)
+	f.emitInstr(opFreeTemp, -1, []int32{tLT, tRT})
+
+	// MatMul
+	f.emitInstr(opMatMul, tMM, []int32{tLR, tRR})
+
+	// Free reshape temps
+	f.emitInstr(opFreeTemp, -1, []int32{tLR, tRR})
+
+	// Final reshape to output shape — params format: [ndim, dims...]
+	outReshapeParams := []int32{int32(len(outShape.Dimensions))}
+	for _, d := range outShape.Dimensions {
+		outReshapeParams = append(outReshapeParams, int32(d))
+	}
+	node := f.record(outShape, result, func(arrays []*bridge.Array, s *bridge.Stream) *bridge.Array {
+		return dotGeneralReplay(arrays[li], l.shape, lhsContractingAxes, lhsBatchAxes,
+			arrays[ri], r.shape, rhsContractingAxes, rhsBatchAxes, outShape, s)
 	})
-	return result, nil
+	f.emitInstr(opReshape, int32(node.tapeIdx), []int32{tMM}, outReshapeParams...)
+
+	// Free matmul temp
+	f.emitInstr(opFreeTemp, -1, []int32{tMM})
+
+	return node, nil
 }
 
 // dotGeneralShape computes the output shape for a DotGeneral operation.
@@ -1391,19 +1491,31 @@ func (f *Function) Gather(operand, startIndices backends.Value,
 
 			outShape, _ := shapeinference.Gather(op.shape, idx.shape, indexVectorAxis,
 				offsetOutputAxes, collapsedSliceAxes, startIndexMap, sliceSizes, false)
+			// Take with flat indices produces [N, ...] — reshape to match expected output shape.
+			outDims := outShape.Dimensions
+			r = bridge.Reshape(r, outDims, s)
 			oi, ii := op.tapeIdx, idx.tapeIdx
 			idxSize := idx.array.Size()
 			node := f.record(outShape, r, func(arrays []*bridge.Array, s *bridge.Stream) *bridge.Array {
 				fi := bridge.Reshape(arrays[ii], []int{idxSize}, s)
 				res := bridge.Take(arrays[oi], fi, axis, s)
 				fi.Free()
+				res = bridge.Reshape(res, outDims, s)
 				return res
 			})
-			// Compound: reshape → t0, take → out
+			// Compound: reshape indices → t0, take → t1, reshape output → out
 			t0 := f.nextTempSlot()
+			t1 := f.nextTempSlot()
 			f.emitInstr(opReshape, t0, []int32{int32(ii)}, int32(1), int32(idxSize))
-			f.emitInstr(opTake, int32(node.tapeIdx), []int32{int32(oi), t0}, int32(axis))
+			f.emitInstr(opTake, t1, []int32{int32(oi), t0}, int32(axis))
+			// Reshape take result from [flatN, ...] to expected output dims
+			reshapeParams := []int32{int32(len(outDims))}
+			for _, d := range outDims {
+				reshapeParams = append(reshapeParams, int32(d))
+			}
+			f.emitInstr(opReshape, int32(node.tapeIdx), []int32{t1}, reshapeParams...)
 			f.emitInstr(opFreeTemp, -1, []int32{t0})
+			f.emitInstr(opFreeTemp, -1, []int32{t1})
 			return node, nil
 		}
 	}
@@ -1686,18 +1798,35 @@ func (f *Function) RNGBitGenerator(state backends.Value, shape shapes.Shape) (ne
 	key := bridge.RandomKey(seed)
 	defer key.Free()
 
-	r := bridge.RandomBits(shape.Dimensions, int(shape.DType.Size())*8, key, s)
+	bits := int(shape.DType.Size()) * 8
+	var r *bridge.Array
+	if bits > 4 {
+		// MLX random_bits only supports width {1,2,4}. For wider types (e.g. Uint32),
+		// generate Float32 uniform [0, 2^bits) and convert to the target integer dtype.
+		lo := bridge.NewArrayScalarFloat32(0)
+		hi := bridge.NewArrayScalarFloat32(float32(uint64(1) << bits))
+		rf := bridge.RandomUniform(lo, hi, shape.Dimensions, bridge.DTypeFloat32, key, s)
+		lo.Free()
+		hi.Free()
+		r = bridge.AsType(rf, gomlxDTypeToMLX(shape.DType), s)
+		rf.Free()
+	} else {
+		r = bridge.RandomBits(shape.Dimensions, bits, key, s)
+	}
 
 	newSeed := seed + 1
 	newStateArr := newScalarSeed(newSeed, stateNode.shape.DType)
-	newStateReshaped := bridge.Reshape(newStateArr, stateNode.shape.Dimensions, s)
+	// The RNG state may be multi-element (e.g. [3] for GoMLX's Philox state).
+	// Broadcast the scalar seed into the correct shape.
+	newStateReshaped := bridge.BroadcastTo(newStateArr, stateNode.shape.Dimensions, s)
 	newStateArr.Free()
 
 	si := stateNode.tapeIdx
 	stShape := stateNode.shape
 	stGomlxDType := stateNode.shape.DType
 	outShape := shape
-	bits := int(shape.DType.Size()) * 8
+	replayBits := bits
+	replayDType := gomlxDTypeToMLX(shape.DType)
 	stDims := append([]int{}, stateNode.shape.Dimensions...)
 	oDims := append([]int{}, shape.Dimensions...)
 
@@ -1705,7 +1834,7 @@ func (f *Function) RNGBitGenerator(state backends.Value, shape shapes.Shape) (ne
 		bridge.Eval(arrays[si])
 		sd := uint64(readScalarInt(arrays[si], stGomlxDType))
 		ns := newScalarSeed(sd+1, stGomlxDType)
-		res := bridge.Reshape(ns, stDims, s)
+		res := bridge.BroadcastTo(ns, stDims, s)
 		ns.Free()
 		return res
 	})
@@ -1713,7 +1842,18 @@ func (f *Function) RNGBitGenerator(state backends.Value, shape shapes.Shape) (ne
 		bridge.Eval(arrays[si])
 		sd := uint64(readScalarInt(arrays[si], stGomlxDType))
 		k := bridge.RandomKey(sd)
-		res := bridge.RandomBits(oDims, bits, k, s)
+		var res *bridge.Array
+		if replayBits > 4 {
+			lo := bridge.NewArrayScalarFloat32(0)
+			hi := bridge.NewArrayScalarFloat32(float32(uint64(1) << replayBits))
+			rf := bridge.RandomUniform(lo, hi, oDims, bridge.DTypeFloat32, k, s)
+			lo.Free()
+			hi.Free()
+			res = bridge.AsType(rf, replayDType, s)
+			rf.Free()
+		} else {
+			res = bridge.RandomBits(oDims, replayBits, k, s)
+		}
 		k.Free()
 		return res
 	})
@@ -2472,13 +2612,25 @@ func (f *Function) serializeTape() (instrs []int32, numSlots int, outputSlots, c
 		paramSlots[i] = int32(p.tapeIdx)
 	}
 
+	// remapSlot translates sentinel temp slot indices (tempSlotBase+N) into the
+	// actual slot range [len(f.tape), len(f.tape)+tempSlotCount).
+	tapeLen := int32(len(f.tape))
+	remapSlot := func(slot int32) int32 {
+		if slot >= int32(tempSlotBase) {
+			return tapeLen + (slot - int32(tempSlotBase))
+		}
+		return slot
+	}
+
 	// Flatten instrMeta to contiguous int32 stream.
 	// Each instruction: [opcode, out_slot, num_inputs, input_slots..., num_params, params...]
 	for _, instr := range f.instrs {
 		instrs = append(instrs, instr.opcode)
-		instrs = append(instrs, instr.outSlot)
+		instrs = append(instrs, remapSlot(instr.outSlot))
 		instrs = append(instrs, int32(len(instr.inputs)))
-		instrs = append(instrs, instr.inputs...)
+		for _, inp := range instr.inputs {
+			instrs = append(instrs, remapSlot(inp))
+		}
 		instrs = append(instrs, int32(len(instr.params)))
 		instrs = append(instrs, instr.params...)
 	}
