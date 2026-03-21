@@ -89,10 +89,16 @@ func (b *Builder) compileSimple() (backends.Executable, error) {
 	inputNames, inputShapes := collectParamInfo(b.mainFn.params)
 	mainFn := b.mainFn
 	backend := b.backend
+	reasons := mainFn.goCallbackReasons()
 
 	// If the tape is fully C-interpretable, use the pure-C interpreter path
 	// to eliminate CGo boundary crossings during steady-state execution.
 	if !mainFn.hasGoCallback && len(mainFn.instrs) > 0 {
+		mode := ExecutionModeCTapeInterpreter
+		if err := backend.validateExecutionMode(b.name, mode, reasons); err != nil {
+			return nil, err
+		}
+		backend.logExecutionMode(b.name, mode, reasons)
 		instrs, numSlots, outputSlots, constSlots, constArrays, paramSlots := mainFn.serializeTape()
 		rawClosure := bridge.NewClosureFromCTape(instrs, numSlots, outputSlots, constSlots, constArrays, paramSlots)
 		// Skip mlx_compile: the C tape interpreter already handles memory correctly
@@ -107,6 +113,8 @@ func (b *Builder) compileSimple() (backends.Executable, error) {
 			inputNames:   inputNames,
 			inputShapes:  inputShapes,
 			outputShapes: collectOutputShapes(b.mainFn.outputs),
+			mode:         mode,
+			reasons:      reasons,
 		}, nil
 	}
 
@@ -152,12 +160,23 @@ func (b *Builder) compileSimple() (backends.Executable, error) {
 	// with symbolic arrays, but Go callbacks (e.g. RNG) try to Eval and read
 	// real data during the trace, causing a SIGSEGV.
 	var compiled *bridge.Closure
+	mode := ExecutionModeCompiledGoClosure
 	if !mainFn.hasGoCallback {
+		if err := backend.validateExecutionMode(b.name, mode, reasons); err != nil {
+			rawClosure.Free()
+			return nil, err
+		}
 		compiled = bridge.CompileClosure(rawClosure, false)
 	} else {
+		mode = ExecutionModeRawGoClosure
+		if err := backend.validateExecutionMode(b.name, mode, reasons); err != nil {
+			rawClosure.Free()
+			return nil, err
+		}
 		compiled = rawClosure
 		rawClosure = nil // avoid double-free
 	}
+	backend.logExecutionMode(b.name, mode, reasons)
 
 	return &Executable{
 		backend:      b.backend,
@@ -167,11 +186,19 @@ func (b *Builder) compileSimple() (backends.Executable, error) {
 		inputNames:   inputNames,
 		inputShapes:  inputShapes,
 		outputShapes: collectOutputShapes(b.mainFn.outputs),
+		mode:         mode,
+		reasons:      reasons,
 	}, nil
 }
 
 // compileWithControlFlow compiles a function containing a control flow operation.
 func (b *Builder) compileWithControlFlow() (backends.Executable, error) {
+	mode := ExecutionModeControlFlow
+	reasons := []string{"control_flow"}
+	if err := b.backend.validateExecutionMode(b.name, mode, reasons); err != nil {
+		return nil, err
+	}
+	b.backend.logExecutionMode(b.name, mode, reasons)
 	cf := b.mainFn.controlFlowStep
 
 	// Build output mapping.
@@ -195,6 +222,8 @@ func (b *Builder) compileWithControlFlow() (backends.Executable, error) {
 		inputNames:    inputNames,
 		inputShapes:   inputShapes,
 		outputShapes:  collectOutputShapes(b.mainFn.outputs),
+		mode:          mode,
+		reasons:       reasons,
 	}, nil
 }
 

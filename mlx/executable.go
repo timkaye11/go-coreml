@@ -63,6 +63,8 @@ type Executable struct {
 	inputNames   []string
 	inputShapes  []shapes.Shape
 	outputShapes []shapes.Shape
+	mode         ExecutionMode
+	reasons      []string
 	mu           sync.Mutex
 }
 
@@ -88,6 +90,17 @@ func (e *Executable) Inputs() (names []string, inputShapes []shapes.Shape) {
 
 func (e *Executable) Outputs() (outputShapes []shapes.Shape) {
 	return e.outputShapes
+}
+
+func (e *Executable) ExecutionMode() ExecutionMode {
+	return e.mode
+}
+
+func (e *Executable) ExecutionReasons() []string {
+	if len(e.reasons) == 0 {
+		return nil
+	}
+	return append([]string(nil), e.reasons...)
 }
 
 func (e *Executable) Execute(inputs []backends.Buffer, donate []bool, defaultDevice backends.DeviceNum) ([]backends.Buffer, error) {
@@ -131,6 +144,7 @@ func (e *Executable) Execute(inputs []backends.Buffer, donate []bool, defaultDev
 	for i, out := range e.mainFn.outputs {
 		results[i] = newBufferFromArray(outputArrays[i], out.shape)
 	}
+	finalizeDonatedInputs(e.backend, inputs, donate)
 
 	return results, nil
 }
@@ -179,6 +193,8 @@ type ExecutableWithCF struct {
 	inputNames    []string
 	inputShapes   []shapes.Shape
 	outputShapes  []shapes.Shape
+	mode          ExecutionMode
+	reasons       []string
 	mu            sync.Mutex
 }
 
@@ -196,6 +212,17 @@ func (e *ExecutableWithCF) Inputs() ([]string, []shapes.Shape) {
 
 func (e *ExecutableWithCF) Outputs() []shapes.Shape {
 	return e.outputShapes
+}
+
+func (e *ExecutableWithCF) ExecutionMode() ExecutionMode {
+	return e.mode
+}
+
+func (e *ExecutableWithCF) ExecutionReasons() []string {
+	if len(e.reasons) == 0 {
+		return nil
+	}
+	return append([]string(nil), e.reasons...)
 }
 
 func (e *ExecutableWithCF) Execute(inputs []backends.Buffer, donate []bool, defaultDevice backends.DeviceNum) ([]backends.Buffer, error) {
@@ -264,8 +291,30 @@ func (e *ExecutableWithCF) Execute(inputs []backends.Buffer, donate []bool, defa
 	// Without this, all intermediate arrays from replayTape leak every step
 	// (~1.8 MB/step for a 1-layer model with VJP gradients).
 	freeIntermediates(e.mainFn, arrays, outputTapeIndices)
+	finalizeDonatedInputs(e.backend, inputs, donate)
 
 	return results, nil
+}
+
+func finalizeDonatedInputs(backend *Backend, inputs []backends.Buffer, donate []bool) {
+	if backend == nil || len(inputs) == 0 || len(donate) == 0 {
+		return
+	}
+	seen := make(map[*mlxBuffer]struct{}, len(inputs))
+	for i, input := range inputs {
+		if i >= len(donate) || !donate[i] || input == nil {
+			continue
+		}
+		buf, ok := input.(*mlxBuffer)
+		if !ok || buf == nil {
+			continue
+		}
+		if _, found := seen[buf]; found {
+			continue
+		}
+		seen[buf] = struct{}{}
+		_ = backend.BufferFinalize(buf)
+	}
 }
 
 func (e *ExecutableWithCF) execWhile(cf *controlFlowStep, cfInputArrays []*bridge.Array) ([]backends.Buffer, error) {
@@ -389,4 +438,3 @@ func (e *ExecutableWithCF) execSort(cf *controlFlowStep, cfInputArrays []*bridge
 func (e *ExecutableWithCF) execCall(cf *controlFlowStep, cfInputArrays []*bridge.Array) ([]backends.Buffer, error) {
 	return e.evalFunctionOutputs(cf.callData.targetFn, cfInputArrays, "Call: eval")
 }
-

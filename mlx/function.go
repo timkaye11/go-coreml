@@ -8,6 +8,7 @@ import (
 	"math"
 	"reflect"
 	"runtime"
+	"slices"
 	"unsafe"
 
 	"github.com/gomlx/go-coreml/mlx/internal/bridge"
@@ -25,7 +26,7 @@ import (
 
 const (
 	// Unary
-	opAbs        int32 = iota
+	opAbs int32 = iota
 	opNeg
 	opSqrt
 	opRsqrt
@@ -170,6 +171,7 @@ type Function struct {
 	instrs        []instrMeta // instruction metadata for C interpreter
 	hasGoCallback bool        // true if any op needs Go callback (DynamicSlice, RNG)
 	tempSlotCount int         // number of temp slots for compound ops
+	goCallbackOps map[string]struct{}
 }
 
 // controlFlowStep records a pending control flow operation.
@@ -303,8 +305,27 @@ func (f *Function) nextTempSlot() int32 {
 }
 
 // markGoCallback marks this function as requiring a Go callback (fallback path).
-func (f *Function) markGoCallback() {
+func (f *Function) markGoCallback(op string) {
 	f.hasGoCallback = true
+	if op == "" {
+		return
+	}
+	if f.goCallbackOps == nil {
+		f.goCallbackOps = make(map[string]struct{})
+	}
+	f.goCallbackOps[op] = struct{}{}
+}
+
+func (f *Function) goCallbackReasons() []string {
+	if len(f.goCallbackOps) == 0 {
+		return nil
+	}
+	reasons := make([]string, 0, len(f.goCallbackOps))
+	for op := range f.goCallbackOps {
+		reasons = append(reasons, op)
+	}
+	slices.Sort(reasons)
+	return reasons
 }
 
 // finalize frees all build-time MLX arrays held by this function.
@@ -416,61 +437,80 @@ func (f *Function) unaryBoolOp(bridgeFn func(*bridge.Array, *bridge.Stream) *bri
 }
 
 func (f *Function) Abs(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryOp(bridge.Abs, n, opAbs), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryOp(bridge.Abs, n, opAbs), nil
 }
 func (f *Function) Neg(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryOp(bridge.Negative, n, opNeg), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryOp(bridge.Negative, n, opNeg), nil
 }
 func (f *Function) Sqrt(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryOp(bridge.Sqrt, n, opSqrt), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryOp(bridge.Sqrt, n, opSqrt), nil
 }
 func (f *Function) Rsqrt(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryOp(bridge.Rsqrt, n, opRsqrt), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryOp(bridge.Rsqrt, n, opRsqrt), nil
 }
 func (f *Function) Exp(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryOp(bridge.Exp, n, opExp), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryOp(bridge.Exp, n, opExp), nil
 }
 func (f *Function) Expm1(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryOp(bridge.Expm1, n, opExpm1), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryOp(bridge.Expm1, n, opExpm1), nil
 }
 func (f *Function) Log(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryOp(bridge.Log, n, opLog), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryOp(bridge.Log, n, opLog), nil
 }
 func (f *Function) Log1p(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryOp(bridge.Log1p, n, opLog1p), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryOp(bridge.Log1p, n, opLog1p), nil
 }
 func (f *Function) Sin(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryOp(bridge.Sin, n, opSin), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryOp(bridge.Sin, n, opSin), nil
 }
 func (f *Function) Cos(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryOp(bridge.Cos, n, opCos), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryOp(bridge.Cos, n, opCos), nil
 }
 func (f *Function) Tanh(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryOp(bridge.Tanh, n, opTanh), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryOp(bridge.Tanh, n, opTanh), nil
 }
 func (f *Function) Logistic(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryOp(bridge.Sigmoid, n, opSigmoid), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryOp(bridge.Sigmoid, n, opSigmoid), nil
 }
 func (f *Function) Erf(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryOp(bridge.Erf, n, opErf), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryOp(bridge.Erf, n, opErf), nil
 }
 func (f *Function) Floor(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryOp(bridge.Floor, n, opFloor), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryOp(bridge.Floor, n, opFloor), nil
 }
 func (f *Function) Ceil(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryOp(bridge.Ceil, n, opCeil), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryOp(bridge.Ceil, n, opCeil), nil
 }
 func (f *Function) Round(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryOp(bridge.Round, n, opRound), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryOp(bridge.Round, n, opRound), nil
 }
 func (f *Function) Sign(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryOp(bridge.Sign, n, opSign), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryOp(bridge.Sign, n, opSign), nil
 }
 func (f *Function) LogicalNot(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryBoolOp(bridge.LogicalNot, n, opLogicalNot), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryBoolOp(bridge.LogicalNot, n, opLogicalNot), nil
 }
 func (f *Function) BitwiseNot(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryOp(bridge.BitwiseNot, n, opBitwiseNot), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryOp(bridge.BitwiseNot, n, opBitwiseNot), nil
 }
 func (f *Function) IsFinite(x backends.Value) (backends.Value, error) {
 	n, _ := f.resolveNode(x)
@@ -479,7 +519,9 @@ func (f *Function) IsFinite(x backends.Value) (backends.Value, error) {
 		in := bridge.IsNaN(a, s)
 		ior := bridge.LogicalOr(ii, in, s)
 		res := bridge.LogicalNot(ior, s)
-		ii.Free(); in.Free(); ior.Free()
+		ii.Free()
+		in.Free()
+		ior.Free()
 		return res
 	}
 	node := f.unaryBoolOp(isFiniteFn, n)
@@ -496,7 +538,8 @@ func (f *Function) IsFinite(x backends.Value) (backends.Value, error) {
 	return node, nil
 }
 func (f *Function) IsNaN(x backends.Value) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.unaryBoolOp(bridge.IsNaN, n, opIsNaN), nil
+	n, _ := f.resolveNode(x)
+	return f.unaryBoolOp(bridge.IsNaN, n, opIsNaN), nil
 }
 func (f *Function) Identity(x backends.Value) (backends.Value, error) {
 	n, _ := f.resolveNode(x)
@@ -569,26 +612,51 @@ func (f *Function) binaryCompareOp(name string, fn func(*bridge.Array, *bridge.A
 	return node, nil
 }
 
-func (f *Function) Add(lhs, rhs backends.Value) (backends.Value, error) { return f.binaryOp("Add", bridge.Add, lhs, rhs, opAdd) }
-func (f *Function) Sub(lhs, rhs backends.Value) (backends.Value, error) { return f.binaryOp("Sub", bridge.Subtract, lhs, rhs, opSub) }
-func (f *Function) Mul(lhs, rhs backends.Value) (backends.Value, error) { return f.binaryOp("Mul", bridge.Multiply, lhs, rhs, opMul) }
-func (f *Function) Div(lhs, rhs backends.Value) (backends.Value, error) { return f.binaryOp("Div", bridge.Divide, lhs, rhs, opDiv) }
-func (f *Function) Rem(lhs, rhs backends.Value) (backends.Value, error) { return f.binaryOp("Rem", bridge.Remainder, lhs, rhs, opRem) }
-func (f *Function) Pow(lhs, rhs backends.Value) (backends.Value, error) { return f.binaryOp("Pow", bridge.Power, lhs, rhs, opPow) }
-func (f *Function) Max(lhs, rhs backends.Value) (backends.Value, error) { return f.binaryOp("Max", bridge.Maximum, lhs, rhs, opMax) }
-func (f *Function) Min(lhs, rhs backends.Value) (backends.Value, error) { return f.binaryOp("Min", bridge.Minimum, lhs, rhs, opMin) }
-func (f *Function) Atan2(lhs, rhs backends.Value) (backends.Value, error) { return f.binaryOp("Atan2", bridge.Arctan2, lhs, rhs, opAtan2) }
+func (f *Function) Add(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryOp("Add", bridge.Add, lhs, rhs, opAdd)
+}
+func (f *Function) Sub(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryOp("Sub", bridge.Subtract, lhs, rhs, opSub)
+}
+func (f *Function) Mul(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryOp("Mul", bridge.Multiply, lhs, rhs, opMul)
+}
+func (f *Function) Div(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryOp("Div", bridge.Divide, lhs, rhs, opDiv)
+}
+func (f *Function) Rem(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryOp("Rem", bridge.Remainder, lhs, rhs, opRem)
+}
+func (f *Function) Pow(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryOp("Pow", bridge.Power, lhs, rhs, opPow)
+}
+func (f *Function) Max(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryOp("Max", bridge.Maximum, lhs, rhs, opMax)
+}
+func (f *Function) Min(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryOp("Min", bridge.Minimum, lhs, rhs, opMin)
+}
+func (f *Function) Atan2(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryOp("Atan2", bridge.Arctan2, lhs, rhs, opAtan2)
+}
 
-func (f *Function) LogicalAnd(lhs, rhs backends.Value) (backends.Value, error) { return f.binaryCompareOp("LogicalAnd", bridge.LogicalAnd, lhs, rhs, opLogicalAnd) }
-func (f *Function) LogicalOr(lhs, rhs backends.Value) (backends.Value, error)  { return f.binaryCompareOp("LogicalOr", bridge.LogicalOr, lhs, rhs, opLogicalOr) }
+func (f *Function) LogicalAnd(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryCompareOp("LogicalAnd", bridge.LogicalAnd, lhs, rhs, opLogicalAnd)
+}
+func (f *Function) LogicalOr(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryCompareOp("LogicalOr", bridge.LogicalOr, lhs, rhs, opLogicalOr)
+}
 func (f *Function) LogicalXor(lhs, rhs backends.Value) (backends.Value, error) {
-	l, _ := f.resolveNode(lhs); r, _ := f.resolveNode(rhs)
+	l, _ := f.resolveNode(lhs)
+	r, _ := f.resolveNode(rhs)
 	s := f.stream()
 	orr := bridge.LogicalOr(l.array, r.array, s)
 	andd := bridge.LogicalAnd(l.array, r.array, s)
 	notAnd := bridge.LogicalNot(andd, s)
 	result := bridge.LogicalAnd(orr, notAnd, s)
-	orr.Free(); andd.Free(); notAnd.Free()
+	orr.Free()
+	andd.Free()
+	notAnd.Free()
 	outShape, _ := shapeinference.ComparisonOp(backends.OpTypeEqual, l.shape, r.shape)
 	li, ri := l.tapeIdx, r.tapeIdx
 	node := f.record(outShape, result, func(arrays []*bridge.Array, s *bridge.Stream) *bridge.Array {
@@ -596,7 +664,9 @@ func (f *Function) LogicalXor(lhs, rhs backends.Value) (backends.Value, error) {
 		a := bridge.LogicalAnd(arrays[li], arrays[ri], s)
 		na := bridge.LogicalNot(a, s)
 		r := bridge.LogicalAnd(o, na, s)
-		o.Free(); a.Free(); na.Free()
+		o.Free()
+		a.Free()
+		na.Free()
 		return r
 	})
 	// Compound: or → t0, and → t1, not → t2, and(t0,t2) → out
@@ -611,11 +681,21 @@ func (f *Function) LogicalXor(lhs, rhs backends.Value) (backends.Value, error) {
 	return node, nil
 }
 
-func (f *Function) BitwiseAnd(lhs, rhs backends.Value) (backends.Value, error) { return f.binaryOp("BitwiseAnd", bridge.BitwiseAnd, lhs, rhs, opBitwiseAnd) }
-func (f *Function) BitwiseOr(lhs, rhs backends.Value) (backends.Value, error)  { return f.binaryOp("BitwiseOr", bridge.BitwiseOr, lhs, rhs, opBitwiseOr) }
-func (f *Function) BitwiseXor(lhs, rhs backends.Value) (backends.Value, error) { return f.binaryOp("BitwiseXor", bridge.BitwiseXor, lhs, rhs, opBitwiseXor) }
-func (f *Function) ShiftLeft(lhs, rhs backends.Value) (backends.Value, error)  { return f.binaryOp("ShiftLeft", bridge.LeftShift, lhs, rhs, opLeftShift) }
-func (f *Function) ShiftRightArithmetic(lhs, rhs backends.Value) (backends.Value, error) { return f.binaryOp("ShiftRightArithmetic", bridge.RightShift, lhs, rhs, opRightShift) }
+func (f *Function) BitwiseAnd(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryOp("BitwiseAnd", bridge.BitwiseAnd, lhs, rhs, opBitwiseAnd)
+}
+func (f *Function) BitwiseOr(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryOp("BitwiseOr", bridge.BitwiseOr, lhs, rhs, opBitwiseOr)
+}
+func (f *Function) BitwiseXor(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryOp("BitwiseXor", bridge.BitwiseXor, lhs, rhs, opBitwiseXor)
+}
+func (f *Function) ShiftLeft(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryOp("ShiftLeft", bridge.LeftShift, lhs, rhs, opLeftShift)
+}
+func (f *Function) ShiftRightArithmetic(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryOp("ShiftRightArithmetic", bridge.RightShift, lhs, rhs, opRightShift)
+}
 func (f *Function) ShiftRightLogical(lhs, rhs backends.Value) (backends.Value, error) {
 	l, _ := f.resolveNode(lhs)
 	r, _ := f.resolveNode(rhs)
@@ -666,20 +746,44 @@ func signedToUnsigned(dt dtypes.DType) dtypes.DType {
 }
 
 // Comparison
-func (f *Function) Equal(lhs, rhs backends.Value) (backends.Value, error)        { return f.binaryCompareOp("Equal", bridge.Equal, lhs, rhs, opEq) }
-func (f *Function) NotEqual(lhs, rhs backends.Value) (backends.Value, error)     { return f.binaryCompareOp("NotEqual", bridge.NotEqual, lhs, rhs, opNe) }
-func (f *Function) LessThan(lhs, rhs backends.Value) (backends.Value, error)     { return f.binaryCompareOp("LessThan", bridge.Less, lhs, rhs, opLt) }
-func (f *Function) LessOrEqual(lhs, rhs backends.Value) (backends.Value, error)  { return f.binaryCompareOp("LessOrEqual", bridge.LessEqual, lhs, rhs, opLe) }
-func (f *Function) GreaterThan(lhs, rhs backends.Value) (backends.Value, error)  { return f.binaryCompareOp("GreaterThan", bridge.Greater, lhs, rhs, opGt) }
-func (f *Function) GreaterOrEqual(lhs, rhs backends.Value) (backends.Value, error) { return f.binaryCompareOp("GreaterOrEqual", bridge.GreaterEqual, lhs, rhs, opGe) }
+func (f *Function) Equal(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryCompareOp("Equal", bridge.Equal, lhs, rhs, opEq)
+}
+func (f *Function) NotEqual(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryCompareOp("NotEqual", bridge.NotEqual, lhs, rhs, opNe)
+}
+func (f *Function) LessThan(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryCompareOp("LessThan", bridge.Less, lhs, rhs, opLt)
+}
+func (f *Function) LessOrEqual(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryCompareOp("LessOrEqual", bridge.LessEqual, lhs, rhs, opLe)
+}
+func (f *Function) GreaterThan(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryCompareOp("GreaterThan", bridge.Greater, lhs, rhs, opGt)
+}
+func (f *Function) GreaterOrEqual(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.binaryCompareOp("GreaterOrEqual", bridge.GreaterEqual, lhs, rhs, opGe)
+}
 
 // TotalOrder comparisons — treat same as regular for MLX.
-func (f *Function) EqualTotalOrder(lhs, rhs backends.Value) (backends.Value, error)          { return f.Equal(lhs, rhs) }
-func (f *Function) NotEqualTotalOrder(lhs, rhs backends.Value) (backends.Value, error)       { return f.NotEqual(lhs, rhs) }
-func (f *Function) LessThanTotalOrder(lhs, rhs backends.Value) (backends.Value, error)       { return f.LessThan(lhs, rhs) }
-func (f *Function) LessOrEqualTotalOrder(lhs, rhs backends.Value) (backends.Value, error)    { return f.LessOrEqual(lhs, rhs) }
-func (f *Function) GreaterThanTotalOrder(lhs, rhs backends.Value) (backends.Value, error)    { return f.GreaterThan(lhs, rhs) }
-func (f *Function) GreaterOrEqualTotalOrder(lhs, rhs backends.Value) (backends.Value, error) { return f.GreaterOrEqual(lhs, rhs) }
+func (f *Function) EqualTotalOrder(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.Equal(lhs, rhs)
+}
+func (f *Function) NotEqualTotalOrder(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.NotEqual(lhs, rhs)
+}
+func (f *Function) LessThanTotalOrder(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.LessThan(lhs, rhs)
+}
+func (f *Function) LessOrEqualTotalOrder(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.LessOrEqual(lhs, rhs)
+}
+func (f *Function) GreaterThanTotalOrder(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.GreaterThan(lhs, rhs)
+}
+func (f *Function) GreaterOrEqualTotalOrder(lhs, rhs backends.Value) (backends.Value, error) {
+	return f.GreaterOrEqual(lhs, rhs)
+}
 
 // ===========================================================================
 // Shape Operations
@@ -696,7 +800,9 @@ func (f *Function) Reshape(x backends.Value, dimensions ...int) (backends.Value,
 	})
 	// params: [ndim, dims...]
 	p := []int32{int32(len(dims))}
-	for _, d := range dims { p = append(p, int32(d)) }
+	for _, d := range dims {
+		p = append(p, int32(d))
+	}
 	f.emitInstr(opReshape, int32(node.tapeIdx), []int32{int32(xi)}, p...)
 	return node, nil
 }
@@ -715,7 +821,9 @@ func (f *Function) Transpose(x backends.Value, permutation ...int) (backends.Val
 		return bridge.Transpose(arrays[xi], perm, s)
 	})
 	p := []int32{int32(len(perm))}
-	for _, a := range perm { p = append(p, int32(a)) }
+	for _, a := range perm {
+		p = append(p, int32(a))
+	}
 	f.emitInstr(opTranspose, int32(node.tapeIdx), []int32{int32(xi)}, p...)
 	return node, nil
 }
@@ -742,10 +850,14 @@ func (f *Function) BroadcastInDim(x backends.Value, outputShape shapes.Shape, br
 	// Compound: reshape → t0, broadcast_to → out
 	t0 := f.nextTempSlot()
 	rp := []int32{int32(len(eDims))}
-	for _, d := range eDims { rp = append(rp, int32(d)) }
+	for _, d := range eDims {
+		rp = append(rp, int32(d))
+	}
 	f.emitInstr(opReshape, t0, []int32{int32(xi)}, rp...)
 	bp := []int32{int32(len(oDims))}
-	for _, d := range oDims { bp = append(bp, int32(d)) }
+	for _, d := range oDims {
+		bp = append(bp, int32(d))
+	}
 	f.emitInstr(opBroadcastTo, int32(node.tapeIdx), []int32{t0}, bp...)
 	f.emitInstr(opFreeTemp, -1, []int32{t0})
 	return node, nil
@@ -809,9 +921,15 @@ func (f *Function) Slice(x backends.Value, starts, limits, strides []int) (backe
 	})
 	// params: [ndim, starts..., stops..., strides...]
 	p := []int32{int32(len(st))}
-	for _, v := range st { p = append(p, int32(v)) }
-	for _, v := range li { p = append(p, int32(v)) }
-	for _, v := range sr { p = append(p, int32(v)) }
+	for _, v := range st {
+		p = append(p, int32(v))
+	}
+	for _, v := range li {
+		p = append(p, int32(v))
+	}
+	for _, v := range sr {
+		p = append(p, int32(v))
+	}
 	f.emitInstr(opSlice, int32(node.tapeIdx), []int32{int32(xi)}, p...)
 	return node, nil
 }
@@ -845,7 +963,9 @@ func (f *Function) Concatenate(axis int, operands ...backends.Value) (backends.V
 		return bridge.Concatenate(arrs, ax, s)
 	})
 	ins := make([]int32, len(tapeIndices))
-	for i, ti := range tapeIndices { ins[i] = int32(ti) }
+	for i, ti := range tapeIndices {
+		ins[i] = int32(ti)
+	}
 	f.emitInstr(opConcat, int32(node.tapeIdx), ins, int32(ax))
 	return node, nil
 }
@@ -859,7 +979,9 @@ func (f *Function) Reverse(x backends.Value, axes ...int) (backends.Value, error
 		return bridge.Flip(arrays[xi], ax, s)
 	})
 	p := []int32{int32(len(ax))}
-	for _, a := range ax { p = append(p, int32(a)) }
+	for _, a := range ax {
+		p = append(p, int32(a))
+	}
 	f.emitInstr(opFlip, int32(node.tapeIdx), []int32{int32(xi)}, p...)
 	return node, nil
 }
@@ -925,9 +1047,15 @@ func (f *Function) Pad(x, fillValue backends.Value, axesConfig ...backends.PadAx
 	})
 	// params: [naxes, axes..., low_pads..., high_pads...]
 	p := []int32{int32(len(ax))}
-	for _, a := range ax { p = append(p, int32(a)) }
-	for _, v := range lp { p = append(p, int32(v)) }
-	for _, v := range hp { p = append(p, int32(v)) }
+	for _, a := range ax {
+		p = append(p, int32(a))
+	}
+	for _, v := range lp {
+		p = append(p, int32(v))
+	}
+	for _, v := range hp {
+		p = append(p, int32(v))
+	}
 	f.emitInstr(opPad, int32(node.tapeIdx), []int32{int32(ni), int32(fi)}, p...)
 	return node, nil
 }
@@ -956,7 +1084,9 @@ func (f *Function) reduceOp(fn func(*bridge.Array, []int, bool, *bridge.Stream) 
 	if len(opcodes) > 0 {
 		// params: [naxes, axes..., keepdims]
 		p := []int32{int32(len(ax))}
-		for _, a := range ax { p = append(p, int32(a)) }
+		for _, a := range ax {
+			p = append(p, int32(a))
+		}
 		p = append(p, 0) // keepdims=false
 		f.emitInstr(opcodes[0], int32(node.tapeIdx), []int32{int32(xi)}, p...)
 	}
@@ -964,16 +1094,20 @@ func (f *Function) reduceOp(fn func(*bridge.Array, []int, bool, *bridge.Stream) 
 }
 
 func (f *Function) ReduceSum(x backends.Value, axes ...int) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.reduceOp(bridge.Sum, n, axes, opReduceSum), nil
+	n, _ := f.resolveNode(x)
+	return f.reduceOp(bridge.Sum, n, axes, opReduceSum), nil
 }
 func (f *Function) ReduceMax(x backends.Value, axes ...int) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.reduceOp(bridge.Max, n, axes, opReduceMax), nil
+	n, _ := f.resolveNode(x)
+	return f.reduceOp(bridge.Max, n, axes, opReduceMax), nil
 }
 func (f *Function) ReduceMin(x backends.Value, axes ...int) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.reduceOp(bridge.Min, n, axes, opReduceMin), nil
+	n, _ := f.resolveNode(x)
+	return f.reduceOp(bridge.Min, n, axes, opReduceMin), nil
 }
 func (f *Function) ReduceProduct(x backends.Value, axes ...int) (backends.Value, error) {
-	n, _ := f.resolveNode(x); return f.reduceOp(bridge.Prod, n, axes, opReduceProd), nil
+	n, _ := f.resolveNode(x)
+	return f.reduceOp(bridge.Prod, n, axes, opReduceProd), nil
 }
 func (f *Function) ReduceLogicalAnd(x backends.Value, axes ...int) (backends.Value, error) {
 	n, _ := f.resolveNode(x)
@@ -1027,7 +1161,9 @@ func (f *Function) ArgMinMax(x backends.Value, axis int, outputDType dtypes.DTyp
 	})
 	// params: [axis, keepdims, out_dtype_or_-1]
 	oc := opArgMax
-	if isMin { oc = opArgMin }
+	if isMin {
+		oc = opArgMin
+	}
 	dtParam := int32(-1) // no cast needed
 	if mlxDTypeToGoMLX(r.DType()) != outputDType {
 		dtParam = int32(mlxDt)
@@ -1193,13 +1329,17 @@ func (f *Function) DotGeneral(lhs backends.Value, lhsContractingAxes, lhsBatchAx
 func dotGeneralShape(lShape shapes.Shape, lContract, lBatch []int, rShape shapes.Shape, rContract, rBatch []int) shapes.Shape {
 	isContracting := func(ax int, contract []int) bool {
 		for _, c := range contract {
-			if c == ax { return true }
+			if c == ax {
+				return true
+			}
 		}
 		return false
 	}
 	isBatch := func(ax int, batch []int) bool {
 		for _, b := range batch {
-			if b == ax { return true }
+			if b == ax {
+				return true
+			}
 		}
 		return false
 	}
@@ -1282,28 +1422,41 @@ func dotGeneralReplay(lArr *bridge.Array, lShape shapes.Shape, lContract, lBatch
 	rT := bridge.Transpose(rArr, rPerm, s)
 
 	batchSize := 1
-	for _, ax := range lBatch { batchSize *= lShape.Dimensions[ax] }
+	for _, ax := range lBatch {
+		batchSize *= lShape.Dimensions[ax]
+	}
 	lCrossSize := 1
-	for _, ax := range lCross { lCrossSize *= lShape.Dimensions[ax] }
+	for _, ax := range lCross {
+		lCrossSize *= lShape.Dimensions[ax]
+	}
 	contractSize := 1
-	for _, ax := range lContract { contractSize *= lShape.Dimensions[ax] }
+	for _, ax := range lContract {
+		contractSize *= lShape.Dimensions[ax]
+	}
 	rCrossSize := 1
-	for _, ax := range rCross { rCrossSize *= rShape.Dimensions[ax] }
+	for _, ax := range rCross {
+		rCrossSize *= rShape.Dimensions[ax]
+	}
 
 	if batchSize > 1 {
 		lTr := bridge.Reshape(lT, []int{batchSize, lCrossSize, contractSize}, s)
-		lT.Free(); lT = lTr
+		lT.Free()
+		lT = lTr
 		rTr := bridge.Reshape(rT, []int{batchSize, contractSize, rCrossSize}, s)
-		rT.Free(); rT = rTr
+		rT.Free()
+		rT = rTr
 	} else {
 		lTr := bridge.Reshape(lT, []int{lCrossSize, contractSize}, s)
-		lT.Free(); lT = lTr
+		lT.Free()
+		lT = lTr
 		rTr := bridge.Reshape(rT, []int{contractSize, rCrossSize}, s)
-		rT.Free(); rT = rTr
+		rT.Free()
+		rT = rTr
 	}
 
 	result := bridge.MatMul(lT, rT, s)
-	lT.Free(); rT.Free()
+	lT.Free()
+	rT.Free()
 	final := bridge.Reshape(result, outShape.Dimensions, s)
 	result.Free()
 	return final
@@ -1393,7 +1546,7 @@ func replayDynamicIndices(arrays []*bridge.Array, info []dynamicIndexInfo) []int
 }
 
 func (f *Function) DynamicSlice(operand backends.Value, startIndices []backends.Value, sliceDims []int) (backends.Value, error) {
-	f.markGoCallback()
+	f.markGoCallback("DynamicSlice")
 	n, _ := f.resolveNode(operand)
 	s := f.stream()
 
@@ -1425,7 +1578,7 @@ func (f *Function) DynamicSlice(operand backends.Value, startIndices []backends.
 }
 
 func (f *Function) DynamicUpdateSlice(operand, update backends.Value, startIndices []backends.Value) (backends.Value, error) {
-	f.markGoCallback()
+	f.markGoCallback("DynamicUpdateSlice")
 	n, _ := f.resolveNode(operand)
 	u, _ := f.resolveNode(update)
 	s := f.stream()
@@ -1550,7 +1703,7 @@ func (f *Function) scatterOp(name string, scatterFn func(*bridge.Array, []*bridg
 		return node, nil
 	}
 
-	f.markGoCallback()
+	f.markGoCallback("Scatter(complex)")
 	return nil, errors.Wrapf(backends.ErrNotImplemented, "%s: complex scatter not yet supported", name)
 }
 
@@ -1619,7 +1772,9 @@ func (f *Function) ConvGeneral(
 		dilation := [2]int{kernelDilations[0], kernelDilations[1]}
 		r := bridge.Conv2d(inp.array, ker.array, stride, padding, dilation, channelGroupCount, s)
 		outShape, err := shapeinference.ConvGeneralOp(inp.shape, ker.shape, axes, strides, paddings, inputDilations, kernelDilations, channelGroupCount, batchGroupCount)
-		if err != nil { return nil, err }
+		if err != nil {
+			return nil, err
+		}
 		groups := channelGroupCount
 		node := f.record(outShape, r, func(arrays []*bridge.Array, s *bridge.Stream) *bridge.Array {
 			return bridge.Conv2d(arrays[ii], arrays[ki], stride, padding, dilation, groups, s)
@@ -1632,7 +1787,9 @@ func (f *Function) ConvGeneral(
 		st, pd, dl, groups := strides[0], paddings[0][0], kernelDilations[0], channelGroupCount
 		r := bridge.Conv1d(inp.array, ker.array, st, pd, dl, groups, s)
 		outShape, err := shapeinference.ConvGeneralOp(inp.shape, ker.shape, axes, strides, paddings, inputDilations, kernelDilations, channelGroupCount, batchGroupCount)
-		if err != nil { return nil, err }
+		if err != nil {
+			return nil, err
+		}
 		node := f.record(outShape, r, func(arrays []*bridge.Array, s *bridge.Stream) *bridge.Array {
 			return bridge.Conv1d(arrays[ii], arrays[ki], st, pd, dl, groups, s)
 		})
@@ -1650,7 +1807,7 @@ func (f *Function) ConvGeneral(
 
 func (f *Function) BatchNormForInference(operand, scale, offset, mean, variance backends.Value,
 	epsilon float32, featureAxis int) (backends.Value, error) {
-	f.markGoCallback() // compound op — uses Go callback path
+	f.markGoCallback("BatchNormForInference") // compound op — uses Go callback path
 	x, _ := f.resolveNode(operand)
 	sc, _ := f.resolveNode(scale)
 	off, _ := f.resolveNode(offset)
@@ -1666,8 +1823,12 @@ func (f *Function) BatchNormForInference(operand, scale, offset, mean, variance 
 	scaled := bridge.Multiply(normalized, sc.array, s)
 	result := bridge.Add(scaled, off.array, s)
 
-	eps.Free(); varPlusEps.Free(); invStd.Free()
-	xCentered.Free(); normalized.Free(); scaled.Free()
+	eps.Free()
+	varPlusEps.Free()
+	invStd.Free()
+	xCentered.Free()
+	normalized.Free()
+	scaled.Free()
 
 	xi, si, oi, mi, vi := x.tapeIdx, sc.tapeIdx, off.tapeIdx, m.tapeIdx, v.tapeIdx
 	ep := epsilon
@@ -1679,14 +1840,19 @@ func (f *Function) BatchNormForInference(operand, scale, offset, mean, variance 
 		nm := bridge.Multiply(xc, is, s)
 		sc := bridge.Multiply(nm, arrays[si], s)
 		res := bridge.Add(sc, arrays[oi], s)
-		e.Free(); vpe.Free(); is.Free(); xc.Free(); nm.Free(); sc.Free()
+		e.Free()
+		vpe.Free()
+		is.Free()
+		xc.Free()
+		nm.Free()
+		sc.Free()
 		return res
 	}), nil
 }
 
 func (f *Function) BatchNormForTraining(operand, scale, offset backends.Value,
 	epsilon float32, featureAxis int) (normalized, batchMean, batchVariance backends.Value, err error) {
-	f.markGoCallback() // compound op
+	f.markGoCallback("BatchNormForTraining") // compound op
 	x, _ := f.resolveNode(operand)
 	sc, _ := f.resolveNode(scale)
 	off, _ := f.resolveNode(offset)
@@ -1723,8 +1889,15 @@ func (f *Function) BatchNormForTraining(operand, scale, offset backends.Value,
 	featureDim := x.shape.Dimensions[featureAxis]
 	statsShape := shapes.Make(x.shape.DType, featureDim)
 
-	mean.Free(); count.Free(); diffSq.Free(); variance.Free(); eps.Free()
-	varPlusEps.Free(); invStd.Free(); norm.Free(); scaled.Free()
+	mean.Free()
+	count.Free()
+	diffSq.Free()
+	variance.Free()
+	eps.Free()
+	varPlusEps.Free()
+	invStd.Free()
+	norm.Free()
+	scaled.Free()
 
 	xi, si, oi := x.tapeIdx, sc.tapeIdx, off.tapeIdx
 	rAxes := append([]int{}, reduceAxes...)
@@ -1747,8 +1920,18 @@ func (f *Function) BatchNormForTraining(operand, scale, offset backends.Value,
 		nm := bridge.Multiply(df, is, s)
 		sc := bridge.Multiply(nm, arrays[si], s)
 		res := bridge.Add(sc, arrays[oi], s)
-		cn.Free(); mn.Free(); md.Free(); df.Free(); ds.Free(); vr.Free(); vd.Free()
-		e.Free(); vpe.Free(); is.Free(); nm.Free(); sc.Free()
+		cn.Free()
+		mn.Free()
+		md.Free()
+		df.Free()
+		ds.Free()
+		vr.Free()
+		vd.Free()
+		e.Free()
+		vpe.Free()
+		is.Free()
+		nm.Free()
+		sc.Free()
 		return res
 	})
 	meanNode := f.record(statsShape, meanOut, func(arrays []*bridge.Array, s *bridge.Stream) *bridge.Array {
@@ -1756,7 +1939,9 @@ func (f *Function) BatchNormForTraining(operand, scale, offset backends.Value,
 		mn := bridge.Sum(arrays[xi], rAxes, true, s)
 		md := bridge.Divide(mn, cn, s)
 		res := bridge.Squeeze(md, rAxes, s)
-		cn.Free(); mn.Free(); md.Free()
+		cn.Free()
+		mn.Free()
+		md.Free()
 		return res
 	})
 	varNode := f.record(statsShape, varOut, func(arrays []*bridge.Array, s *bridge.Stream) *bridge.Array {
@@ -1768,7 +1953,13 @@ func (f *Function) BatchNormForTraining(operand, scale, offset backends.Value,
 		vr := bridge.Sum(ds, rAxes, true, s)
 		vd := bridge.Divide(vr, cn, s)
 		res := bridge.Squeeze(vd, rAxes, s)
-		cn.Free(); mn.Free(); md.Free(); df.Free(); ds.Free(); vr.Free(); vd.Free()
+		cn.Free()
+		mn.Free()
+		md.Free()
+		df.Free()
+		ds.Free()
+		vr.Free()
+		vd.Free()
 		return res
 	})
 
@@ -1786,7 +1977,7 @@ func (f *Function) BatchNormGradient(operand, scale, mean, variance, gradOutput 
 // ===========================================================================
 
 func (f *Function) RNGBitGenerator(state backends.Value, shape shapes.Shape) (newState, values backends.Value, err error) {
-	f.markGoCallback()
+	f.markGoCallback("RNGBitGenerator")
 	stateNode, _ := f.resolveNode(state)
 	s := f.stream()
 
@@ -1972,7 +2163,7 @@ func (f *Function) ReduceWindow(
 	windowDimensions, strides, baseDilations, windowDilations []int,
 	paddings [][2]int,
 ) (backends.Value, error) {
-	f.markGoCallback() // compound op using AsStrided
+	f.markGoCallback("ReduceWindow") // compound op using AsStrided
 	n, _ := f.resolveNode(x)
 	s := f.stream()
 
@@ -2047,8 +2238,13 @@ func (f *Function) FusedGelu(x backends.Value, exact bool) (backends.Value, erro
 		onePlusErf := bridge.Add(one, erfVal, s)
 		halfTimesOPE := bridge.Multiply(half, onePlusErf, s)
 		result := bridge.Multiply(n.array, halfTimesOPE, s)
-		sqrt2.Free(); half.Free(); one.Free(); xDivSqrt2.Free()
-		erfVal.Free(); onePlusErf.Free(); halfTimesOPE.Free()
+		sqrt2.Free()
+		half.Free()
+		one.Free()
+		xDivSqrt2.Free()
+		erfVal.Free()
+		onePlusErf.Free()
+		halfTimesOPE.Free()
 		node := f.record(n.shape, result, func(arrays []*bridge.Array, s *bridge.Stream) *bridge.Array {
 			sq2 := bridge.NewArrayScalarFloat32(float32(math.Sqrt2))
 			h := bridge.NewArrayScalarFloat32(0.5)
@@ -2058,7 +2254,13 @@ func (f *Function) FusedGelu(x backends.Value, exact bool) (backends.Value, erro
 			ope := bridge.Add(o, ev, s)
 			htope := bridge.Multiply(h, ope, s)
 			res := bridge.Multiply(arrays[xi], htope, s)
-			sq2.Free(); h.Free(); o.Free(); xds.Free(); ev.Free(); ope.Free(); htope.Free()
+			sq2.Free()
+			h.Free()
+			o.Free()
+			xds.Free()
+			ev.Free()
+			ope.Free()
+			htope.Free()
 			return res
 		})
 		// C-tape: x * 0.5 * (1 + erf(x / sqrt(2)))
@@ -2092,9 +2294,17 @@ func (f *Function) FusedGelu(x backends.Value, exact bool) (backends.Value, erro
 	onePlusTanh := bridge.Add(one, tanhVal, s)
 	halfTimesOPT := bridge.Multiply(half, onePlusTanh, s)
 	result := bridge.Multiply(n.array, halfTimesOPT, s)
-	c.Free(); sqrt2pi.Free(); half.Free(); one.Free(); x3.Free()
-	cx3.Free(); xPlusCx3.Free(); inner.Free(); tanhVal.Free()
-	onePlusTanh.Free(); halfTimesOPT.Free()
+	c.Free()
+	sqrt2pi.Free()
+	half.Free()
+	one.Free()
+	x3.Free()
+	cx3.Free()
+	xPlusCx3.Free()
+	inner.Free()
+	tanhVal.Free()
+	onePlusTanh.Free()
+	halfTimesOPT.Free()
 	node := f.record(n.shape, result, func(arrays []*bridge.Array, s *bridge.Stream) *bridge.Array {
 		cc := bridge.NewArrayScalarFloat32(0.044715)
 		sp := bridge.NewArrayScalarFloat32(float32(math.Sqrt(2.0 / math.Pi)))
@@ -2109,8 +2319,18 @@ func (f *Function) FusedGelu(x backends.Value, exact bool) (backends.Value, erro
 		opt := bridge.Add(o, tv, s)
 		htopt := bridge.Multiply(h, opt, s)
 		res := bridge.Multiply(arrays[xi], htopt, s)
-		cc.Free(); sp.Free(); h.Free(); o.Free(); three.Free()
-		xx3.Free(); ccx3.Free(); xpcx3.Free(); inn.Free(); tv.Free(); opt.Free(); htopt.Free()
+		cc.Free()
+		sp.Free()
+		h.Free()
+		o.Free()
+		three.Free()
+		xx3.Free()
+		ccx3.Free()
+		xpcx3.Free()
+		inn.Free()
+		tv.Free()
+		opt.Free()
+		htopt.Free()
 		return res
 	})
 	// C-tape: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
@@ -2168,15 +2388,25 @@ func (f *Function) FusedLayerNorm(x backends.Value, axes []int, epsilon float64,
 		r := bridge.FastLayerNorm(n.array, gArr, bArr, ep, s)
 		node := f.record(n.shape, r, func(arrays []*bridge.Array, s *bridge.Stream) *bridge.Array {
 			var ga, ba *bridge.Array
-			if gi >= 0 { ga = arrays[gi] }
-			if bi >= 0 { ba = arrays[bi] }
+			if gi >= 0 {
+				ga = arrays[gi]
+			}
+			if bi >= 0 {
+				ba = arrays[bi]
+			}
 			return bridge.FastLayerNorm(arrays[xi], ga, ba, ep, s)
 		})
 		ins := []int32{int32(xi)}
 		hasGamma := int32(0)
 		hasBeta := int32(0)
-		if gi >= 0 { ins = append(ins, int32(gi)); hasGamma = 1 }
-		if bi >= 0 { ins = append(ins, int32(bi)); hasBeta = 1 }
+		if gi >= 0 {
+			ins = append(ins, int32(gi))
+			hasGamma = 1
+		}
+		if bi >= 0 {
+			ins = append(ins, int32(bi))
+			hasBeta = 1
+		}
 		f.emitInstr(opFastLayerNorm, int32(node.tapeIdx), ins, float32Bits(ep), hasGamma, hasBeta)
 		return node, nil
 	}
@@ -2199,15 +2429,25 @@ func (f *Function) FusedLayerNorm(x backends.Value, axes []int, epsilon float64,
 
 	if gArr != nil {
 		result2 := bridge.Multiply(result, gArr, s)
-		result.Free(); result = result2
+		result.Free()
+		result = result2
 	}
 	if bArr != nil {
 		result2 := bridge.Add(result, bArr, s)
-		result.Free(); result = result2
+		result.Free()
+		result = result2
 	}
 
-	mean.Free(); countArr.Free(); meanDiv.Free(); diff.Free(); diffSq.Free()
-	variance.Free(); varianceDiv.Free(); eps.Free(); varPlusEps.Free(); invStd.Free()
+	mean.Free()
+	countArr.Free()
+	meanDiv.Free()
+	diff.Free()
+	diffSq.Free()
+	variance.Free()
+	varianceDiv.Free()
+	eps.Free()
+	varPlusEps.Free()
+	invStd.Free()
 
 	cv := float32(count)
 	node := f.record(n.shape, result, func(arrays []*bridge.Array, s *bridge.Stream) *bridge.Array {
@@ -2222,8 +2462,16 @@ func (f *Function) FusedLayerNorm(x backends.Value, axes []int, epsilon float64,
 		vpe := bridge.Add(vd, e, s)
 		is := bridge.Rsqrt(vpe, s)
 		res := bridge.Multiply(df, is, s)
-		ca.Free(); mn.Free(); md.Free(); df.Free(); ds.Free(); vr.Free(); vd.Free()
-		e.Free(); vpe.Free(); is.Free()
+		ca.Free()
+		mn.Free()
+		md.Free()
+		df.Free()
+		ds.Free()
+		vr.Free()
+		vd.Free()
+		e.Free()
+		vpe.Free()
+		is.Free()
 		if gi >= 0 {
 			old := res
 			res = bridge.Multiply(res, arrays[gi], s)
@@ -2312,7 +2560,8 @@ func (f *Function) FusedDense(x, weight, bias backends.Value, activation backend
 		bn, _ := f.resolveNode(bias)
 		biasTapeIdx = bn.tapeIdx
 		result2 := bridge.Add(result, bn.array, s)
-		result.Free(); result = result2
+		result.Free()
+		result = result2
 	}
 
 	act := activation
@@ -2327,19 +2576,31 @@ func (f *Function) FusedDense(x, weight, bias backends.Value, activation backend
 		ope := bridge.Add(one, ev, s)
 		htope := bridge.Multiply(half, ope, s)
 		geluResult := bridge.Multiply(result, htope, s)
-		sqrt2.Free(); half.Free(); one.Free(); xds.Free(); ev.Free(); ope.Free(); htope.Free()
-		result.Free(); result = geluResult
+		sqrt2.Free()
+		half.Free()
+		one.Free()
+		xds.Free()
+		ev.Free()
+		ope.Free()
+		htope.Free()
+		result.Free()
+		result = geluResult
 	case backends.ActivationRelu:
 		zero := bridge.NewArrayScalarFloat32(0)
 		reluResult := bridge.Maximum(result, zero, s)
-		zero.Free(); result.Free(); result = reluResult
+		zero.Free()
+		result.Free()
+		result = reluResult
 	case backends.ActivationSilu:
 		sig := bridge.Sigmoid(result, s)
 		siluResult := bridge.Multiply(result, sig, s)
-		sig.Free(); result.Free(); result = siluResult
+		sig.Free()
+		result.Free()
+		result = siluResult
 	case backends.ActivationTanh:
 		tanhResult := bridge.Tanh(result, s)
-		result.Free(); result = tanhResult
+		result.Free()
+		result = tanhResult
 	}
 
 	outShape := dotGeneralShape(xn.shape, []int{xn.shape.Rank() - 1}, nil, wn.shape, []int{0}, nil)
@@ -2362,17 +2623,26 @@ func (f *Function) FusedDense(x, weight, bias backends.Value, activation backend
 			htope := bridge.Multiply(h, ope, s)
 			old := res
 			res = bridge.Multiply(res, htope, s)
-			old.Free(); sq2.Free(); h.Free(); o.Free(); xds.Free(); ev.Free(); ope.Free(); htope.Free()
+			old.Free()
+			sq2.Free()
+			h.Free()
+			o.Free()
+			xds.Free()
+			ev.Free()
+			ope.Free()
+			htope.Free()
 		case backends.ActivationRelu:
 			z := bridge.NewArrayScalarFloat32(0)
 			old := res
 			res = bridge.Maximum(res, z, s)
-			old.Free(); z.Free()
+			old.Free()
+			z.Free()
 		case backends.ActivationSilu:
 			sg := bridge.Sigmoid(res, s)
 			old := res
 			res = bridge.Multiply(res, sg, s)
-			old.Free(); sg.Free()
+			old.Free()
+			sg.Free()
 		case backends.ActivationTanh:
 			old := res
 			res = bridge.Tanh(res, s)
@@ -2475,7 +2745,9 @@ func (f *Function) FusedScaledDotProductAttention(
 	r := bridge.FastScaledDotProductAttention(q.array, k.array, v.array, maskArr, sc, s)
 	node := f.record(q.shape, r, func(arrays []*bridge.Array, s *bridge.Stream) *bridge.Array {
 		var ma *bridge.Array
-		if mi >= 0 { ma = arrays[mi] }
+		if mi >= 0 {
+			ma = arrays[mi]
+		}
 		return bridge.FastScaledDotProductAttention(arrays[qi], arrays[ki], arrays[vi], ma, sc, s)
 	})
 	ins := []int32{int32(qi), int32(ki), int32(vi)}
@@ -2492,7 +2764,7 @@ func (f *Function) FusedAttentionQKVProjection(
 	x, wQKV, biasQ, biasK, biasV backends.Value,
 	queryDim, keyValueDim int,
 ) (query, key, value backends.Value, err error) {
-	f.markGoCallback() // compound op
+	f.markGoCallback("FusedAttentionQKVProjection") // compound op
 	xn, _ := f.resolveNode(x)
 	wn, _ := f.resolveNode(wQKV)
 	s := f.stream()
@@ -2525,19 +2797,22 @@ func (f *Function) FusedAttentionQKVProjection(
 		bq, _ := f.resolveNode(biasQ)
 		bqi = bq.tapeIdx
 		qArr2 := bridge.Add(qArr, bq.array, s)
-		qArr.Free(); qArr = qArr2
+		qArr.Free()
+		qArr = qArr2
 	}
 	if biasK != nil {
 		bk, _ := f.resolveNode(biasK)
 		bki = bk.tapeIdx
 		kArr2 := bridge.Add(kArr, bk.array, s)
-		kArr.Free(); kArr = kArr2
+		kArr.Free()
+		kArr = kArr2
 	}
 	if biasV != nil {
 		bv, _ := f.resolveNode(biasV)
 		bvi = bv.tapeIdx
 		vArr2 := bridge.Add(vArr, bv.array, s)
-		vArr.Free(); vArr = vArr2
+		vArr.Free()
+		vArr = vArr2
 	}
 
 	qDims := append(append([]int{}, batchDims...), queryDim)

@@ -693,7 +693,9 @@ func NewArrayFromData(data unsafe.Pointer, shape []int, dtype DType) *Array {
 	}
 	if data == nil {
 		// Create zeros array instead.
-		rc := C.mlx_zeros(&a.handle, shapePtr, C.size_t(len(shape)), dtype, C.mlx_default_gpu_stream_new())
+		stream := DefaultGPUStream()
+		rc := C.mlx_zeros(&a.handle, shapePtr, C.size_t(len(shape)), dtype, stream.handle)
+		stream.Free()
 		checkRC(rc, "mlx_zeros")
 	} else {
 		a.handle = C.mlx_array_new_data(data, shapePtr, C.int(len(shape)), dtype)
@@ -948,64 +950,104 @@ func SetCacheLimit(limit uint64) uint64 {
 // ===========================================================================
 
 func Abs(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_abs(&r.handle, x.handle, s.handle), "mlx_abs"); return r
+	r := &Array{}
+	checkRC(C.mlx_abs(&r.handle, x.handle, s.handle), "mlx_abs")
+	return r
 }
 func Negative(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_negative(&r.handle, x.handle, s.handle), "mlx_negative"); return r
+	r := &Array{}
+	checkRC(C.mlx_negative(&r.handle, x.handle, s.handle), "mlx_negative")
+	return r
 }
 func Sqrt(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_sqrt(&r.handle, x.handle, s.handle), "mlx_sqrt"); return r
+	r := &Array{}
+	checkRC(C.mlx_sqrt(&r.handle, x.handle, s.handle), "mlx_sqrt")
+	return r
 }
 func Rsqrt(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_rsqrt(&r.handle, x.handle, s.handle), "mlx_rsqrt"); return r
+	r := &Array{}
+	checkRC(C.mlx_rsqrt(&r.handle, x.handle, s.handle), "mlx_rsqrt")
+	return r
 }
 func Exp(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_exp(&r.handle, x.handle, s.handle), "mlx_exp"); return r
+	r := &Array{}
+	checkRC(C.mlx_exp(&r.handle, x.handle, s.handle), "mlx_exp")
+	return r
 }
 func Expm1(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_expm1(&r.handle, x.handle, s.handle), "mlx_expm1"); return r
+	r := &Array{}
+	checkRC(C.mlx_expm1(&r.handle, x.handle, s.handle), "mlx_expm1")
+	return r
 }
 func Log(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_log(&r.handle, x.handle, s.handle), "mlx_log"); return r
+	r := &Array{}
+	checkRC(C.mlx_log(&r.handle, x.handle, s.handle), "mlx_log")
+	return r
 }
 func Log1p(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_log1p(&r.handle, x.handle, s.handle), "mlx_log1p"); return r
+	r := &Array{}
+	checkRC(C.mlx_log1p(&r.handle, x.handle, s.handle), "mlx_log1p")
+	return r
 }
 func Sin(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_sin(&r.handle, x.handle, s.handle), "mlx_sin"); return r
+	r := &Array{}
+	checkRC(C.mlx_sin(&r.handle, x.handle, s.handle), "mlx_sin")
+	return r
 }
 func Cos(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_cos(&r.handle, x.handle, s.handle), "mlx_cos"); return r
+	r := &Array{}
+	checkRC(C.mlx_cos(&r.handle, x.handle, s.handle), "mlx_cos")
+	return r
 }
 func Tanh(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_tanh(&r.handle, x.handle, s.handle), "mlx_tanh"); return r
+	r := &Array{}
+	checkRC(C.mlx_tanh(&r.handle, x.handle, s.handle), "mlx_tanh")
+	return r
 }
 func Sigmoid(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_sigmoid(&r.handle, x.handle, s.handle), "mlx_sigmoid"); return r
+	r := &Array{}
+	checkRC(C.mlx_sigmoid(&r.handle, x.handle, s.handle), "mlx_sigmoid")
+	return r
 }
 func Erf(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_erf(&r.handle, x.handle, s.handle), "mlx_erf"); return r
+	r := &Array{}
+	checkRC(C.mlx_erf(&r.handle, x.handle, s.handle), "mlx_erf")
+	return r
 }
 func Floor(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_floor(&r.handle, x.handle, s.handle), "mlx_floor"); return r
+	r := &Array{}
+	checkRC(C.mlx_floor(&r.handle, x.handle, s.handle), "mlx_floor")
+	return r
 }
 func Ceil(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_ceil(&r.handle, x.handle, s.handle), "mlx_ceil"); return r
+	r := &Array{}
+	checkRC(C.mlx_ceil(&r.handle, x.handle, s.handle), "mlx_ceil")
+	return r
 }
 func Sign(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_sign(&r.handle, x.handle, s.handle), "mlx_sign"); return r
+	r := &Array{}
+	checkRC(C.mlx_sign(&r.handle, x.handle, s.handle), "mlx_sign")
+	return r
 }
 func LogicalNot(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_logical_not(&r.handle, x.handle, s.handle), "mlx_logical_not"); return r
+	r := &Array{}
+	checkRC(C.mlx_logical_not(&r.handle, x.handle, s.handle), "mlx_logical_not")
+	return r
 }
 func IsNaN(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_isnan(&r.handle, x.handle, s.handle), "mlx_isnan"); return r
+	r := &Array{}
+	checkRC(C.mlx_isnan(&r.handle, x.handle, s.handle), "mlx_isnan")
+	return r
 }
 func BitwiseNot(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_bitwise_invert(&r.handle, x.handle, s.handle), "mlx_bitwise_invert"); return r
+	r := &Array{}
+	checkRC(C.mlx_bitwise_invert(&r.handle, x.handle, s.handle), "mlx_bitwise_invert")
+	return r
 }
 func Round(x *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_round(&r.handle, x.handle, 0, s.handle), "mlx_round"); return r
+	r := &Array{}
+	checkRC(C.mlx_round(&r.handle, x.handle, 0, s.handle), "mlx_round")
+	return r
 }
 
 // ===========================================================================
@@ -1013,70 +1055,114 @@ func Round(x *Array, s *Stream) *Array {
 // ===========================================================================
 
 func Add(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_add(&r.handle, a.handle, b.handle, s.handle), "mlx_add"); return r
+	r := &Array{}
+	checkRC(C.mlx_add(&r.handle, a.handle, b.handle, s.handle), "mlx_add")
+	return r
 }
 func Subtract(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_subtract(&r.handle, a.handle, b.handle, s.handle), "mlx_subtract"); return r
+	r := &Array{}
+	checkRC(C.mlx_subtract(&r.handle, a.handle, b.handle, s.handle), "mlx_subtract")
+	return r
 }
 func Multiply(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_multiply(&r.handle, a.handle, b.handle, s.handle), "mlx_multiply"); return r
+	r := &Array{}
+	checkRC(C.mlx_multiply(&r.handle, a.handle, b.handle, s.handle), "mlx_multiply")
+	return r
 }
 func Divide(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_divide(&r.handle, a.handle, b.handle, s.handle), "mlx_divide"); return r
+	r := &Array{}
+	checkRC(C.mlx_divide(&r.handle, a.handle, b.handle, s.handle), "mlx_divide")
+	return r
 }
 func Remainder(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_remainder(&r.handle, a.handle, b.handle, s.handle), "mlx_remainder"); return r
+	r := &Array{}
+	checkRC(C.mlx_remainder(&r.handle, a.handle, b.handle, s.handle), "mlx_remainder")
+	return r
 }
 func Power(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_power(&r.handle, a.handle, b.handle, s.handle), "mlx_power"); return r
+	r := &Array{}
+	checkRC(C.mlx_power(&r.handle, a.handle, b.handle, s.handle), "mlx_power")
+	return r
 }
 func Maximum(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_maximum(&r.handle, a.handle, b.handle, s.handle), "mlx_maximum"); return r
+	r := &Array{}
+	checkRC(C.mlx_maximum(&r.handle, a.handle, b.handle, s.handle), "mlx_maximum")
+	return r
 }
 func Minimum(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_minimum(&r.handle, a.handle, b.handle, s.handle), "mlx_minimum"); return r
+	r := &Array{}
+	checkRC(C.mlx_minimum(&r.handle, a.handle, b.handle, s.handle), "mlx_minimum")
+	return r
 }
 func Arctan2(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_arctan2(&r.handle, a.handle, b.handle, s.handle), "mlx_arctan2"); return r
+	r := &Array{}
+	checkRC(C.mlx_arctan2(&r.handle, a.handle, b.handle, s.handle), "mlx_arctan2")
+	return r
 }
 func LogicalAnd(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_logical_and(&r.handle, a.handle, b.handle, s.handle), "mlx_logical_and"); return r
+	r := &Array{}
+	checkRC(C.mlx_logical_and(&r.handle, a.handle, b.handle, s.handle), "mlx_logical_and")
+	return r
 }
 func LogicalOr(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_logical_or(&r.handle, a.handle, b.handle, s.handle), "mlx_logical_or"); return r
+	r := &Array{}
+	checkRC(C.mlx_logical_or(&r.handle, a.handle, b.handle, s.handle), "mlx_logical_or")
+	return r
 }
 func BitwiseAnd(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_bitwise_and(&r.handle, a.handle, b.handle, s.handle), "mlx_bitwise_and"); return r
+	r := &Array{}
+	checkRC(C.mlx_bitwise_and(&r.handle, a.handle, b.handle, s.handle), "mlx_bitwise_and")
+	return r
 }
 func BitwiseOr(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_bitwise_or(&r.handle, a.handle, b.handle, s.handle), "mlx_bitwise_or"); return r
+	r := &Array{}
+	checkRC(C.mlx_bitwise_or(&r.handle, a.handle, b.handle, s.handle), "mlx_bitwise_or")
+	return r
 }
 func BitwiseXor(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_bitwise_xor(&r.handle, a.handle, b.handle, s.handle), "mlx_bitwise_xor"); return r
+	r := &Array{}
+	checkRC(C.mlx_bitwise_xor(&r.handle, a.handle, b.handle, s.handle), "mlx_bitwise_xor")
+	return r
 }
 func LeftShift(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_left_shift(&r.handle, a.handle, b.handle, s.handle), "mlx_left_shift"); return r
+	r := &Array{}
+	checkRC(C.mlx_left_shift(&r.handle, a.handle, b.handle, s.handle), "mlx_left_shift")
+	return r
 }
 func RightShift(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_right_shift(&r.handle, a.handle, b.handle, s.handle), "mlx_right_shift"); return r
+	r := &Array{}
+	checkRC(C.mlx_right_shift(&r.handle, a.handle, b.handle, s.handle), "mlx_right_shift")
+	return r
 }
 func Equal(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_equal(&r.handle, a.handle, b.handle, s.handle), "mlx_equal"); return r
+	r := &Array{}
+	checkRC(C.mlx_equal(&r.handle, a.handle, b.handle, s.handle), "mlx_equal")
+	return r
 }
 func NotEqual(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_not_equal(&r.handle, a.handle, b.handle, s.handle), "mlx_not_equal"); return r
+	r := &Array{}
+	checkRC(C.mlx_not_equal(&r.handle, a.handle, b.handle, s.handle), "mlx_not_equal")
+	return r
 }
 func Less(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_less(&r.handle, a.handle, b.handle, s.handle), "mlx_less"); return r
+	r := &Array{}
+	checkRC(C.mlx_less(&r.handle, a.handle, b.handle, s.handle), "mlx_less")
+	return r
 }
 func LessEqual(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_less_equal(&r.handle, a.handle, b.handle, s.handle), "mlx_less_equal"); return r
+	r := &Array{}
+	checkRC(C.mlx_less_equal(&r.handle, a.handle, b.handle, s.handle), "mlx_less_equal")
+	return r
 }
 func Greater(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_greater(&r.handle, a.handle, b.handle, s.handle), "mlx_greater"); return r
+	r := &Array{}
+	checkRC(C.mlx_greater(&r.handle, a.handle, b.handle, s.handle), "mlx_greater")
+	return r
 }
 func GreaterEqual(a, b *Array, s *Stream) *Array {
-	r := &Array{}; checkRC(C.mlx_greater_equal(&r.handle, a.handle, b.handle, s.handle), "mlx_greater_equal"); return r
+	r := &Array{}
+	checkRC(C.mlx_greater_equal(&r.handle, a.handle, b.handle, s.handle), "mlx_greater_equal")
+	return r
 }
 
 // ===========================================================================
@@ -1272,28 +1358,46 @@ func reduceSetup(axes []int) ([]C.int, *C.int, C.size_t) {
 }
 
 func Sum(x *Array, axes []int, keepDims bool, s *Stream) *Array {
-	r := &Array{}; ca, p, n := reduceSetup(axes)
-	checkRC(C.mlx_sum_axes(&r.handle, x.handle, p, n, C.bool(keepDims), s.handle), "mlx_sum_axes"); runtime.KeepAlive(ca); return r
+	r := &Array{}
+	ca, p, n := reduceSetup(axes)
+	checkRC(C.mlx_sum_axes(&r.handle, x.handle, p, n, C.bool(keepDims), s.handle), "mlx_sum_axes")
+	runtime.KeepAlive(ca)
+	return r
 }
 func Prod(x *Array, axes []int, keepDims bool, s *Stream) *Array {
-	r := &Array{}; ca, p, n := reduceSetup(axes)
-	checkRC(C.mlx_prod_axes(&r.handle, x.handle, p, n, C.bool(keepDims), s.handle), "mlx_prod_axes"); runtime.KeepAlive(ca); return r
+	r := &Array{}
+	ca, p, n := reduceSetup(axes)
+	checkRC(C.mlx_prod_axes(&r.handle, x.handle, p, n, C.bool(keepDims), s.handle), "mlx_prod_axes")
+	runtime.KeepAlive(ca)
+	return r
 }
 func Max(x *Array, axes []int, keepDims bool, s *Stream) *Array {
-	r := &Array{}; ca, p, n := reduceSetup(axes)
-	checkRC(C.mlx_max_axes(&r.handle, x.handle, p, n, C.bool(keepDims), s.handle), "mlx_max_axes"); runtime.KeepAlive(ca); return r
+	r := &Array{}
+	ca, p, n := reduceSetup(axes)
+	checkRC(C.mlx_max_axes(&r.handle, x.handle, p, n, C.bool(keepDims), s.handle), "mlx_max_axes")
+	runtime.KeepAlive(ca)
+	return r
 }
 func Min(x *Array, axes []int, keepDims bool, s *Stream) *Array {
-	r := &Array{}; ca, p, n := reduceSetup(axes)
-	checkRC(C.mlx_min_axes(&r.handle, x.handle, p, n, C.bool(keepDims), s.handle), "mlx_min_axes"); runtime.KeepAlive(ca); return r
+	r := &Array{}
+	ca, p, n := reduceSetup(axes)
+	checkRC(C.mlx_min_axes(&r.handle, x.handle, p, n, C.bool(keepDims), s.handle), "mlx_min_axes")
+	runtime.KeepAlive(ca)
+	return r
 }
 func All(x *Array, axes []int, keepDims bool, s *Stream) *Array {
-	r := &Array{}; ca, p, n := reduceSetup(axes)
-	checkRC(C.mlx_all_axes(&r.handle, x.handle, p, n, C.bool(keepDims), s.handle), "mlx_all_axes"); runtime.KeepAlive(ca); return r
+	r := &Array{}
+	ca, p, n := reduceSetup(axes)
+	checkRC(C.mlx_all_axes(&r.handle, x.handle, p, n, C.bool(keepDims), s.handle), "mlx_all_axes")
+	runtime.KeepAlive(ca)
+	return r
 }
 func Any(x *Array, axes []int, keepDims bool, s *Stream) *Array {
-	r := &Array{}; ca, p, n := reduceSetup(axes)
-	checkRC(C.mlx_any_axes(&r.handle, x.handle, p, n, C.bool(keepDims), s.handle), "mlx_any_axes"); runtime.KeepAlive(ca); return r
+	r := &Array{}
+	ca, p, n := reduceSetup(axes)
+	checkRC(C.mlx_any_axes(&r.handle, x.handle, p, n, C.bool(keepDims), s.handle), "mlx_any_axes")
+	runtime.KeepAlive(ca)
+	return r
 }
 
 // ArgMin returns indices of minimum values along an axis.

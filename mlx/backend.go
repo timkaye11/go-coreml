@@ -23,7 +23,10 @@ import "C"
 
 import (
 	"fmt"
+	"math"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"unsafe"
 
@@ -46,6 +49,7 @@ type Backend struct {
 	cpuStream   *bridge.Stream
 	mu          sync.RWMutex
 	isFinalized bool
+	config      backendConfig
 }
 
 // Verify interface compliance.
@@ -62,14 +66,120 @@ const DefaultMemoryLimitFraction = 0.55
 // On a 24GB M4 Pro: 0.25 * 13.2 GB = 3.3 GB cache limit.
 const DefaultCacheLimitFraction = 0.25
 
+// DefaultWiredLimitFraction is the fraction of physical memory used for MLX's
+// wired allocation limit. This is stricter than MLX's advisory GC limit and is
+// intended as a safety guardrail for long-running training jobs.
+const DefaultWiredLimitFraction = 0.50
+
+type backendConfig struct {
+	MemoryLimitFraction float64
+	CacheLimitFraction  float64
+	WiredLimitFraction  float64
+	StrictCTape         bool
+	LogExecution        bool
+}
+
+// MemoryPolicy describes the backend's configured MLX memory governance.
+type MemoryPolicy struct {
+	TotalSystemMemoryBytes uint64
+	MemoryLimitBytes       uint64
+	CacheLimitBytes        uint64
+	WiredLimitBytes        uint64
+	MemoryLimitFraction    float64
+	CacheLimitFraction     float64
+	WiredLimitFraction     float64
+}
+
+func defaultBackendConfig() backendConfig {
+	return backendConfig{
+		MemoryLimitFraction: DefaultMemoryLimitFraction,
+		CacheLimitFraction:  DefaultCacheLimitFraction,
+		WiredLimitFraction:  DefaultWiredLimitFraction,
+	}
+}
+
+func parseBackendConfig(config string) (backendConfig, error) {
+	cfg := defaultBackendConfig()
+	if strings.TrimSpace(config) == "" {
+		return cfg, nil
+	}
+
+	parts := strings.Split(config, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(part, "=")
+		if !ok {
+			return cfg, errors.Errorf("mlx: invalid config %q, expected key=value", part)
+		}
+		key = strings.TrimSpace(strings.ToLower(key))
+		value = strings.TrimSpace(value)
+
+		switch key {
+		case "mem_fraction", "memory_fraction":
+			v, err := parseFractionOption(key, value)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.MemoryLimitFraction = v
+		case "cache_fraction":
+			v, err := parseFractionOption(key, value)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.CacheLimitFraction = v
+		case "wired_fraction", "wired_limit_fraction":
+			v, err := parseFractionOption(key, value)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.WiredLimitFraction = v
+		case "strict_ctape":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return cfg, errors.Wrapf(err, "mlx: invalid bool for %s", key)
+			}
+			cfg.StrictCTape = v
+		case "log_execution":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return cfg, errors.Wrapf(err, "mlx: invalid bool for %s", key)
+			}
+			cfg.LogExecution = v
+		default:
+			return cfg, errors.Errorf("mlx: unknown config option %q", key)
+		}
+	}
+
+	return cfg, nil
+}
+
+func parseFractionOption(key, value string) (float64, error) {
+	v, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, errors.Wrapf(err, "mlx: invalid float for %s", key)
+	}
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 1 {
+		return 0, errors.Errorf("mlx: %s must be within [0,1], got %q", key, value)
+	}
+	return v, nil
+}
+
 // New creates a new MLX backend.
 func New(config string) (backends.Backend, error) {
 	if !bridge.MetalIsAvailable() {
 		return nil, errors.New("MLX backend requires Metal GPU (Apple Silicon)")
 	}
+	cfg, err := parseBackendConfig(config)
+	if err != nil {
+		return nil, err
+	}
 	b := &Backend{
 		gpuStream: bridge.DefaultGPUStream(),
 		cpuStream: bridge.DefaultCPUStream(),
+		config:    cfg,
 	}
 
 	// Set memory limits to prevent unbounded memory growth that can crash the kernel.
@@ -77,12 +187,17 @@ func New(config string) (backends.Backend, error) {
 	// macOS watchdog to trigger a kernel panic when swap is exhausted.
 	totalMem := systemMemoryBytes()
 	if totalMem > 0 {
-		memLimit := uint64(float64(totalMem) * DefaultMemoryLimitFraction)
-		cacheLimit := uint64(float64(memLimit) * DefaultCacheLimitFraction)
+		memLimit := uint64(float64(totalMem) * cfg.MemoryLimitFraction)
+		cacheLimit := uint64(float64(memLimit) * cfg.CacheLimitFraction)
+		wiredLimit := uint64(float64(totalMem) * cfg.WiredLimitFraction)
 		bridge.SetMemoryLimit(memLimit)
 		bridge.SetCacheLimit(cacheLimit)
-		fmt.Printf("  MLX memory limit: %.1f GB (cache: %.1f GB) of %.1f GB total\n",
-			float64(memLimit)/(1<<30), float64(cacheLimit)/(1<<30), float64(totalMem)/(1<<30))
+		if wiredLimit > 0 {
+			bridge.SetWiredLimit(wiredLimit)
+		}
+		fmt.Printf("  MLX memory policy: mem=%.1f GB cache=%.1f GB wired=%.1f GB of %.1f GB total\n",
+			float64(memLimit)/(1<<30), float64(cacheLimit)/(1<<30),
+			float64(wiredLimit)/(1<<30), float64(totalMem)/(1<<30))
 	}
 
 	return b, nil
@@ -112,6 +227,38 @@ func (b *Backend) GetPeakMemory() uint64 {
 // ResetPeakMemory resets the peak memory counter.
 func (b *Backend) ResetPeakMemory() {
 	bridge.ResetPeakMemory()
+}
+
+// MemoryPolicy returns the currently configured MLX memory policy in bytes and fractions.
+func (b *Backend) MemoryPolicy() MemoryPolicy {
+	totalMem := systemMemoryBytes()
+	memLimit := uint64(float64(totalMem) * b.config.MemoryLimitFraction)
+	cacheLimit := uint64(float64(memLimit) * b.config.CacheLimitFraction)
+	wiredLimit := uint64(float64(totalMem) * b.config.WiredLimitFraction)
+	return MemoryPolicy{
+		TotalSystemMemoryBytes: totalMem,
+		MemoryLimitBytes:       memLimit,
+		CacheLimitBytes:        cacheLimit,
+		WiredLimitBytes:        wiredLimit,
+		MemoryLimitFraction:    b.config.MemoryLimitFraction,
+		CacheLimitFraction:     b.config.CacheLimitFraction,
+		WiredLimitFraction:     b.config.WiredLimitFraction,
+	}
+}
+
+// SafeMemoryBudgetBytes returns the tightest configured backend memory budget.
+func (b *Backend) SafeMemoryBudgetBytes() uint64 {
+	policy := b.MemoryPolicy()
+	switch {
+	case policy.MemoryLimitBytes == 0:
+		return policy.WiredLimitBytes
+	case policy.WiredLimitBytes == 0:
+		return policy.MemoryLimitBytes
+	case policy.WiredLimitBytes < policy.MemoryLimitBytes:
+		return policy.WiredLimitBytes
+	default:
+		return policy.MemoryLimitBytes
+	}
 }
 
 // SystemMemoryBytes returns total physical memory in bytes.

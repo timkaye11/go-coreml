@@ -558,13 +558,13 @@ func TestDeepGraph(t *testing.T) {
 		func(fn backends.Function, params []backends.Value) []backends.Value {
 			v := params[0]
 			// Chain: (((x + x) * 0.5) - 1) + 2 = x + 1
-			added, _ := fn.Add(v, v)                                   // 2x
+			added, _ := fn.Add(v, v) // 2x
 			half, _ := fn.Constant([]float32{0.5, 0.5, 0.5, 0.5}, 4)
-			halved, _ := fn.Mul(added, half)                            // x
+			halved, _ := fn.Mul(added, half) // x
 			one, _ := fn.Constant([]float32{1, 1, 1, 1}, 4)
-			subbed, _ := fn.Sub(halved, one)                            // x - 1
+			subbed, _ := fn.Sub(halved, one) // x - 1
 			two, _ := fn.Constant([]float32{2, 2, 2, 2}, 4)
-			result, _ := fn.Add(subbed, two)                            // x + 1
+			result, _ := fn.Add(subbed, two) // x + 1
 			return []backends.Value{result}
 		})
 	assertClose(t, "DeepGraph", results[0], []float32{2, 3, 4, 5}, 1e-5)
@@ -783,8 +783,12 @@ func TestValueAndGrad(t *testing.T) {
 
 	t.Logf("f(3.0) = %f, f'(3.0) = %f", val, grad)
 
-	for _, a := range values { a.Free() }
-	for _, a := range grads { a.Free() }
+	for _, a := range values {
+		a.Free()
+	}
+	for _, a := range grads {
+		a.Free()
+	}
 	x.Free()
 }
 
@@ -831,8 +835,12 @@ func TestVJP(t *testing.T) {
 
 	t.Logf("f(3.0) = %f, vjp = %f", outVal, vjpVal)
 
-	for _, a := range outputs { a.Free() }
-	for _, a := range vjps { a.Free() }
+	for _, a := range outputs {
+		a.Free()
+	}
+	for _, a := range vjps {
+		a.Free()
+	}
 	x.Free()
 	cot.Free()
 }
@@ -880,8 +888,12 @@ func TestJVP(t *testing.T) {
 
 	t.Logf("f(3.0) = %f, jvp = %f", outVal, jvpVal)
 
-	for _, a := range outputs { a.Free() }
-	for _, a := range jvps { a.Free() }
+	for _, a := range outputs {
+		a.Free()
+	}
+	for _, a := range jvps {
+		a.Free()
+	}
 	x.Free()
 	tan.Free()
 }
@@ -943,10 +955,114 @@ func TestValueAndGradMultiParam(t *testing.T) {
 
 	t.Logf("f(x,y) = %f, grad_x size = %d, grad_y size = %d", val, size, sizeY)
 
-	for _, a := range values { a.Free() }
-	for _, a := range grads { a.Free() }
+	for _, a := range values {
+		a.Free()
+	}
+	for _, a := range grads {
+		a.Free()
+	}
 	x.Free()
 	y.Free()
+}
+
+func TestCompileValueAndGradExecutable(t *testing.T) {
+	b := newBackend(t)
+	defer b.Finalize()
+
+	builder := b.Builder("CompileValueAndGradExecutable")
+	autogradBuilder, ok := builder.(AutogradBuilder)
+	if !ok {
+		t.Fatalf("builder does not implement AutogradBuilder")
+	}
+
+	main := builder.Main()
+	x, err := main.Parameter("x", shapes.Make(dtypes.Float32, 2), nil)
+	if err != nil {
+		t.Fatalf("Parameter failed: %v", err)
+	}
+	sq, err := main.Mul(x, x)
+	if err != nil {
+		t.Fatalf("Mul failed: %v", err)
+	}
+	loss, err := main.ReduceSum(sq, 0)
+	if err != nil {
+		t.Fatalf("ReduceSum failed: %v", err)
+	}
+	if err := main.Return([]backends.Value{loss}, nil); err != nil {
+		t.Fatalf("Return failed: %v", err)
+	}
+
+	exec, err := autogradBuilder.CompileValueAndGrad(nil, AutogradCompileOptions{})
+	if err != nil {
+		t.Fatalf("CompileValueAndGrad failed: %v", err)
+	}
+	defer exec.Finalize()
+
+	input, err := b.BufferFromFlatData(0, []float32{3, 4}, shapes.Make(dtypes.Float32, 2))
+	if err != nil {
+		t.Fatalf("BufferFromFlatData failed: %v", err)
+	}
+
+	values, grads, err := exec.ExecuteValueAndGrad([]backends.Buffer{input}, []bool{true}, 0)
+	if err != nil {
+		t.Fatalf("ExecuteValueAndGrad failed: %v", err)
+	}
+	for _, buf := range values {
+		defer b.BufferFinalize(buf)
+	}
+	for _, buf := range grads {
+		defer b.BufferFinalize(buf)
+	}
+
+	gotValue := make([]float32, 1)
+	if err := b.BufferToFlatData(values[0], gotValue); err != nil {
+		t.Fatalf("BufferToFlatData(value) failed: %v", err)
+	}
+	gotGrad := make([]float32, 2)
+	if err := b.BufferToFlatData(grads[0], gotGrad); err != nil {
+		t.Fatalf("BufferToFlatData(grad) failed: %v", err)
+	}
+
+	assertClose(t, "CompileValueAndGrad/value", gotValue, []float32{25}, 1e-5)
+	assertClose(t, "CompileValueAndGrad/grad", gotGrad, []float32{6, 8}, 1e-5)
+}
+
+func TestCompileCheckpointedValueAndGradExecutable(t *testing.T) {
+	b := newBackend(t)
+	defer b.Finalize()
+
+	builder := b.Builder("CompileCheckpointedValueAndGradExecutable")
+	autogradBuilder, ok := builder.(AutogradBuilder)
+	if !ok {
+		t.Fatalf("builder does not implement AutogradBuilder")
+	}
+
+	main := builder.Main()
+	x, err := main.Parameter("x", shapes.Make(dtypes.Float32, 2), nil)
+	if err != nil {
+		t.Fatalf("Parameter failed: %v", err)
+	}
+	sq, err := main.Mul(x, x)
+	if err != nil {
+		t.Fatalf("Mul failed: %v", err)
+	}
+	loss, err := main.ReduceSum(sq, 0)
+	if err != nil {
+		t.Fatalf("ReduceSum failed: %v", err)
+	}
+	if err := main.Return([]backends.Value{loss}, nil); err != nil {
+		t.Fatalf("Return failed: %v", err)
+	}
+
+	exec, err := autogradBuilder.CompileCheckpointedValueAndGrad(nil)
+	if err != nil {
+		t.Fatalf("CompileCheckpointedValueAndGrad failed: %v", err)
+	}
+	defer exec.Finalize()
+
+	if !exec.UsesCheckpoint() {
+		t.Fatalf("expected checkpointed executable")
+	}
 }
 
 // ===========================================================================

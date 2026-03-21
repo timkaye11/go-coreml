@@ -9,6 +9,16 @@ import (
 	"github.com/gomlx/gomlx/pkg/core/dtypes"
 )
 
+// OpCapabilityProfile refines the coarse supported/not-supported capability table
+// with execution-path and training-safety metadata for MLX-specific routing.
+type OpCapabilityProfile struct {
+	Supported            bool
+	CTapeSupported       bool
+	GeneralCaseSupported bool
+	TrainSafe            bool
+	Notes                string
+}
+
 // backendCapabilities declares which ops and dtypes the MLX backend supports.
 var backendCapabilities = backends.Capabilities{
 	Functions: true,
@@ -59,12 +69,12 @@ var backendCapabilities = backends.Capabilities{
 		backends.OpTypeLogicalXor: true,
 
 		// Bitwise
-		backends.OpTypeBitwiseAnd:              true,
-		backends.OpTypeBitwiseOr:               true,
-		backends.OpTypeBitwiseXor:              true,
-		backends.OpTypeShiftLeft:               true,
-		backends.OpTypeShiftRightArithmetic:    true,
-		backends.OpTypeShiftRightLogical:       true,
+		backends.OpTypeBitwiseAnd:           true,
+		backends.OpTypeBitwiseOr:            true,
+		backends.OpTypeBitwiseXor:           true,
+		backends.OpTypeShiftLeft:            true,
+		backends.OpTypeShiftRightArithmetic: true,
+		backends.OpTypeShiftRightLogical:    true,
 
 		// Comparison
 		backends.OpTypeEqual:          true,
@@ -138,11 +148,11 @@ var backendCapabilities = backends.Capabilities{
 
 		// Fused operations
 		backends.OpTypeFusedSoftmax:                   true,
-		backends.OpTypeFusedLayerNorm:                  true,
-		backends.OpTypeFusedGelu:                       true,
-		backends.OpTypeFusedDense:                      true,
-		backends.OpTypeFusedScaledDotProductAttention:  true,
-		backends.OpTypeFusedAttentionQKVProjection:     true,
+		backends.OpTypeFusedLayerNorm:                 true,
+		backends.OpTypeFusedGelu:                      true,
+		backends.OpTypeFusedDense:                     true,
+		backends.OpTypeFusedScaledDotProductAttention: true,
+		backends.OpTypeFusedAttentionQKVProjection:    true,
 
 		// Control flow
 		backends.OpTypeWhile: true,
@@ -167,4 +177,131 @@ var backendCapabilities = backends.Capabilities{
 		dtypes.Uint64:    true,
 		dtypes.Complex64: true,
 	},
+}
+
+// opCapabilityProfiles captures the operations whose practical behavior differs
+// from the coarse backendCapabilities table. Any op not listed here defaults to:
+// supported => ctape_supported => general_case_supported => train_safe.
+var opCapabilityProfiles = map[backends.OpType]OpCapabilityProfile{
+	backends.OpTypeBatchNormForInference: {
+		Supported:            true,
+		CTapeSupported:       false,
+		GeneralCaseSupported: true,
+		TrainSafe:            false,
+		Notes:                "Implemented via Go-callback compound op; functional but not recommended for large training graphs.",
+	},
+	backends.OpTypeBatchNormForTraining: {
+		Supported:            true,
+		CTapeSupported:       false,
+		GeneralCaseSupported: true,
+		TrainSafe:            false,
+		Notes:                "Implemented via Go-callback compound op; functional but not recommended for large training graphs.",
+	},
+	backends.OpTypeGather: {
+		Supported:            true,
+		CTapeSupported:       true,
+		GeneralCaseSupported: false,
+		TrainSafe:            true,
+		Notes:                "Only simple gather forms are implemented; general case is not supported.",
+	},
+	backends.OpTypeScatterSum: {
+		Supported:            true,
+		CTapeSupported:       false,
+		GeneralCaseSupported: false,
+		TrainSafe:            false,
+		Notes:                "Complex scatter forms fall back to Go replay; only restricted cases are suitable for training.",
+	},
+	backends.OpTypeScatterMax: {
+		Supported:            true,
+		CTapeSupported:       false,
+		GeneralCaseSupported: false,
+		TrainSafe:            false,
+		Notes:                "Complex scatter forms fall back to Go replay; only restricted cases are suitable for training.",
+	},
+	backends.OpTypeScatterMin: {
+		Supported:            true,
+		CTapeSupported:       false,
+		GeneralCaseSupported: false,
+		TrainSafe:            false,
+		Notes:                "Complex scatter forms fall back to Go replay; only restricted cases are suitable for training.",
+	},
+	backends.OpTypeDynamicSlice: {
+		Supported:            true,
+		CTapeSupported:       false,
+		GeneralCaseSupported: true,
+		TrainSafe:            false,
+		Notes:                "Dynamic slice currently forces raw Go-closure execution.",
+	},
+	backends.OpTypeDynamicUpdateSlice: {
+		Supported:            true,
+		CTapeSupported:       false,
+		GeneralCaseSupported: true,
+		TrainSafe:            false,
+		Notes:                "Dynamic update slice currently forces raw Go-closure execution.",
+	},
+	backends.OpTypeRNGBitGenerator: {
+		Supported:            true,
+		CTapeSupported:       false,
+		GeneralCaseSupported: true,
+		TrainSafe:            false,
+		Notes:                "RNG path currently forces raw Go-closure execution.",
+	},
+	backends.OpTypeReduceWindow: {
+		Supported:            true,
+		CTapeSupported:       false,
+		GeneralCaseSupported: true,
+		TrainSafe:            false,
+		Notes:                "ReduceWindow currently uses a compound Go-callback path.",
+	},
+	backends.OpTypeFusedAttentionQKVProjection: {
+		Supported:            true,
+		CTapeSupported:       false,
+		GeneralCaseSupported: true,
+		TrainSafe:            false,
+		Notes:                "Fused QKV projection currently uses a compound Go-callback path.",
+	},
+	backends.OpTypeWhile: {
+		Supported:            true,
+		CTapeSupported:       false,
+		GeneralCaseSupported: true,
+		TrainSafe:            false,
+		Notes:                "Control flow executes through the control-flow executor, not the steady-state C-tape path.",
+	},
+	backends.OpTypeIf: {
+		Supported:            true,
+		CTapeSupported:       false,
+		GeneralCaseSupported: true,
+		TrainSafe:            false,
+		Notes:                "Control flow executes through the control-flow executor, not the steady-state C-tape path.",
+	},
+	backends.OpTypeSort: {
+		Supported:            true,
+		CTapeSupported:       false,
+		GeneralCaseSupported: true,
+		TrainSafe:            false,
+		Notes:                "Control flow executes through the control-flow executor, not the steady-state C-tape path.",
+	},
+	backends.OpTypeCall: {
+		Supported:            true,
+		CTapeSupported:       false,
+		GeneralCaseSupported: true,
+		TrainSafe:            false,
+		Notes:                "Control flow executes through the control-flow executor, not the steady-state C-tape path.",
+	},
+}
+
+// CapabilityProfile returns a more precise MLX support profile for an operation.
+// It preserves the existing coarse Capabilities contract while exposing MLX-
+// specific execution caveats to callers that care about training safety.
+func (b *Backend) CapabilityProfile(op backends.OpType) OpCapabilityProfile {
+	if profile, found := opCapabilityProfiles[op]; found {
+		return profile
+	}
+	supported := backendCapabilities.Operations[op]
+	return OpCapabilityProfile{
+		Supported:            supported,
+		CTapeSupported:       supported,
+		GeneralCaseSupported: supported,
+		TrainSafe:            supported,
+	}
 }
